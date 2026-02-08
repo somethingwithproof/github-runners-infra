@@ -5,12 +5,13 @@ users:
     shell: /bin/bash
     groups: docker
     sudo: |
-      runner ALL=(ALL) NOPASSWD: /usr/bin/docker, /usr/bin/systemctl
+      runner ALL=(ALL) NOPASSWD: /usr/bin/docker
 
 package_update: true
 
 packages:
   - docker.io
+  - awscli
   - build-essential
   - curl
   - git
@@ -28,9 +29,13 @@ runcmd:
   - |
     set -ex
     CHEF_INSTALLER="/tmp/chef-install.sh"
-    CHEF_CHECKSUM="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    CHEF_CHECKSUM="{{.ChefInstallerSHA256}}"
     curl -fsSL -o "$CHEF_INSTALLER" https://omnitruck.chef.io/install.sh
-    echo "$CHEF_CHECKSUM  $CHEF_INSTALLER" | sha256sum -c -
+    ACTUAL=$(sha256sum "$CHEF_INSTALLER" | awk '{print $1}')
+    if [ "$ACTUAL" != "$CHEF_CHECKSUM" ]; then
+      echo "FATAL: Chef installer checksum mismatch: expected=$CHEF_CHECKSUM actual=$ACTUAL" >&2
+      exit 1
+    fi
     bash "$CHEF_INSTALLER" -P chef-workstation
     rm -f "$CHEF_INSTALLER"
 
@@ -42,12 +47,13 @@ runcmd:
     set -ex
     mkdir -p /home/runner/actions-runner
     cd /home/runner/actions-runner
-    RUNNER_URL="https://github.com/actions/runner/releases/download/v{{.RunnerVersion}}/actions-runner-linux-x64-{{.RunnerVersion}}.tar.gz"
-    curl -fsSL -o actions-runner.tar.gz "$RUNNER_URL"
-    curl -fsSL -o actions-runner.tar.gz.sha256 "$RUNNER_URL.sha256"
-    sha256sum -c actions-runner.tar.gz.sha256
-    tar xzf actions-runner.tar.gz
-    rm actions-runner.tar.gz actions-runner.tar.gz.sha256
+    RUNNER_TARBALL="actions-runner-linux-x64-{{.RunnerVersion}}.tar.gz"
+    RUNNER_URL="https://github.com/actions/runner/releases/download/v{{.RunnerVersion}}/${RUNNER_TARBALL}"
+    curl -fsSL -o "$RUNNER_TARBALL" "$RUNNER_URL"
+    curl -fsSL -o "${RUNNER_TARBALL}.sha256" "${RUNNER_URL}.sha256"
+    sha256sum -c "${RUNNER_TARBALL}.sha256"
+    tar xzf "$RUNNER_TARBALL"
+    rm "$RUNNER_TARBALL" "${RUNNER_TARBALL}.sha256"
     chown -R runner:runner /home/runner/actions-runner
 
   # Fetch runner token from AWS SSM Parameter Store

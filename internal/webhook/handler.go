@@ -65,8 +65,9 @@ type Handler struct {
 	callbackSecret        string
 	callbackSecretSSMPath string
 	callbackURL           string
-	workerPool            chan struct{}      // concurrency limiter (#8)
-	rateLimiter           *repoRateLimiter   // per-repo rate limiter (#7)
+	chefInstallerSHA256   string
+	workerPool            chan struct{}    // concurrency limiter (#8)
+	rateLimiter           *repoRateLimiter // per-repo rate limiter (#7)
 	ssmClient             *ssm.Client
 }
 
@@ -83,6 +84,7 @@ type Config struct {
 	CallbackURL           string
 	MaxConcurrent         int
 	MaxPerRepoPerMin      int
+	ChefInstallerSHA256   string
 }
 
 // repoRateLimiter implements a simple per-repo token bucket. (#7)
@@ -125,8 +127,9 @@ func (rl *repoRateLimiter) allow(repo string) bool {
 	return true
 }
 
-// NewHandler creates a new webhook handler.
-func NewHandler(cfg Config) *Handler {
+// NewHandler creates a new webhook handler, returning an error instead of
+// calling log.Fatalf so callers can handle failures gracefully.
+func NewHandler(cfg Config) (*Handler, error) {
 	label := cfg.RequiredLabel
 	if label == "" {
 		label = "self-hosted"
@@ -147,14 +150,22 @@ func NewHandler(cfg Config) *Handler {
 	// Initialize AWS SSM client
 	awsCfg, err := config.LoadDefaultConfig(context.Background())
 	if err != nil {
-		log.Fatalf("Failed to load AWS config: %v", err)
+		return nil, fmt.Errorf("loading AWS config: %w", err)
 	}
 	ssmClient := ssm.NewFromConfig(awsCfg)
 
-	// Set SSM path for callback secret
+	// Set SSM path for callback secret — this is the single source of truth.
+	// The handler fetches the secret from SSM at startup so that runners and
+	// the destroy-callback endpoint use the same value.
 	ssmPath := cfg.CallbackSecretSSMPath
 	if ssmPath == "" {
 		ssmPath = "/github-runners/callback-secret"
+	}
+
+	// Resolve callback secret from SSM (single source of truth)
+	callbackSecret, err := resolveCallbackSecret(context.Background(), ssmClient, ssmPath, cfg.CallbackSecret)
+	if err != nil {
+		return nil, fmt.Errorf("resolving callback secret: %w", err)
 	}
 
 	return &Handler{
@@ -164,13 +175,35 @@ func NewHandler(cfg Config) *Handler {
 		doToken:               cfg.DOToken,
 		requiredLabel:         label,
 		runnerVersion:         version,
-		callbackSecret:        cfg.CallbackSecret,
+		callbackSecret:        callbackSecret,
 		callbackSecretSSMPath: ssmPath,
 		callbackURL:           cfg.CallbackURL,
+		chefInstallerSHA256:   cfg.ChefInstallerSHA256,
 		workerPool:            make(chan struct{}, maxConcurrent),
 		rateLimiter:           newRepoRateLimiter(maxPerRepo),
 		ssmClient:             ssmClient,
+	}, nil
+}
+
+// resolveCallbackSecret loads the callback secret from SSM. If SSM is
+// unreachable or the parameter doesn't exist yet, it falls back to the
+// supplied envSecret. This ensures both the destroy-callback handler and
+// the runner cloud-init derive the secret from a single authoritative
+// location (SSM), eliminating the previous two-source divergence.
+func resolveCallbackSecret(ctx context.Context, client *ssm.Client, ssmPath, envSecret string) (string, error) {
+	out, err := client.GetParameter(ctx, &ssm.GetParameterInput{
+		Name:           &ssmPath,
+		WithDecryption: boolPtr(true),
+	})
+	if err == nil && out.Parameter != nil && out.Parameter.Value != nil {
+		return *out.Parameter.Value, nil
 	}
+	// Fallback: use the env-supplied secret (e.g. first deploy before SSM is populated)
+	if envSecret != "" {
+		log.Printf("WARN: callback secret not found in SSM (%s), using env fallback", ssmPath)
+		return envSecret, nil
+	}
+	return "", fmt.Errorf("callback secret not available from SSM (%s) and no env fallback provided", ssmPath)
 }
 
 // ServeHTTP handles webhook requests.
@@ -280,18 +313,42 @@ func (h *Handler) provisionRunner(event WorkflowJobEvent) {
 		runnerName = runnerName[:63]
 	}
 
-	// Store runner token in SSM Parameter Store with short TTL
+	// Store runner token in SSM Parameter Store with an expiration policy.
+	// Tokens are ephemeral — schedule cleanup even if the runner never
+	// calls back (e.g. provisioning failure). We tag with an expiry
+	// timestamp and also defer a goroutine-based cleanup as a safety net.
 	tokenParamName := fmt.Sprintf("/github-runners/tokens/%s", runnerName)
+	expiresAt := time.Now().Add(30 * time.Minute).UTC().Format(time.RFC3339)
 	_, err = h.ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
 		Name:      &tokenParamName,
 		Value:     &runnerToken,
 		Type:      types.ParameterTypeSecureString,
 		Overwrite: boolPtr(true),
+		Tags: []types.Tag{
+			{Key: strPtr("expires-at"), Value: &expiresAt},
+			{Key: strPtr("runner-name"), Value: &runnerName},
+		},
 	})
 	if err != nil {
 		log.Printf("ERROR: failed to store runner token in SSM: %v", err)
 		return
 	}
+
+	// Schedule automatic cleanup of the token parameter after 30 minutes.
+	// This prevents token accumulation if the runner never self-destructs.
+	go func(paramName string) {
+		time.Sleep(30 * time.Minute)
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		_, err := h.ssmClient.DeleteParameter(cleanupCtx, &ssm.DeleteParameterInput{
+			Name: &paramName,
+		})
+		if err != nil {
+			log.Printf("WARN: failed to cleanup expired token param %s: %v", paramName, err)
+		} else {
+			log.Printf("Cleaned up expired token param %s", paramName)
+		}
+	}(tokenParamName)
 
 	// Validate and sanitize labels (#9)
 	var safeLabels []string
@@ -319,6 +376,7 @@ func (h *Handler) provisionRunner(event WorkflowJobEvent) {
 		RunnerVersion:          h.runnerVersion,
 		CallbackSecretSSMParam: h.callbackSecretSSMPath,
 		CallbackURL:            h.callbackURL,
+		ChefInstallerSHA256:    h.chefInstallerSHA256,
 	}
 
 	droplet, err := h.doClient.CreateRunner(ctx, params)
@@ -376,4 +434,9 @@ func (h *Handler) HandleDestroy(w http.ResponseWriter, r *http.Request) {
 // boolPtr returns a pointer to a bool value
 func boolPtr(b bool) *bool {
 	return &b
+}
+
+// strPtr returns a pointer to a string value
+func strPtr(s string) *string {
+	return &s
 }

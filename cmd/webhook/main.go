@@ -41,6 +41,7 @@ func main() {
 	region := envOrDefault("DO_REGION", "nyc3")
 	size := envOrDefault("DO_SIZE", "s-4vcpu-8gb")
 	requiredLabel := envOrDefault("REQUIRED_LABEL", "self-hosted")
+	chefInstallerSHA256 := mustEnv("CHEF_INSTALLER_SHA256")
 	listenAddr := envOrDefault("LISTEN_ADDR", ":8080")
 
 	var sshFingerprints []string
@@ -65,7 +66,7 @@ func main() {
 		log.Fatalf("Failed to create DO client: %v", err)
 	}
 
-	handler := webhook.NewHandler(webhook.Config{
+	handler, err := webhook.NewHandler(webhook.Config{
 		WebhookSecret:         webhookSecret,
 		GitHubApp:             githubApp,
 		DOClient:              doClient,
@@ -74,7 +75,11 @@ func main() {
 		CallbackSecret:        callbackSecret,
 		CallbackSecretSSMPath: callbackSecretSSMPath,
 		CallbackURL:           callbackURL,
+		ChefInstallerSHA256:   chefInstallerSHA256,
 	})
+	if err != nil {
+		log.Fatalf("Failed to create webhook handler: %v", err)
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/webhook", handler)
