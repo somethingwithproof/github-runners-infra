@@ -202,7 +202,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	eventType := r.Header.Get("X-GitHub-Event")
 	if eventType != "workflow_job" {
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "ok")
+		_, _ = fmt.Fprint(w, "ok")
 		return
 	}
 
@@ -214,13 +214,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if event.Action != "queued" {
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "ok")
+		_, _ = fmt.Fprint(w, "ok")
 		return
 	}
 
 	if !h.hasRequiredLabel(event.WorkflowJob.Labels) {
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "ok")
+		_, _ = fmt.Fprint(w, "ok")
 		return
 	}
 
@@ -240,7 +240,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.provisionRunner(event)
 		}()
 		w.WriteHeader(http.StatusAccepted)
-		fmt.Fprint(w, "provisioning")
+		_, _ = fmt.Fprint(w, "provisioning")
 	default:
 		log.Printf("WARN: worker pool full, rejecting job %d", event.WorkflowJob.ID)
 		http.Error(w, "system busy", http.StatusServiceUnavailable)
@@ -370,7 +370,7 @@ func (h *Handler) HandleDestroy(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Callback: deleted droplet %d", req.DropletID)
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, "deleted")
+	_, _ = fmt.Fprint(w, "deleted")
 }
 
 // boolPtr returns a pointer to a bool value
