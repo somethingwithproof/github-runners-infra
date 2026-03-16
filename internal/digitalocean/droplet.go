@@ -68,15 +68,14 @@ func NewClient(cfg Config) (*Client, error) {
 
 // RunnerParams holds parameters for cloud-init template rendering.
 type RunnerParams struct {
-	RunnerName             string
-	RunnerTokenSSMParam    string
-	RunnerLabels           string
-	RunnerOrg              string
-	RunnerRepo             string
-	DOToken                string
-	RunnerVersion          string
-	CallbackSecretSSMParam string
-	CallbackURL            string
+	RunnerName    string
+	RunnerToken   string // passed directly; no SSM required on the droplet
+	RunnerLabels  string
+	RunnerOrg     string
+	RunnerRepo    string
+	DOToken       string
+	RunnerVersion string
+	CallbackURL   string
 }
 
 // CreateRunner spins up an ephemeral runner droplet.

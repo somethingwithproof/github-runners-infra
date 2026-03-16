@@ -24,6 +24,10 @@ runcmd:
   - systemctl enable docker
   - systemctl start docker
 
+  # Safety net: hard shutdown after 90 minutes regardless of state
+  - |
+    nohup bash -c 'sleep 5400 && DROPLET_ID=$(curl -s http://169.254.169.254/metadata/v1/id) && curl -s -X DELETE -H "Authorization: Bearer {{.DOToken}}" "https://api.digitalocean.com/v2/droplets/${DROPLET_ID}"' &>/dev/null &
+
   # Install Chef Workstation (includes Ruby, bundler, test-kitchen, etc.)
   - |
     set -ex
@@ -50,11 +54,9 @@ runcmd:
     rm actions-runner.tar.gz actions-runner.tar.gz.sha256
     chown -R runner:runner /home/runner/actions-runner
 
-  # Fetch runner token from AWS SSM Parameter Store
+  # Write runner token (passed via cloud-init params)
   - |
-    set -ex
-    TOKEN_PARAM="{{.RunnerTokenSSMParam}}"
-    aws ssm get-parameter --name "$TOKEN_PARAM" --with-decryption --query 'Parameter.Value' --output text > /home/runner/.runner-token
+    echo "{{.RunnerToken}}" > /home/runner/.runner-token
     chmod 600 /home/runner/.runner-token
     chown runner:runner /home/runner/.runner-token
 
@@ -75,13 +77,9 @@ runcmd:
       ./run.sh
     '
 
-  # Self-destruct: call back to webhook controller
+  # Self-destruct via DigitalOcean API
   - |
     DROPLET_ID=$(curl -s http://169.254.169.254/metadata/v1/id)
-    CALLBACK_SECRET_PARAM="{{.CallbackSecretSSMParam}}"
-    CALLBACK_SECRET=$(aws ssm get-parameter --name "$CALLBACK_SECRET_PARAM" --with-decryption --query 'Parameter.Value' --output text)
-    curl -s -X POST \
-      -H "Content-Type: application/json" \
-      -H "X-Callback-Secret: $CALLBACK_SECRET" \
-      -d "{\"droplet_id\": ${DROPLET_ID}}" \
-      "{{.CallbackURL}}/callback/destroy"
+    curl -s -X DELETE \
+      -H "Authorization: Bearer {{.DOToken}}" \
+      "https://api.digitalocean.com/v2/droplets/${DROPLET_ID}"
