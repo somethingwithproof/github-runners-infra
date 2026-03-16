@@ -35,7 +35,7 @@ func (a *App) GenerateRunnerToken(org string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("request runner token: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusCreated {
 		return "", fmt.Errorf("unexpected status %d requesting runner token", resp.StatusCode)
@@ -69,7 +69,7 @@ func (a *App) GenerateRepoRunnerToken(owner, repo string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("request runner token: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusCreated {
 		return "", fmt.Errorf("unexpected status %d requesting repo runner token", resp.StatusCode)
