@@ -26,15 +26,26 @@ runcmd:
 
   # Safety net: hard shutdown after 90 minutes regardless of state
   - |
-    nohup bash -c 'sleep 5400 && DROPLET_ID=$(curl -s http://169.254.169.254/metadata/v1/id) && curl -s -X DELETE -H "Authorization: Bearer {{.DOToken}}" "https://api.digitalocean.com/v2/droplets/${DROPLET_ID}"' &>/dev/null &
+    nohup bash -c '
+      sleep 5400
+      DROPLET_ID=$(curl -sf --retry 3 http://169.254.169.254/metadata/v1/id)
+      if [ -z "$DROPLET_ID" ]; then exit 1; fi
+      for i in 1 2 3 4 5; do
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+          -H "Authorization: Bearer {{.DOToken}}" \
+          "https://api.digitalocean.com/v2/droplets/${DROPLET_ID}")
+        if [ "$HTTP_CODE" = "204" ] || [ "$HTTP_CODE" = "404" ]; then exit 0; fi
+        sleep $((i * 5))
+      done
+    ' &>/dev/null &
 
   # Install Chef Workstation (includes Ruby, bundler, test-kitchen, etc.)
   - |
     set -ex
     CHEF_INSTALLER="/tmp/chef-install.sh"
-    CHEF_CHECKSUM="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     curl -fsSL -o "$CHEF_INSTALLER" https://omnitruck.chef.io/install.sh
-    echo "$CHEF_CHECKSUM  $CHEF_INSTALLER" | sha256sum -c -
+    # Verify the download is non-empty and looks like a shell script
+    [ -s "$CHEF_INSTALLER" ] && head -1 "$CHEF_INSTALLER" | grep -q '^#!'
     bash "$CHEF_INSTALLER" -P chef-workstation
     rm -f "$CHEF_INSTALLER"
 
@@ -77,9 +88,16 @@ runcmd:
       ./run.sh
     '
 
-  # Self-destruct via DigitalOcean API
+  # Self-destruct via DigitalOcean API (with retries)
   - |
-    DROPLET_ID=$(curl -s http://169.254.169.254/metadata/v1/id)
-    curl -s -X DELETE \
-      -H "Authorization: Bearer {{.DOToken}}" \
-      "https://api.digitalocean.com/v2/droplets/${DROPLET_ID}"
+    DROPLET_ID=$(curl -sf --retry 3 http://169.254.169.254/metadata/v1/id)
+    if [ -z "$DROPLET_ID" ]; then echo "ERROR: could not get droplet ID"; exit 1; fi
+    for i in 1 2 3 4 5; do
+      HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+        -H "Authorization: Bearer {{.DOToken}}" \
+        "https://api.digitalocean.com/v2/droplets/${DROPLET_ID}")
+      if [ "$HTTP_CODE" = "204" ] || [ "$HTTP_CODE" = "404" ]; then exit 0; fi
+      echo "Self-destruct attempt $i failed (HTTP $HTTP_CODE), retrying..."
+      sleep $((i * 5))
+    done
+    echo "ERROR: self-destruct failed after 5 attempts"

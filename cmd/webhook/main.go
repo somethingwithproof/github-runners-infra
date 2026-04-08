@@ -33,7 +33,6 @@ func main() {
 
 	webhookSecret := []byte(mustEnv("WEBHOOK_SECRET"))
 	callbackSecret := mustEnv("CALLBACK_SECRET")
-	callbackSecretSSMPath := envOrDefault("CALLBACK_SECRET_SSM_PATH", "/github-runners/callback-secret")
 	callbackURL := mustEnv("CALLBACK_URL")
 	doToken := mustEnv("DIGITALOCEAN_TOKEN")
 
@@ -71,9 +70,8 @@ func main() {
 		DOClient:              doClient,
 		DOToken:               doToken,
 		RequiredLabel:         requiredLabel,
-		CallbackSecret:        callbackSecret,
-		CallbackSecretSSMPath: callbackSecretSSMPath,
-		CallbackURL:           callbackURL,
+		CallbackSecret: callbackSecret,
+		CallbackURL:    callbackURL,
 	})
 
 	mux := http.NewServeMux()

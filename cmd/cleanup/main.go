@@ -23,7 +23,7 @@ func main() {
 		log.Fatalf("Failed to create DO client: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
 	maxAge := 60 * time.Minute
