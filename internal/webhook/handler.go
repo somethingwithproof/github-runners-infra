@@ -2,7 +2,6 @@ package webhook
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -53,16 +52,14 @@ type RepoInfo struct {
 
 // Handler processes incoming GitHub webhooks.
 type Handler struct {
-	webhookSecret  []byte
-	githubApp      *gh.App
-	doClient       *digitalocean.Client
-	doToken        string
-	requiredLabel  string
-	runnerVersion  string
-	callbackSecret string
-	callbackURL    string
-	workerPool     chan struct{}     // concurrency limiter (#8)
-	rateLimiter    *repoRateLimiter // per-repo rate limiter (#7)
+	webhookSecret []byte
+	githubApp     *gh.App
+	doClient      *digitalocean.Client
+	doToken       string
+	requiredLabel string
+	runnerVersion string
+	workerPool    chan struct{}     // concurrency limiter (#8)
+	rateLimiter   *repoRateLimiter // per-repo rate limiter (#7)
 }
 
 // Config holds handler configuration.
@@ -73,8 +70,6 @@ type Config struct {
 	DOToken          string
 	RequiredLabel    string
 	RunnerVersion    string
-	CallbackSecret   string
-	CallbackURL      string
 	MaxConcurrent    int
 	MaxPerRepoPerMin int
 }
@@ -115,6 +110,11 @@ func (rl *repoRateLimiter) allow(repo string) bool {
 		return false
 	}
 
+	// Prune empty buckets to prevent unbounded map growth
+	if len(valid) == 0 {
+		delete(rl.buckets, repo)
+	}
+
 	rl.buckets[repo] = append(valid, now)
 	return true
 }
@@ -139,16 +139,14 @@ func NewHandler(cfg Config) *Handler {
 	}
 
 	return &Handler{
-		webhookSecret:  cfg.WebhookSecret,
-		githubApp:      cfg.GitHubApp,
-		doClient:       cfg.DOClient,
-		doToken:        cfg.DOToken,
-		requiredLabel:  label,
-		runnerVersion:  version,
-		callbackSecret: cfg.CallbackSecret,
-		callbackURL:    cfg.CallbackURL,
-		workerPool:     make(chan struct{}, maxConcurrent),
-		rateLimiter:    newRepoRateLimiter(maxPerRepo),
+		webhookSecret: cfg.WebhookSecret,
+		githubApp:     cfg.GitHubApp,
+		doClient:      cfg.DOClient,
+		doToken:       cfg.DOToken,
+		requiredLabel: label,
+		runnerVersion: version,
+		workerPool:    make(chan struct{}, maxConcurrent),
+		rateLimiter:   newRepoRateLimiter(maxPerRepo),
 	}
 }
 
@@ -283,7 +281,6 @@ func (h *Handler) provisionRunner(event WorkflowJobEvent) {
 		RunnerRepo:    repoFull,
 		DOToken:       h.doToken,
 		RunnerVersion: h.runnerVersion,
-		CallbackURL:   h.callbackURL,
 	}
 
 	droplet, err := h.doClient.CreateRunner(ctx, params)
@@ -294,46 +291,4 @@ func (h *Handler) provisionRunner(event WorkflowJobEvent) {
 
 	log.Printf("Provisioned runner %s (droplet %d) for %s job %d",
 		runnerName, droplet.ID, repoFull, event.WorkflowJob.ID)
-}
-
-// HandleDestroy processes self-destruct callbacks from runner droplets. (#1)
-func (h *Handler) HandleDestroy(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	secret := r.Header.Get("X-Callback-Secret")
-	if secret == "" || subtle.ConstantTimeCompare([]byte(secret), []byte(h.callbackSecret)) != 1 {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	r.Body = http.MaxBytesReader(w, r.Body, 1024)
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return
-	}
-
-	var req struct {
-		DropletID int `json:"droplet_id"`
-	}
-	if err := json.Unmarshal(body, &req); err != nil || req.DropletID == 0 {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	if err := h.doClient.DeleteDroplet(ctx, req.DropletID); err != nil {
-		log.Printf("ERROR: callback delete droplet %d: %v", req.DropletID, err)
-		http.Error(w, "delete failed", http.StatusInternalServerError)
-		return
-	}
-
-	log.Printf("Callback: deleted droplet %d", req.DropletID)
-	w.WriteHeader(http.StatusOK)
-	_, _ = fmt.Fprint(w, "deleted")
 }

@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/thomasvincent/github-runners-infra/internal/digitalocean"
@@ -32,9 +35,6 @@ func main() {
 	}
 
 	webhookSecret := []byte(mustEnv("WEBHOOK_SECRET"))
-	callbackSecret := mustEnv("CALLBACK_SECRET")
-	callbackSecretSSMPath := envOrDefault("CALLBACK_SECRET_SSM_PATH", "/github-runners/callback-secret")
-	callbackURL := mustEnv("CALLBACK_URL")
 	doToken := mustEnv("DIGITALOCEAN_TOKEN")
 
 	cloudInitPath := envOrDefault("CLOUD_INIT_PATH", "cloud-init/runner.yaml.tmpl")
@@ -66,19 +66,15 @@ func main() {
 	}
 
 	handler := webhook.NewHandler(webhook.Config{
-		WebhookSecret:         webhookSecret,
-		GitHubApp:             githubApp,
-		DOClient:              doClient,
-		DOToken:               doToken,
-		RequiredLabel:         requiredLabel,
-		CallbackSecret:        callbackSecret,
-		CallbackSecretSSMPath: callbackSecretSSMPath,
-		CallbackURL:           callbackURL,
+		WebhookSecret: webhookSecret,
+		GitHubApp:     githubApp,
+		DOClient:      doClient,
+		DOToken:       doToken,
+		RequiredLabel: requiredLabel,
 	})
 
 	mux := http.NewServeMux()
 	mux.Handle("/webhook", handler)
-	mux.HandleFunc("/callback/destroy", handler.HandleDestroy)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -93,10 +89,26 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	log.Printf("Webhook listener starting on %s", listenAddr)
-	if err := srv.ListenAndServe(); err != nil {
-		log.Fatalf("Server failed: %v", err)
+	// Graceful shutdown: finish in-flight provisioning on SIGTERM/SIGINT
+	shutdownCh := make(chan os.Signal, 1)
+	signal.Notify(shutdownCh, syscall.SIGTERM, syscall.SIGINT)
+
+	go func() {
+		log.Printf("Webhook listener starting on %s", listenAddr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server failed: %v", err)
+		}
+	}()
+
+	<-shutdownCh
+	log.Printf("Shutdown signal received, draining in-flight requests...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("Shutdown error: %v", err)
 	}
+	log.Printf("Server stopped")
 }
 
 func mustEnv(key string) string {

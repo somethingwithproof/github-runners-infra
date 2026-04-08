@@ -75,7 +75,6 @@ type RunnerParams struct {
 	RunnerRepo    string
 	DOToken       string
 	RunnerVersion string
-	CallbackURL   string
 }
 
 // CreateRunner spins up an ephemeral runner droplet.
@@ -118,13 +117,29 @@ func (c *Client) DeleteDroplet(ctx context.Context, id int) error {
 }
 
 // ListRunnerDroplets returns all droplets tagged as github-runner.
+// Paginates through all pages to ensure no droplets are missed.
 func (c *Client) ListRunnerDroplets(ctx context.Context) ([]godo.Droplet, error) {
+	var allDroplets []godo.Droplet
 	opt := &godo.ListOptions{PerPage: 200}
-	droplets, _, err := c.client.Droplets.ListByTag(ctx, "github-runner", opt)
-	if err != nil {
-		return nil, fmt.Errorf("list runner droplets: %w", err)
+
+	for {
+		droplets, resp, err := c.client.Droplets.ListByTag(ctx, "github-runner", opt)
+		if err != nil {
+			return nil, fmt.Errorf("list runner droplets: %w", err)
+		}
+		allDroplets = append(allDroplets, droplets...)
+
+		if resp.Links == nil || resp.Links.IsLastPage() {
+			break
+		}
+		page, err := resp.Links.CurrentPage()
+		if err != nil {
+			break
+		}
+		opt.Page = page + 1
 	}
-	return droplets, nil
+
+	return allDroplets, nil
 }
 
 // CleanupOldDroplets deletes runner droplets older than maxAge.

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -29,6 +30,10 @@ type App struct {
 	AppID          int64
 	InstallationID int64
 	PrivateKey     []byte
+
+	tokenMu      sync.Mutex
+	cachedToken  string
+	tokenExpires time.Time
 }
 
 // GenerateJWT creates a short-lived JWT for GitHub App authentication.
@@ -54,8 +59,17 @@ func (a *App) GenerateJWT() (string, error) {
 	return token.SignedString(key)
 }
 
-// InstallationToken retrieves an installation access token.
+// InstallationToken retrieves an installation access token, returning a
+// cached token if it is still valid (with a 5-minute safety margin).
 func (a *App) InstallationToken() (string, error) {
+	a.tokenMu.Lock()
+	defer a.tokenMu.Unlock()
+
+	// Return cached token if still valid with 5 min buffer
+	if a.cachedToken != "" && time.Now().Before(a.tokenExpires.Add(-5*time.Minute)) {
+		return a.cachedToken, nil
+	}
+
 	jwtToken, err := a.GenerateJWT()
 	if err != nil {
 		return "", fmt.Errorf("generate JWT: %w", err)
@@ -80,10 +94,15 @@ func (a *App) InstallationToken() (string, error) {
 	}
 
 	var result struct {
-		Token string `json:"token"`
+		Token     string    `json:"token"`
+		ExpiresAt time.Time `json:"expires_at"`
 	}
 	if err := decodeJSON(resp.Body, &result); err != nil {
 		return "", err
 	}
+
+	a.cachedToken = result.Token
+	a.tokenExpires = result.ExpiresAt
+
 	return result.Token, nil
 }
