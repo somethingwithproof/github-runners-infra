@@ -28,6 +28,16 @@ runcmd:
   - |
     nohup bash -c '
       sleep 5400
+      {{if .CallbackURL}}
+      for i in 1 2 3 4 5; do
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+          -H "Content-Type: application/json" \
+          -d "{\"destroy_token\": \"{{.DestroyToken}}\"}" \
+          "{{.CallbackURL}}/destroy")
+        if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "404" ]; then exit 0; fi
+        sleep $((i * 5))
+      done
+      {{else}}
       DROPLET_ID=$(curl -sf --retry 3 http://169.254.169.254/metadata/v1/id)
       if [ -z "$DROPLET_ID" ]; then exit 1; fi
       for i in 1 2 3 4 5; do
@@ -37,6 +47,7 @@ runcmd:
         if [ "$HTTP_CODE" = "204" ] || [ "$HTTP_CODE" = "404" ]; then exit 0; fi
         sleep $((i * 5))
       done
+      {{end}}
     ' &>/dev/null &
 
   # Install Chef Workstation (includes Ruby, bundler, test-kitchen, etc.)
@@ -44,7 +55,6 @@ runcmd:
     set -ex
     CHEF_INSTALLER="/tmp/chef-install.sh"
     curl -fsSL -o "$CHEF_INSTALLER" https://omnitruck.chef.io/install.sh
-    # Verify the download is non-empty and looks like a shell script
     [ -s "$CHEF_INSTALLER" ] && head -1 "$CHEF_INSTALLER" | grep -q '^#!'
     bash "$CHEF_INSTALLER" -P chef-workstation
     rm -f "$CHEF_INSTALLER"
@@ -88,8 +98,19 @@ runcmd:
       ./run.sh
     '
 
-  # Self-destruct via DigitalOcean API (with retries)
+  # Self-destruct via callback or direct DO API (with retries)
   - |
+    {{if .CallbackURL}}
+    for i in 1 2 3 4 5; do
+      HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+        -H "Content-Type: application/json" \
+        -d "{\"destroy_token\": \"{{.DestroyToken}}\"}" \
+        "{{.CallbackURL}}/destroy")
+      if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "404" ]; then exit 0; fi
+      echo "Self-destruct attempt $i failed (HTTP $HTTP_CODE), retrying..."
+      sleep $((i * 5))
+    done
+    {{else}}
     DROPLET_ID=$(curl -sf --retry 3 http://169.254.169.254/metadata/v1/id)
     if [ -z "$DROPLET_ID" ]; then echo "ERROR: could not get droplet ID"; exit 1; fi
     for i in 1 2 3 4 5; do
@@ -100,4 +121,5 @@ runcmd:
       echo "Self-destruct attempt $i failed (HTTP $HTTP_CODE), retrying..."
       sleep $((i * 5))
     done
+    {{end}}
     echo "ERROR: self-destruct failed after 5 attempts"

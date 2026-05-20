@@ -2,10 +2,14 @@ package webhook
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strings"
@@ -14,17 +18,16 @@ import (
 
 	"github.com/thomasvincent/github-runners-infra/internal/digitalocean"
 	gh "github.com/thomasvincent/github-runners-infra/internal/github"
+	"github.com/thomasvincent/github-runners-infra/internal/metrics"
 )
 
-const maxBodySize = 1 * 1024 * 1024 // 1 MB (#3)
+const maxBodySize = 1 * 1024 * 1024 // 1 MB
 
-// Input validation regexes (#9)
 var (
 	safeNameRegex = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 	repoRegex     = regexp.MustCompile(`^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$`)
 )
 
-// WorkflowJobEvent represents the GitHub workflow_job webhook payload.
 type WorkflowJobEvent struct {
 	Action      string      `json:"action"`
 	WorkflowJob WorkflowJob `json:"workflow_job"`
@@ -50,37 +53,42 @@ type RepoInfo struct {
 	} `json:"owner"`
 }
 
-// Handler processes incoming GitHub webhooks.
 type Handler struct {
-	webhookSecret []byte
-	githubApp     *gh.App
-	doClient      *digitalocean.Client
-	doToken       string
-	requiredLabel string
-	runnerVersion string
-	workerPool    chan struct{}     // concurrency limiter (#8)
-	rateLimiter   *repoRateLimiter // per-repo rate limiter (#7)
-	wg            sync.WaitGroup   // tracks in-flight provisioning goroutines
+	webhookSecret    []byte
+	githubApp        *gh.App
+	doClient         *digitalocean.Client
+	doToken          string
+	requiredLabel    string
+	runnerVersion    string
+	callbackURL      string
+	destroySecret    []byte
+	maxActiveDroplets int
+	workerPool       chan struct{}
+	rateLimiter      *repoRateLimiter
+	wg               sync.WaitGroup
+	dedup            *jobDeduplicator
+	destroyTokens    sync.Map // token → dropletID
 }
 
-// Wait blocks until all in-flight provisioning goroutines complete.
 func (h *Handler) Wait() {
 	h.wg.Wait()
 }
 
-// Config holds handler configuration.
 type Config struct {
-	WebhookSecret    []byte
-	GitHubApp        *gh.App
-	DOClient         *digitalocean.Client
-	DOToken          string
-	RequiredLabel    string
-	RunnerVersion    string
-	MaxConcurrent    int
-	MaxPerRepoPerMin int
+	WebhookSecret     []byte
+	GitHubApp         *gh.App
+	DOClient          *digitalocean.Client
+	DOToken           string
+	RequiredLabel     string
+	RunnerVersion     string
+	CallbackURL       string
+	DestroySecret     string
+	MaxConcurrent     int
+	MaxPerRepoPerMin  int
+	MaxActiveDroplets int
 }
 
-// repoRateLimiter implements a simple per-repo token bucket. (#7)
+// repoRateLimiter implements a simple per-repo token bucket.
 type repoRateLimiter struct {
 	mu      sync.Mutex
 	buckets map[string][]time.Time
@@ -103,7 +111,6 @@ func (rl *repoRateLimiter) allow(repo string) bool {
 	now := time.Now()
 	cutoff := now.Add(-rl.window)
 
-	// Remove expired entries
 	valid := rl.buckets[repo][:0]
 	for _, t := range rl.buckets[repo] {
 		if t.After(cutoff) {
@@ -116,7 +123,6 @@ func (rl *repoRateLimiter) allow(repo string) bool {
 		return false
 	}
 
-	// Prune empty buckets to prevent unbounded map growth
 	if len(valid) == 0 {
 		delete(rl.buckets, repo)
 	}
@@ -125,7 +131,48 @@ func (rl *repoRateLimiter) allow(repo string) bool {
 	return true
 }
 
-// NewHandler creates a new webhook handler.
+// jobDeduplicator prevents duplicate provisioning for the same workflow job.
+type jobDeduplicator struct {
+	mu   sync.Mutex
+	seen map[int64]time.Time
+	ttl  time.Duration
+}
+
+func newJobDeduplicator(ttl time.Duration) *jobDeduplicator {
+	d := &jobDeduplicator{
+		seen: make(map[int64]time.Time),
+		ttl:  ttl,
+	}
+	go d.cleanupLoop()
+	return d
+}
+
+func (d *jobDeduplicator) isDuplicate(jobID int64) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if _, ok := d.seen[jobID]; ok {
+		return true
+	}
+	d.seen[jobID] = time.Now()
+	return false
+}
+
+func (d *jobDeduplicator) cleanupLoop() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		d.mu.Lock()
+		cutoff := time.Now().Add(-d.ttl)
+		for id, t := range d.seen {
+			if t.Before(cutoff) {
+				delete(d.seen, id)
+			}
+		}
+		d.mu.Unlock()
+	}
+}
+
 func NewHandler(cfg Config) *Handler {
 	label := cfg.RequiredLabel
 	if label == "" {
@@ -143,27 +190,38 @@ func NewHandler(cfg Config) *Handler {
 	if maxPerRepo <= 0 {
 		maxPerRepo = 20
 	}
+	maxActive := cfg.MaxActiveDroplets
+	if maxActive <= 0 {
+		maxActive = 0 // disabled
+	}
+
+	var destroySecret []byte
+	if cfg.DestroySecret != "" {
+		destroySecret = []byte(cfg.DestroySecret)
+	}
 
 	return &Handler{
-		webhookSecret: cfg.WebhookSecret,
-		githubApp:     cfg.GitHubApp,
-		doClient:      cfg.DOClient,
-		doToken:       cfg.DOToken,
-		requiredLabel: label,
-		runnerVersion: version,
-		workerPool:    make(chan struct{}, maxConcurrent),
-		rateLimiter:   newRepoRateLimiter(maxPerRepo),
+		webhookSecret:     cfg.WebhookSecret,
+		githubApp:         cfg.GitHubApp,
+		doClient:          cfg.DOClient,
+		doToken:           cfg.DOToken,
+		requiredLabel:     label,
+		runnerVersion:     version,
+		callbackURL:       cfg.CallbackURL,
+		destroySecret:     destroySecret,
+		maxActiveDroplets: maxActive,
+		workerPool:        make(chan struct{}, maxConcurrent),
+		rateLimiter:       newRepoRateLimiter(maxPerRepo),
+		dedup:             newJobDeduplicator(10 * time.Minute),
 	}
 }
 
-// ServeHTTP handles webhook requests.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Limit request body size (#3)
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -178,6 +236,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	sig := r.Header.Get("X-Hub-Signature-256")
 	if !gh.VerifyWebhookSignature(body, sig, h.webhookSecret, clientIP) {
+		metrics.WebhookRequests.WithLabelValues("unauthorized").Inc()
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -207,27 +266,42 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Rate limit per repo (#7)
+	// Duplicate webhook detection
+	if h.dedup.isDuplicate(event.WorkflowJob.ID) {
+		metrics.DuplicateWebhooks.Inc()
+		slog.Warn("duplicate webhook suppressed", "job_id", event.WorkflowJob.ID, "repo", event.Repo.FullName)
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, "duplicate")
+		return
+	}
+
 	repoKey := event.Repo.FullName
 	if !h.rateLimiter.allow(repoKey) {
-		log.Printf("SECURITY: rate limit exceeded for %s from %s", repoKey, clientIP)
+		metrics.RateLimitHits.Inc()
+		metrics.WebhookRequests.WithLabelValues("rate_limited").Inc()
+		slog.Warn("rate limit exceeded", "repo", repoKey, "client_ip", clientIP)
 		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}
 
-	// Worker pool for bounded concurrency (#8)
 	select {
 	case h.workerPool <- struct{}{}:
+		metrics.WorkerPoolSize.Inc()
 		h.wg.Add(1)
 		go func() {
 			defer h.wg.Done()
-			defer func() { <-h.workerPool }()
+			defer func() {
+				<-h.workerPool
+				metrics.WorkerPoolSize.Dec()
+			}()
 			h.provisionRunner(event)
 		}()
+		metrics.WebhookRequests.WithLabelValues("accepted").Inc()
 		w.WriteHeader(http.StatusAccepted)
 		_, _ = fmt.Fprint(w, "provisioning")
 	default:
-		log.Printf("WARN: worker pool full, rejecting job %d", event.WorkflowJob.ID)
+		metrics.WebhookRequests.WithLabelValues("pool_full").Inc()
+		slog.Warn("worker pool full", "job_id", event.WorkflowJob.ID)
 		http.Error(w, "system busy", http.StatusServiceUnavailable)
 	}
 }
@@ -242,30 +316,51 @@ func (h *Handler) hasRequiredLabel(labels []string) bool {
 }
 
 func (h *Handler) provisionRunner(event WorkflowJobEvent) {
+	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	owner := event.Repo.Owner.Login
 	repo := event.Repo.Name
+	repoFull := fmt.Sprintf("%s/%s", owner, repo)
+	jobID := event.WorkflowJob.ID
 
-	// Validate inputs (#9)
 	if !safeNameRegex.MatchString(owner) || !safeNameRegex.MatchString(repo) {
-		log.Printf("ERROR: invalid owner/repo: %s/%s", owner, repo)
+		slog.Error("invalid owner/repo", "owner", owner, "repo", repo)
+		metrics.ProvisioningErrors.Inc()
 		return
+	}
+
+	if !repoRegex.MatchString(repoFull) {
+		slog.Error("invalid repo format", "repo", repoFull)
+		metrics.ProvisioningErrors.Inc()
+		return
+	}
+
+	// Cost guardrail: check active droplet count
+	if h.maxActiveDroplets > 0 {
+		droplets, err := h.doClient.ListRunnerDroplets(ctx)
+		if err != nil {
+			slog.Error("failed to check active droplets", "error", err)
+		} else if len(droplets) >= h.maxActiveDroplets {
+			slog.Warn("active droplet cap reached", "active", len(droplets), "cap", h.maxActiveDroplets, "job_id", jobID)
+			metrics.ProvisioningErrors.Inc()
+			return
+		}
 	}
 
 	runnerToken, err := h.githubApp.GenerateRepoRunnerToken(owner, repo)
 	if err != nil {
-		log.Printf("ERROR: runner token for %s/%s: %v", owner, repo, err)
+		slog.Error("runner token generation failed", "repo", repoFull, "error", err)
+		metrics.ProvisioningErrors.Inc()
 		return
 	}
 
-	runnerName := fmt.Sprintf("eph-%s-%d-%d", repo, event.WorkflowJob.ID, time.Now().Unix())
+	runnerName := fmt.Sprintf("eph-%s-%d-%d", repo, jobID, time.Now().Unix())
 	if len(runnerName) > 63 {
 		runnerName = runnerName[:63]
 	}
 
-	// Validate and sanitize labels (#9)
 	var safeLabels []string
 	for _, l := range event.WorkflowJob.Labels {
 		cleaned := strings.TrimSpace(l)
@@ -275,28 +370,159 @@ func (h *Handler) provisionRunner(event WorkflowJobEvent) {
 	}
 	labels := strings.Join(safeLabels, ",")
 
-	repoFull := fmt.Sprintf("%s/%s", owner, repo)
-	if !repoRegex.MatchString(repoFull) {
-		log.Printf("ERROR: invalid repo format: %s", repoFull)
-		return
-	}
-
 	params := digitalocean.RunnerParams{
 		RunnerName:    runnerName,
 		RunnerToken:   runnerToken,
 		RunnerLabels:  labels,
 		RunnerOrg:     owner,
 		RunnerRepo:    repoFull,
-		DOToken:       h.doToken,
 		RunnerVersion: h.runnerVersion,
 	}
 
-	droplet, err := h.doClient.CreateRunner(ctx, params)
-	if err != nil {
-		log.Printf("ERROR: create droplet for job %d: %v", event.WorkflowJob.ID, err)
+	// Use scoped self-destruct if configured, otherwise fall back to DO token
+	if h.callbackURL != "" && len(h.destroySecret) > 0 {
+		destroyToken := generateDestroyToken()
+		params.DestroyToken = destroyToken
+		params.CallbackURL = h.callbackURL
+
+		droplet, err := h.doClient.CreateRunner(ctx, params)
+		if err != nil {
+			slog.Error("create droplet failed", "job_id", jobID, "error", err)
+			metrics.ProvisioningErrors.Inc()
+			return
+		}
+
+		// Register the destroy token → droplet ID mapping
+		h.destroyTokens.Store(destroyToken, droplet.ID)
+
+		metrics.DropletsCreated.Inc()
+		metrics.ProvisioningDuration.Observe(time.Since(start).Seconds())
+		slog.Info("provisioned runner", "runner", runnerName, "droplet_id", droplet.ID, "repo", repoFull, "job_id", jobID)
+	} else {
+		params.DOToken = h.doToken
+
+		droplet, err := h.doClient.CreateRunner(ctx, params)
+		if err != nil {
+			slog.Error("create droplet failed", "job_id", jobID, "error", err)
+			metrics.ProvisioningErrors.Inc()
+			return
+		}
+
+		metrics.DropletsCreated.Inc()
+		metrics.ProvisioningDuration.Observe(time.Since(start).Seconds())
+		slog.Info("provisioned runner", "runner", runnerName, "droplet_id", droplet.ID, "repo", repoFull, "job_id", jobID)
+	}
+}
+
+func generateDestroyToken() string {
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// HandleDestroy processes scoped self-destruct callbacks from runner droplets.
+func (h *Handler) HandleDestroy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	log.Printf("Provisioned runner %s (droplet %d) for %s job %d",
-		runnerName, droplet.ID, repoFull, event.WorkflowJob.ID)
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		DestroyToken string `json:"destroy_token"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil || req.DestroyToken == "" {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	// Verify the token is a hex string to prevent injection
+	if _, err := hex.DecodeString(req.DestroyToken); err != nil {
+		http.Error(w, "invalid token", http.StatusBadRequest)
+		return
+	}
+
+	val, ok := h.destroyTokens.LoadAndDelete(req.DestroyToken)
+	if !ok {
+		http.Error(w, "unknown token", http.StatusNotFound)
+		return
+	}
+
+	dropletID := val.(int)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := h.doClient.DeleteDroplet(ctx, dropletID); err != nil {
+		slog.Error("callback delete failed", "droplet_id", dropletID, "error", err)
+		http.Error(w, "delete failed", http.StatusInternalServerError)
+		return
+	}
+
+	metrics.DropletsDestroyed.WithLabelValues("callback").Inc()
+	slog.Info("callback: destroyed droplet", "droplet_id", dropletID)
+	w.WriteHeader(http.StatusOK)
+	_, _ = fmt.Fprint(w, "deleted")
+}
+
+// HandleDestroyHMAC processes self-destruct callbacks authenticated with HMAC.
+// Used when the droplet discovers its own ID at runtime and signs it.
+func (h *Handler) HandleDestroyHMAC(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if len(h.destroySecret) == 0 {
+		http.Error(w, "not configured", http.StatusNotFound)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		DropletID int    `json:"droplet_id"`
+		Signature string `json:"signature"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil || req.DropletID == 0 || req.Signature == "" {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	expected := computeHMAC(fmt.Sprintf("%d", req.DropletID), h.destroySecret)
+	if !hmac.Equal([]byte(req.Signature), []byte(expected)) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := h.doClient.DeleteDroplet(ctx, req.DropletID); err != nil {
+		slog.Error("HMAC destroy failed", "droplet_id", req.DropletID, "error", err)
+		http.Error(w, "delete failed", http.StatusInternalServerError)
+		return
+	}
+
+	metrics.DropletsDestroyed.WithLabelValues("callback").Inc()
+	slog.Info("HMAC destroy: deleted droplet", "droplet_id", req.DropletID)
+	w.WriteHeader(http.StatusOK)
+	_, _ = fmt.Fprint(w, "deleted")
+}
+
+func computeHMAC(message string, secret []byte) string {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(message))
+	return hex.EncodeToString(mac.Sum(nil))
 }

@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 )
@@ -144,9 +144,9 @@ func (a *App) RemoveOfflineRepoRunners(owner, repo string) (int, error) {
 	removed := 0
 	for _, r := range runners {
 		if r.Status == "offline" {
-			log.Printf("Removing offline runner %s (ID: %d) from %s/%s", r.Name, r.ID, owner, repo)
+			slog.Info("removing offline runner", "runner", r.Name, "runner_id", r.ID, "repo", fmt.Sprintf("%s/%s", owner, repo))
 			if err := a.RemoveRepoRunner(owner, repo, r.ID); err != nil {
-				log.Printf("Failed to remove runner %d: %v", r.ID, err)
+				slog.Error("failed to remove runner", "runner_id", r.ID, "error", err)
 				continue
 			}
 			removed++
@@ -213,7 +213,7 @@ func (a *App) ListInstallationRepos() ([][2]string, error) {
 // Logs failed attempts with client IP for security monitoring. (#10)
 func VerifyWebhookSignature(payload []byte, signature string, secret []byte, clientIP string) bool {
 	if !strings.HasPrefix(signature, "sha256=") {
-		log.Printf("SECURITY: invalid signature format from %s", clientIP)
+		slog.Warn("invalid signature format", "client_ip", clientIP)
 		return false
 	}
 
@@ -223,7 +223,7 @@ func VerifyWebhookSignature(payload []byte, signature string, secret []byte, cli
 
 	valid := hmac.Equal([]byte(signature[7:]), []byte(expected))
 	if !valid {
-		log.Printf("SECURITY: signature mismatch from %s", clientIP)
+		slog.Warn("signature mismatch", "client_ip", clientIP)
 	}
 	return valid
 }

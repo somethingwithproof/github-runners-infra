@@ -4,15 +4,18 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
+	"sync"
 	"text/template"
 	"time"
 
 	"github.com/digitalocean/godo"
+	"github.com/thomasvincent/github-runners-infra/internal/metrics"
 	"golang.org/x/oauth2"
 )
 
-// Client wraps the DigitalOcean API client.
+const maxPages = 50
+
 type Client struct {
 	client          *godo.Client
 	cloudInitTmpl   *template.Template
@@ -22,7 +25,6 @@ type Client struct {
 	sshFingerprints []string
 }
 
-// Config holds DigitalOcean client configuration.
 type Config struct {
 	Token           string
 	Region          string
@@ -32,7 +34,6 @@ type Config struct {
 	CloudInitPath   string
 }
 
-// NewClient creates a new DigitalOcean API client.
 func NewClient(cfg Config) (*Client, error) {
 	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: cfg.Token})
 	tc := oauth2.NewClient(context.Background(), ts)
@@ -69,15 +70,16 @@ func NewClient(cfg Config) (*Client, error) {
 // RunnerParams holds parameters for cloud-init template rendering.
 type RunnerParams struct {
 	RunnerName    string
-	RunnerToken   string // passed directly; no SSM required on the droplet
+	RunnerToken   string
 	RunnerLabels  string
 	RunnerOrg     string
 	RunnerRepo    string
-	DOToken       string
+	DOToken       string // used when callback is not configured
 	RunnerVersion string
+	DestroyToken  string // scoped self-destruct token (replaces DOToken when set)
+	CallbackURL   string // webhook server URL for self-destruct callback
 }
 
-// CreateRunner spins up an ephemeral runner droplet.
 func (c *Client) CreateRunner(ctx context.Context, params RunnerParams) (*godo.Droplet, error) {
 	var userData bytes.Buffer
 	if err := c.cloudInitTmpl.Execute(&userData, params); err != nil {
@@ -106,20 +108,21 @@ func (c *Client) CreateRunner(ctx context.Context, params RunnerParams) (*godo.D
 		return nil, fmt.Errorf("create droplet: %w", err)
 	}
 
-	log.Printf("Created runner droplet %s (ID: %d)", params.RunnerName, droplet.ID)
+	slog.Info("created runner droplet", "name", params.RunnerName, "droplet_id", droplet.ID)
 	return droplet, nil
 }
 
-// DeleteDroplet removes a droplet by ID.
 func (c *Client) DeleteDroplet(ctx context.Context, id int) error {
 	_, err := c.client.Droplets.Delete(ctx, id)
 	return err
 }
 
-const maxPages = 50
+// Ping verifies the DO API is reachable by listing one droplet.
+func (c *Client) Ping(ctx context.Context) error {
+	_, _, err := c.client.Droplets.ListByTag(ctx, "github-runner", &godo.ListOptions{PerPage: 1})
+	return err
+}
 
-// ListRunnerDroplets returns all droplets tagged as github-runner.
-// Paginates through all pages to ensure no droplets are missed.
 func (c *Client) ListRunnerDroplets(ctx context.Context) ([]godo.Droplet, error) {
 	var allDroplets []godo.Droplet
 	opt := &godo.ListOptions{PerPage: 200}
@@ -145,30 +148,57 @@ func (c *Client) ListRunnerDroplets(ctx context.Context) ([]godo.Droplet, error)
 }
 
 // CleanupOldDroplets deletes runner droplets older than maxAge.
+// Deletions run in parallel with bounded concurrency.
 func (c *Client) CleanupOldDroplets(ctx context.Context, maxAge time.Duration) (int, error) {
 	droplets, err := c.ListRunnerDroplets(ctx)
 	if err != nil {
 		return 0, err
 	}
 
-	cutoff := time.Now().Add(-maxAge)
-	deleted := 0
+	metrics.ActiveDroplets.Set(float64(len(droplets)))
 
+	cutoff := time.Now().Add(-maxAge)
+	var stale []godo.Droplet
 	for _, d := range droplets {
 		created, err := time.Parse(time.RFC3339, d.Created)
 		if err != nil {
-			log.Printf("WARN: cannot parse creation time for droplet %d (%q), skipping", d.ID, d.Created)
+			slog.Warn("cannot parse creation time, skipping", "droplet_id", d.ID, "created", d.Created)
 			continue
 		}
 		if created.Before(cutoff) {
-			log.Printf("Deleting stale runner droplet %s (ID: %d, created: %s)", d.Name, d.ID, d.Created)
-			if err := c.DeleteDroplet(ctx, d.ID); err != nil {
-				log.Printf("Failed to delete droplet %d: %v", d.ID, err)
-				continue
-			}
-			deleted++
+			stale = append(stale, d)
 		}
 	}
+
+	if len(stale) == 0 {
+		return 0, nil
+	}
+
+	var (
+		mu      sync.Mutex
+		deleted int
+		wg      sync.WaitGroup
+		sem     = make(chan struct{}, 10) // parallel deletion concurrency
+	)
+
+	for _, d := range stale {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(d godo.Droplet) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			slog.Info("deleting stale droplet", "name", d.Name, "droplet_id", d.ID, "created", d.Created)
+			if err := c.DeleteDroplet(ctx, d.ID); err != nil {
+				slog.Error("failed to delete droplet", "droplet_id", d.ID, "error", err)
+				return
+			}
+			metrics.CleanupDeleted.Inc()
+			mu.Lock()
+			deleted++
+			mu.Unlock()
+		}(d)
+	}
+	wg.Wait()
 
 	return deleted, nil
 }
