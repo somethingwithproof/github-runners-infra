@@ -108,6 +108,20 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Printf("Shutdown error: %v", err)
 	}
+
+	// Wait for in-flight provisioning goroutines to finish
+	done := make(chan struct{})
+	go func() {
+		handler.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		log.Printf("All provisioning goroutines completed")
+	case <-ctx.Done():
+		log.Printf("Timed out waiting for provisioning goroutines")
+	}
+
 	log.Printf("Server stopped")
 }
 

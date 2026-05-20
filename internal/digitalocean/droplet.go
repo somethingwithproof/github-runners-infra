@@ -153,7 +153,11 @@ func (c *Client) CleanupOldDroplets(ctx context.Context, maxAge time.Duration) (
 	deleted := 0
 
 	for _, d := range droplets {
-		created, _ := time.Parse(time.RFC3339, d.Created)
+		created, err := time.Parse(time.RFC3339, d.Created)
+		if err != nil {
+			log.Printf("WARN: cannot parse creation time for droplet %d (%q), skipping", d.ID, d.Created)
+			continue
+		}
 		if created.Before(cutoff) {
 			log.Printf("Deleting stale runner droplet %s (ID: %d, created: %s)", d.Name, d.ID, d.Created)
 			if err := c.DeleteDroplet(ctx, d.ID); err != nil {

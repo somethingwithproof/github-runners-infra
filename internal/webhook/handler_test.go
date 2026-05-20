@@ -257,7 +257,7 @@ func TestInputValidationRegexes(t *testing.T) {
 		allowed bool
 	}{
 		{"safe name: alphanumeric", safeNameRegex.MatchString, "my-repo_1", true},
-		{"safe name: with dots", safeNameRegex.MatchString, "my.repo", false},
+		{"safe name: with dots", safeNameRegex.MatchString, "my.repo", true},
 		{"safe name: injection attempt", safeNameRegex.MatchString, "repo;rm -rf /", false},
 		{"safe name: empty", safeNameRegex.MatchString, "", false},
 		{"repo: valid", repoRegex.MatchString, "owner/repo", true},

@@ -20,7 +20,7 @@ const maxBodySize = 1 * 1024 * 1024 // 1 MB (#3)
 
 // Input validation regexes (#9)
 var (
-	safeNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	safeNameRegex = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 	repoRegex     = regexp.MustCompile(`^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$`)
 )
 
@@ -60,6 +60,12 @@ type Handler struct {
 	runnerVersion string
 	workerPool    chan struct{}     // concurrency limiter (#8)
 	rateLimiter   *repoRateLimiter // per-repo rate limiter (#7)
+	wg            sync.WaitGroup   // tracks in-flight provisioning goroutines
+}
+
+// Wait blocks until all in-flight provisioning goroutines complete.
+func (h *Handler) Wait() {
+	h.wg.Wait()
 }
 
 // Config holds handler configuration.
@@ -212,7 +218,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Worker pool for bounded concurrency (#8)
 	select {
 	case h.workerPool <- struct{}{}:
+		h.wg.Add(1)
 		go func() {
+			defer h.wg.Done()
 			defer func() { <-h.workerPool }()
 			h.provisionRunner(event)
 		}()

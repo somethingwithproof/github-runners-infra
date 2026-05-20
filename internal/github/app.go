@@ -1,6 +1,7 @@
 package github
 
 import (
+	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
@@ -31,19 +32,30 @@ type App struct {
 	InstallationID int64
 	PrivateKey     []byte
 
+	keyOnce   sync.Once
+	parsedKey *rsa.PrivateKey
+	keyErr    error
+
 	tokenMu      sync.Mutex
 	cachedToken  string
 	tokenExpires time.Time
 }
 
+func (a *App) rsaKey() (*rsa.PrivateKey, error) {
+	a.keyOnce.Do(func() {
+		block, _ := pem.Decode(a.PrivateKey)
+		if block == nil {
+			a.keyErr = fmt.Errorf("failed to decode PEM block")
+			return
+		}
+		a.parsedKey, a.keyErr = x509.ParsePKCS1PrivateKey(block.Bytes)
+	})
+	return a.parsedKey, a.keyErr
+}
+
 // GenerateJWT creates a short-lived JWT for GitHub App authentication.
 func (a *App) GenerateJWT() (string, error) {
-	block, _ := pem.Decode(a.PrivateKey)
-	if block == nil {
-		return "", fmt.Errorf("failed to decode PEM block")
-	}
-
-	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	key, err := a.rsaKey()
 	if err != nil {
 		return "", fmt.Errorf("parse private key: %w", err)
 	}

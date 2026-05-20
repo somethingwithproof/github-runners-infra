@@ -5,9 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
-	"strings"
 	"testing"
 )
 
@@ -53,44 +50,24 @@ func testSign(payload, secret []byte) string {
 	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }
 
-func TestListRepoRunners_ParsesResponse(t *testing.T) {
+func TestRunnerJSON_Roundtrip(t *testing.T) {
 	runners := []Runner{
 		{ID: 1, Name: "eph-repo-1", Status: "online"},
 		{ID: 2, Name: "eph-repo-2", Status: "offline"},
 	}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/actions/runners") {
-			resp := struct {
-				TotalCount int      `json:"total_count"`
-				Runners    []Runner `json:"runners"`
-			}{
-				TotalCount: len(runners),
-				Runners:    runners,
-			}
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(resp)
-			return
+	for _, r := range runners {
+		data, err := json.Marshal(r)
+		if err != nil {
+			t.Fatalf("failed to marshal runner: %v", err)
 		}
-		// Installation token endpoint
-		if strings.Contains(r.URL.Path, "/access_tokens") {
-			w.WriteHeader(http.StatusCreated)
-			json.NewEncoder(w).Encode(map[string]string{"token": "test-token"})
-			return
+		var parsed Runner
+		if err := json.Unmarshal(data, &parsed); err != nil {
+			t.Fatalf("failed to unmarshal runner: %v", err)
 		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
-
-	// We can't easily test the full flow without mocking the GitHub API base URL,
-	// but we can verify the Runner struct serialization
-	data, _ := json.Marshal(runners[0])
-	var parsed Runner
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		t.Fatalf("failed to unmarshal runner: %v", err)
-	}
-	if parsed.ID != 1 || parsed.Name != "eph-repo-1" || parsed.Status != "online" {
-		t.Errorf("unexpected runner: %+v", parsed)
+		if parsed.ID != r.ID || parsed.Name != r.Name || parsed.Status != r.Status {
+			t.Errorf("roundtrip mismatch: got %+v, want %+v", parsed, r)
+		}
 	}
 }
 
