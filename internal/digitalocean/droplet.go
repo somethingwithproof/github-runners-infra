@@ -116,13 +116,15 @@ func (c *Client) DeleteDroplet(ctx context.Context, id int) error {
 	return err
 }
 
+const maxPages = 50
+
 // ListRunnerDroplets returns all droplets tagged as github-runner.
 // Paginates through all pages to ensure no droplets are missed.
 func (c *Client) ListRunnerDroplets(ctx context.Context) ([]godo.Droplet, error) {
 	var allDroplets []godo.Droplet
 	opt := &godo.ListOptions{PerPage: 200}
 
-	for {
+	for range maxPages {
 		droplets, resp, err := c.client.Droplets.ListByTag(ctx, "github-runner", opt)
 		if err != nil {
 			return nil, fmt.Errorf("list runner droplets: %w", err)

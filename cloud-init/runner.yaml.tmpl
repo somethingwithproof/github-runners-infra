@@ -76,6 +76,7 @@ runcmd:
     set -ex
     su - runner -c '
       cd /home/runner/actions-runner
+      trap "shred -u /home/runner/.runner-token 2>/dev/null" EXIT
       TOKEN=$(cat /home/runner/.runner-token)
       ./config.sh \
         --url "https://github.com/{{.RunnerRepo}}" \
@@ -84,7 +85,6 @@ runcmd:
         --labels "{{.RunnerLabels}}" \
         --ephemeral \
         --unattended
-      shred -u /home/runner/.runner-token
       ./run.sh
     '
 
