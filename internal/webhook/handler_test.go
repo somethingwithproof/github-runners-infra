@@ -22,16 +22,19 @@ func signPayload(payload []byte, secret string) string {
 	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }
 
-func newTestHandler() *Handler {
-	return NewHandler(Config{
+func newTestHandler(t *testing.T) *Handler {
+	t.Helper()
+	h := NewHandler(Config{
 		WebhookSecret:    []byte(testSecret),
 		MaxConcurrent:    2,
 		MaxPerRepoPerMin: 5,
 	})
+	t.Cleanup(h.Stop)
+	return h
 }
 
 func TestMethodNotAllowed(t *testing.T) {
-	h := newTestHandler()
+	h := newTestHandler(t)
 	req := httptest.NewRequest(http.MethodGet, "/webhook", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
@@ -42,7 +45,7 @@ func TestMethodNotAllowed(t *testing.T) {
 }
 
 func TestInvalidSignature(t *testing.T) {
-	h := newTestHandler()
+	h := newTestHandler(t)
 	body := `{}`
 	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(body))
 	req.Header.Set("X-Hub-Signature-256", "sha256=bad")
@@ -55,7 +58,7 @@ func TestInvalidSignature(t *testing.T) {
 }
 
 func TestNonWorkflowJobEvent(t *testing.T) {
-	h := newTestHandler()
+	h := newTestHandler(t)
 	body := `{}`
 	sig := signPayload([]byte(body), testSecret)
 
@@ -71,7 +74,7 @@ func TestNonWorkflowJobEvent(t *testing.T) {
 }
 
 func TestNonQueuedAction(t *testing.T) {
-	h := newTestHandler()
+	h := newTestHandler(t)
 	event := WorkflowJobEvent{
 		Action: "completed",
 		WorkflowJob: WorkflowJob{
@@ -94,7 +97,7 @@ func TestNonQueuedAction(t *testing.T) {
 }
 
 func TestMissingRequiredLabel(t *testing.T) {
-	h := newTestHandler()
+	h := newTestHandler(t)
 	event := WorkflowJobEvent{
 		Action: "queued",
 		WorkflowJob: WorkflowJob{
@@ -117,7 +120,7 @@ func TestMissingRequiredLabel(t *testing.T) {
 }
 
 func TestHasRequiredLabel(t *testing.T) {
-	h := newTestHandler()
+	h := newTestHandler(t)
 	tests := []struct {
 		labels []string
 		want   bool
@@ -281,6 +284,7 @@ func TestWorkerPoolFull(t *testing.T) {
 		WebhookSecret: []byte(testSecret),
 		MaxConcurrent: 1,
 	})
+	t.Cleanup(h.Stop)
 
 	// Fill the worker pool
 	h.workerPool <- struct{}{}
@@ -312,6 +316,7 @@ func TestWorkerPoolFull(t *testing.T) {
 
 func TestNewHandlerDefaults(t *testing.T) {
 	h := NewHandler(Config{})
+	t.Cleanup(h.Stop)
 
 	if h.requiredLabel != "self-hosted" {
 		t.Errorf("expected default label 'self-hosted', got %q", h.requiredLabel)

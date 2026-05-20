@@ -1,4 +1,8 @@
 runners.pausatf.org {
+    # Block internal endpoints from external access
+    @internal path /metrics /ready
+    respond @internal 404
+
     reverse_proxy localhost:8080
 
     header {

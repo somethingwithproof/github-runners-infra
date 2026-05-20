@@ -4,12 +4,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
-  - package-ecosystem: terraform
+  - package-ecosystem: gomod
     directory: /
     schedule:
       interval: weekly
-  - package-ecosystem: "npm"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 10

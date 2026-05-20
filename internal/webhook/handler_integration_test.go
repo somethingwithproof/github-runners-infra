@@ -10,7 +10,7 @@ import (
 )
 
 func TestDeduplication(t *testing.T) {
-	h := newTestHandler()
+	h := newTestHandler(t)
 	event := WorkflowJobEvent{
 		Action: "queued",
 		WorkflowJob: WorkflowJob{
@@ -34,6 +34,9 @@ func TestDeduplication(t *testing.T) {
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("first request: expected 202, got %d", w.Code)
 	}
+
+	// Wait for the provisioning goroutine to finish (it will fail fast since githubApp is nil)
+	h.Wait()
 
 	// Second request with same job ID should be deduped
 	req2 := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
@@ -81,7 +84,7 @@ func TestDeduplicatorExpiry(t *testing.T) {
 }
 
 func TestDestroyEndpoint_InvalidMethod(t *testing.T) {
-	h := newTestHandler()
+	h := newTestHandler(t)
 	req := httptest.NewRequest(http.MethodGet, "/destroy", nil)
 	w := httptest.NewRecorder()
 	h.HandleDestroy(w, req)
@@ -92,7 +95,7 @@ func TestDestroyEndpoint_InvalidMethod(t *testing.T) {
 }
 
 func TestDestroyEndpoint_UnknownToken(t *testing.T) {
-	h := newTestHandler()
+	h := newTestHandler(t)
 	body := `{"destroy_token":"aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233"}`
 	req := httptest.NewRequest(http.MethodPost, "/destroy", strings.NewReader(body))
 	w := httptest.NewRecorder()
@@ -104,7 +107,7 @@ func TestDestroyEndpoint_UnknownToken(t *testing.T) {
 }
 
 func TestDestroyEndpoint_InvalidToken(t *testing.T) {
-	h := newTestHandler()
+	h := newTestHandler(t)
 	body := `{"destroy_token":"not-hex!"}`
 	req := httptest.NewRequest(http.MethodPost, "/destroy", strings.NewReader(body))
 	w := httptest.NewRecorder()
@@ -116,7 +119,7 @@ func TestDestroyEndpoint_InvalidToken(t *testing.T) {
 }
 
 func TestDestroyEndpoint_EmptyBody(t *testing.T) {
-	h := newTestHandler()
+	h := newTestHandler(t)
 	body := `{}`
 	req := httptest.NewRequest(http.MethodPost, "/destroy", strings.NewReader(body))
 	w := httptest.NewRecorder()
@@ -128,7 +131,7 @@ func TestDestroyEndpoint_EmptyBody(t *testing.T) {
 }
 
 func TestHMACDestroy_NotConfigured(t *testing.T) {
-	h := newTestHandler() // no destroy secret configured
+	h := newTestHandler(t) // no destroy secret configured
 	body := `{"droplet_id":123,"signature":"abc"}`
 	req := httptest.NewRequest(http.MethodPost, "/destroy/hmac", strings.NewReader(body))
 	w := httptest.NewRecorder()
@@ -144,6 +147,7 @@ func TestHMACDestroy_BadSignature(t *testing.T) {
 		WebhookSecret: []byte(testSecret),
 		DestroySecret: "test-destroy-secret",
 	})
+	t.Cleanup(h.Stop)
 
 	body := `{"droplet_id":123,"signature":"badsig"}`
 	req := httptest.NewRequest(http.MethodPost, "/destroy/hmac", strings.NewReader(body))

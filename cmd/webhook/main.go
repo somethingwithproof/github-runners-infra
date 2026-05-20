@@ -77,7 +77,12 @@ func main() {
 
 	var maxActiveDroplets int
 	if v := os.Getenv("MAX_ACTIVE_DROPLETS"); v != "" {
-		maxActiveDroplets, _ = strconv.Atoi(v)
+		var err error
+		maxActiveDroplets, err = strconv.Atoi(v)
+		if err != nil {
+			slog.Error("invalid MAX_ACTIVE_DROPLETS", "value", v, "error", err)
+			os.Exit(1)
+		}
 	}
 
 	doClient, err := digitalocean.NewClient(digitalocean.Config{
@@ -141,17 +146,23 @@ func main() {
 
 	shutdownCh := make(chan os.Signal, 1)
 	signal.Notify(shutdownCh, syscall.SIGTERM, syscall.SIGINT)
+	serverErr := make(chan error, 1)
 
 	go func() {
 		slog.Info("webhook listener starting", "addr", listenAddr, "runner_version", runnerVersion)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Error("server failed", "error", err)
-			os.Exit(1)
+			serverErr <- err
 		}
 	}()
 
-	<-shutdownCh
-	slog.Info("shutdown signal received, draining...")
+	select {
+	case <-shutdownCh:
+		slog.Info("shutdown signal received, draining...")
+	case err := <-serverErr:
+		slog.Error("server failed", "error", err)
+		handler.Stop()
+		os.Exit(1)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -170,6 +181,8 @@ func main() {
 	case <-ctx.Done():
 		slog.Warn("timed out waiting for provisioning goroutines")
 	}
+
+	handler.Stop()
 
 	slog.Info("server stopped")
 }

@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/thomasvincent/github-runners-infra/internal/digitalocean"
@@ -54,20 +55,22 @@ type RepoInfo struct {
 }
 
 type Handler struct {
-	webhookSecret    []byte
-	githubApp        *gh.App
-	doClient         *digitalocean.Client
-	doToken          string
-	requiredLabel    string
-	runnerVersion    string
-	callbackURL      string
-	destroySecret    []byte
-	maxActiveDroplets int
-	workerPool       chan struct{}
-	rateLimiter      *repoRateLimiter
-	wg               sync.WaitGroup
-	dedup            *jobDeduplicator
-	destroyTokens    sync.Map // token → dropletID
+	webhookSecret     []byte
+	githubApp         *gh.App
+	doClient          *digitalocean.Client
+	doToken           string
+	requiredLabel     string
+	runnerVersion     string
+	callbackURL       string
+	destroySecret     []byte
+	maxActiveDroplets int64
+	activeCount       atomic.Int64 // tracks in-flight + created droplets for cost cap
+	workerPool        chan struct{}
+	rateLimiter       *repoRateLimiter
+	wg                sync.WaitGroup
+	dedup             *jobDeduplicator
+	destroyTokens     sync.Map // token → dropletID
+	stop              func()   // cancels background goroutines
 }
 
 func (h *Handler) Wait() {
@@ -131,6 +134,27 @@ func (rl *repoRateLimiter) allow(repo string) bool {
 	return true
 }
 
+// sweep removes all expired entries from all repos.
+func (rl *repoRateLimiter) sweep() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	cutoff := time.Now().Add(-rl.window)
+	for repo, times := range rl.buckets {
+		valid := times[:0]
+		for _, t := range times {
+			if t.After(cutoff) {
+				valid = append(valid, t)
+			}
+		}
+		if len(valid) == 0 {
+			delete(rl.buckets, repo)
+		} else {
+			rl.buckets[repo] = valid
+		}
+	}
+}
+
 // jobDeduplicator prevents duplicate provisioning for the same workflow job.
 type jobDeduplicator struct {
 	mu   sync.Mutex
@@ -138,12 +162,12 @@ type jobDeduplicator struct {
 	ttl  time.Duration
 }
 
-func newJobDeduplicator(ttl time.Duration) *jobDeduplicator {
+func newJobDeduplicator(ctx context.Context, ttl time.Duration) *jobDeduplicator {
 	d := &jobDeduplicator{
 		seen: make(map[int64]time.Time),
 		ttl:  ttl,
 	}
-	go d.cleanupLoop()
+	go d.cleanupLoop(ctx)
 	return d
 }
 
@@ -158,18 +182,23 @@ func (d *jobDeduplicator) isDuplicate(jobID int64) bool {
 	return false
 }
 
-func (d *jobDeduplicator) cleanupLoop() {
+func (d *jobDeduplicator) cleanupLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
-		d.mu.Lock()
-		cutoff := time.Now().Add(-d.ttl)
-		for id, t := range d.seen {
-			if t.Before(cutoff) {
-				delete(d.seen, id)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			d.mu.Lock()
+			cutoff := time.Now().Add(-d.ttl)
+			for id, t := range d.seen {
+				if t.Before(cutoff) {
+					delete(d.seen, id)
+				}
 			}
+			d.mu.Unlock()
 		}
-		d.mu.Unlock()
 	}
 }
 
@@ -190,9 +219,9 @@ func NewHandler(cfg Config) *Handler {
 	if maxPerRepo <= 0 {
 		maxPerRepo = 20
 	}
-	maxActive := cfg.MaxActiveDroplets
-	if maxActive <= 0 {
-		maxActive = 0 // disabled
+	var maxActive int64
+	if cfg.MaxActiveDroplets > 0 {
+		maxActive = int64(cfg.MaxActiveDroplets)
 	}
 
 	var destroySecret []byte
@@ -200,7 +229,9 @@ func NewHandler(cfg Config) *Handler {
 		destroySecret = []byte(cfg.DestroySecret)
 	}
 
-	return &Handler{
+	ctx, cancel := context.WithCancel(context.Background())
+
+	h := &Handler{
 		webhookSecret:     cfg.WebhookSecret,
 		githubApp:         cfg.GitHubApp,
 		doClient:          cfg.DOClient,
@@ -212,7 +243,31 @@ func NewHandler(cfg Config) *Handler {
 		maxActiveDroplets: maxActive,
 		workerPool:        make(chan struct{}, maxConcurrent),
 		rateLimiter:       newRepoRateLimiter(maxPerRepo),
-		dedup:             newJobDeduplicator(10 * time.Minute),
+		dedup:             newJobDeduplicator(ctx, 10*time.Minute),
+		stop:              cancel,
+	}
+
+	// Periodic sweep of stale rate limiter keys (repos that stopped sending webhooks)
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				h.rateLimiter.sweep()
+			}
+		}
+	}()
+
+	return h
+}
+
+// Stop cancels background goroutines. Call during shutdown or in tests.
+func (h *Handler) Stop() {
+	if h.stop != nil {
+		h.stop()
 	}
 }
 
@@ -337,16 +392,15 @@ func (h *Handler) provisionRunner(event WorkflowJobEvent) {
 		return
 	}
 
-	// Cost guardrail: check active droplet count
+	// Cost guardrail: atomic counter prevents TOCTOU race
 	if h.maxActiveDroplets > 0 {
-		droplets, err := h.doClient.ListRunnerDroplets(ctx)
-		if err != nil {
-			slog.Error("failed to check active droplets", "error", err)
-		} else if len(droplets) >= h.maxActiveDroplets {
-			slog.Warn("active droplet cap reached", "active", len(droplets), "cap", h.maxActiveDroplets, "job_id", jobID)
+		if h.activeCount.Load() >= h.maxActiveDroplets {
+			slog.Warn("active droplet cap reached", "active", h.activeCount.Load(), "cap", h.maxActiveDroplets, "job_id", jobID)
 			metrics.ProvisioningErrors.Inc()
 			return
 		}
+		h.activeCount.Add(1)
+		defer h.activeCount.Add(-1)
 	}
 
 	runnerToken, err := h.githubApp.GenerateRepoRunnerToken(owner, repo)
@@ -358,7 +412,7 @@ func (h *Handler) provisionRunner(event WorkflowJobEvent) {
 
 	runnerName := fmt.Sprintf("eph-%s-%d-%d", repo, jobID, time.Now().Unix())
 	if len(runnerName) > 63 {
-		runnerName = runnerName[:63]
+		runnerName = strings.TrimRight(runnerName[:63], "-.")
 	}
 
 	var safeLabels []string
@@ -454,7 +508,12 @@ func (h *Handler) HandleDestroy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dropletID := val.(int)
+	dropletID, ok2 := val.(int)
+	if !ok2 {
+		slog.Error("destroy token mapped to unexpected type", "token", req.DestroyToken)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
