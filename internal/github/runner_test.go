@@ -69,13 +69,17 @@ func TestListRepoRunners_ParsesResponse(t *testing.T) {
 				Runners:    runners,
 			}
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(resp)
+			if err := json.NewEncoder(w).Encode(resp); err != nil {
+				t.Errorf("failed to encode runners response: %v", err)
+			}
 			return
 		}
 		// Installation token endpoint
 		if strings.Contains(r.URL.Path, "/access_tokens") {
 			w.WriteHeader(http.StatusCreated)
-			json.NewEncoder(w).Encode(map[string]string{"token": "test-token"})
+			if err := json.NewEncoder(w).Encode(map[string]string{"token": "test-token"}); err != nil {
+				t.Errorf("failed to encode token response: %v", err)
+			}
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
