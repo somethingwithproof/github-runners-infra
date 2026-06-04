@@ -17,9 +17,17 @@ func main() {
 		log.Fatal("DIGITALOCEAN_TOKEN is required")
 	}
 
+	// NewClient parses the cloud-init template even though cleanup never
+	// provisions droplets, so resolve the path the same way the webhook does
+	// instead of hardcoding a relative path that only works from the repo root.
+	cloudInitPath := os.Getenv("CLOUD_INIT_PATH")
+	if cloudInitPath == "" {
+		cloudInitPath = "cloud-init/runner.yaml.tmpl"
+	}
+
 	client, err := digitalocean.NewClient(digitalocean.Config{
 		Token:         doToken,
-		CloudInitPath: "cloud-init/runner.yaml.tmpl",
+		CloudInitPath: cloudInitPath,
 	})
 	if err != nil {
 		log.Fatalf("Failed to create DO client: %v", err)
