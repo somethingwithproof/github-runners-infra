@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/thomasvincent/github-runners-infra/internal/digitalocean"
 	gh "github.com/thomasvincent/github-runners-infra/internal/github"
+	"github.com/thomasvincent/github-runners-infra/internal/provider"
 )
 
 const maxBodySize = 1 * 1024 * 1024 // 1 MB (#3)
@@ -34,6 +34,7 @@ type WorkflowJobEvent struct {
 
 type WorkflowJob struct {
 	ID     int64    `json:"id"`
+	RunID  int64    `json:"run_id"`
 	Name   string   `json:"name"`
 	Labels []string `json:"labels"`
 }
@@ -54,11 +55,11 @@ type RepoInfo struct {
 type Handler struct {
 	webhookSecret []byte
 	githubApp     *gh.App
-	doClient      *digitalocean.Client
+	provisioner   provider.Provisioner
 	doToken       string
 	requiredLabel string
 	runnerVersion string
-	workerPool    chan struct{}     // concurrency limiter (#8)
+	workerPool    chan struct{}    // concurrency limiter (#8)
 	rateLimiter   *repoRateLimiter // per-repo rate limiter (#7)
 }
 
@@ -66,7 +67,7 @@ type Handler struct {
 type Config struct {
 	WebhookSecret    []byte
 	GitHubApp        *gh.App
-	DOClient         *digitalocean.Client
+	Provisioner      provider.Provisioner
 	DOToken          string
 	RequiredLabel    string
 	RunnerVersion    string
@@ -141,7 +142,7 @@ func NewHandler(cfg Config) *Handler {
 	return &Handler{
 		webhookSecret: cfg.WebhookSecret,
 		githubApp:     cfg.GitHubApp,
-		doClient:      cfg.DOClient,
+		provisioner:   cfg.Provisioner,
 		doToken:       cfg.DOToken,
 		requiredLabel: label,
 		runnerVersion: version,
@@ -189,18 +190,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if event.Action != "queued" {
-		w.WriteHeader(http.StatusOK)
-		_, _ = fmt.Fprint(w, "ok")
-		return
-	}
-
+	// Only act on jobs targeting our runner label; ignore everything else so
+	// completed events for other runners don't trigger spurious deletes.
 	if !h.hasRequiredLabel(event.WorkflowJob.Labels) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = fmt.Fprint(w, "ok")
 		return
 	}
 
+	switch event.Action {
+	case "queued":
+		h.handleQueued(w, event, clientIP)
+	case "completed":
+		h.handleCompleted(w, event)
+	default:
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, "ok")
+	}
+}
+
+func (h *Handler) handleQueued(w http.ResponseWriter, event WorkflowJobEvent, clientIP string) {
 	// Rate limit per repo (#7)
 	repoKey := event.Repo.FullName
 	if !h.rateLimiter.allow(repoKey) {
@@ -220,6 +229,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprint(w, "provisioning")
 	default:
 		log.Printf("WARN: worker pool full, rejecting job %d", event.WorkflowJob.ID)
+		http.Error(w, "system busy", http.StatusServiceUnavailable)
+	}
+}
+
+// handleCompleted tears down the runner VM as the control-plane identity. The
+// runner-node SA is log-only and cannot delete itself, so teardown MUST happen
+// here. The cleanup reaper is the backstop for completion events that never
+// arrive (missed webhook, control-plane crash).
+func (h *Handler) handleCompleted(w http.ResponseWriter, event WorkflowJobEvent) {
+	select {
+	case h.workerPool <- struct{}{}:
+		go func() {
+			defer func() { <-h.workerPool }()
+			h.teardownRunner(event)
+		}()
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = fmt.Fprint(w, "tearing down")
+	default:
+		// Backstopped by the reaper; shed load rather than queue unbounded.
+		log.Printf("WARN: worker pool full, deferring teardown of job %d to reaper", event.WorkflowJob.ID)
 		http.Error(w, "system busy", http.StatusServiceUnavailable)
 	}
 }
@@ -252,10 +281,7 @@ func (h *Handler) provisionRunner(event WorkflowJobEvent) {
 		return
 	}
 
-	runnerName := fmt.Sprintf("eph-%s-%d-%d", repo, event.WorkflowJob.ID, time.Now().Unix())
-	if len(runnerName) > 63 {
-		runnerName = runnerName[:63]
-	}
+	runnerName := instanceName(repo, event.WorkflowJob.RunID, event.WorkflowJob.ID)
 
 	// Validate and sanitize labels (#9)
 	var safeLabels []string
@@ -273,7 +299,7 @@ func (h *Handler) provisionRunner(event WorkflowJobEvent) {
 		return
 	}
 
-	params := digitalocean.RunnerParams{
+	params := provider.RunnerParams{
 		RunnerName:    runnerName,
 		RunnerToken:   runnerToken,
 		RunnerLabels:  labels,
@@ -283,12 +309,75 @@ func (h *Handler) provisionRunner(event WorkflowJobEvent) {
 		RunnerVersion: h.runnerVersion,
 	}
 
-	droplet, err := h.doClient.CreateRunner(ctx, params)
+	inst, err := h.provisioner.Create(ctx, params)
 	if err != nil {
-		log.Printf("ERROR: create droplet for job %d: %v", event.WorkflowJob.ID, err)
+		log.Printf("ERROR: create runner for job %d: %v", event.WorkflowJob.ID, err)
 		return
 	}
 
-	log.Printf("Provisioned runner %s (droplet %d) for %s job %d",
-		runnerName, droplet.ID, repoFull, event.WorkflowJob.ID)
+	log.Printf("Provisioned runner %s (instance %s) for %s job %d",
+		runnerName, inst.ID, repoFull, event.WorkflowJob.ID)
+}
+
+// teardownRunner deletes the instance provisioned for a now-completed job. The
+// instance name is re-derived from the same job/run ids the queued event used,
+// so the two events resolve to the same host without any shared state.
+func (h *Handler) teardownRunner(event WorkflowJobEvent) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	repo := event.Repo.Name
+	if !safeNameRegex.MatchString(repo) {
+		log.Printf("ERROR: invalid repo on completed event: %s", repo)
+		return
+	}
+
+	name := instanceName(repo, event.WorkflowJob.RunID, event.WorkflowJob.ID)
+	if err := h.provisioner.Delete(ctx, name); err != nil {
+		// A missing instance is benign: the runner may have already gone via
+		// Spot termination or the reaper. Log and move on.
+		log.Printf("Teardown of %s (job %d) failed: %v", name, event.WorkflowJob.ID, err)
+		return
+	}
+
+	log.Printf("Tore down runner %s for %s job %d", name, event.Repo.FullName, event.WorkflowJob.ID)
+}
+
+// instanceName derives the runner host name from the job/run ids. It must be
+// deterministic so the queued and completed webhooks resolve to the same
+// instance; the runner registers under this name (--ephemeral), so it doubles
+// as the GitHub runner name.
+//
+// The result is RFC1035-valid for GCE: lowercase, starts with a letter (the
+// "eph-" prefix guarantees this), only [a-z0-9-] otherwise, no trailing hyphen,
+// at most 63 chars. The repo segment is sanitized in-place so that both webhook
+// paths derive the same name from the same inputs. An unsanitized name is
+// rejected by GCE at insert time and the job silently hangs to timeout.
+func instanceName(repo string, runID, jobID int64) string {
+	name := fmt.Sprintf("eph-%s-%d-%d", sanitizeNameSegment(repo), runID, jobID)
+	if len(name) > 63 {
+		name = name[:63]
+	}
+	// Truncation can land on a hyphen; RFC1035 forbids a trailing one.
+	return strings.TrimRight(name, "-")
+}
+
+// sanitizeNameSegment lowercases s and replaces every run of characters outside
+// [a-z0-9] with a single hyphen, leaving an RFC1035-safe label fragment.
+func sanitizeNameSegment(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	prevHyphen := false
+	for _, r := range strings.ToLower(s) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			prevHyphen = false
+			continue
+		}
+		if !prevHyphen {
+			b.WriteByte('-')
+			prevHyphen = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
 }

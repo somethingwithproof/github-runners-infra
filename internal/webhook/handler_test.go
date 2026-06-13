@@ -1,18 +1,50 @@
 package webhook
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	gh "github.com/thomasvincent/github-runners-infra/internal/github"
+	"github.com/thomasvincent/github-runners-infra/internal/provider"
 )
+
+// fakeProvisioner records the names passed to Delete so completion handling can
+// be asserted without touching any cloud API.
+type fakeProvisioner struct {
+	mu      sync.Mutex
+	deleted []string
+	done    chan struct{}
+}
+
+func newFakeProvisioner() *fakeProvisioner {
+	return &fakeProvisioner{done: make(chan struct{}, 1)}
+}
+
+func (f *fakeProvisioner) Create(context.Context, provider.RunnerParams) (provider.Instance, error) {
+	return provider.Instance{}, nil
+}
+
+func (f *fakeProvisioner) Delete(_ context.Context, name string) error {
+	f.mu.Lock()
+	f.deleted = append(f.deleted, name)
+	f.mu.Unlock()
+	f.done <- struct{}{}
+	return nil
+}
+
+func (f *fakeProvisioner) CleanupOld(context.Context, time.Duration) (int, error) {
+	return 0, nil
+}
 
 const testSecret = "test-webhook-secret"
 
@@ -70,10 +102,10 @@ func TestNonWorkflowJobEvent(t *testing.T) {
 	}
 }
 
-func TestNonQueuedAction(t *testing.T) {
+func TestIgnoredAction(t *testing.T) {
 	h := newTestHandler()
 	event := WorkflowJobEvent{
-		Action: "completed",
+		Action: "in_progress",
 		WorkflowJob: WorkflowJob{
 			ID:     1,
 			Labels: []string{"self-hosted"},
@@ -90,6 +122,99 @@ func TestNonQueuedAction(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200 for non-queued action, got %d", w.Code)
+	}
+}
+
+func TestCompletedActionDeletesInstance(t *testing.T) {
+	fake := newFakeProvisioner()
+	h := NewHandler(Config{
+		WebhookSecret:    []byte(testSecret),
+		Provisioner:      fake,
+		MaxConcurrent:    2,
+		MaxPerRepoPerMin: 5,
+	})
+
+	event := WorkflowJobEvent{
+		Action: "completed",
+		WorkflowJob: WorkflowJob{
+			ID:     42,
+			RunID:  100,
+			Labels: []string{"self-hosted"},
+		},
+		Repo: RepoInfo{FullName: "org/repo", Name: "repo"},
+	}
+	body, _ := json.Marshal(event)
+	sig := signPayload(body, testSecret)
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
+	req.Header.Set("X-Hub-Signature-256", sig)
+	req.Header.Set("X-GitHub-Event", "workflow_job")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 for completed action, got %d", w.Code)
+	}
+
+	select {
+	case <-fake.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Delete was not called for completed event")
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	want := instanceName("repo", 100, 42)
+	if len(fake.deleted) != 1 || fake.deleted[0] != want {
+		t.Errorf("Delete called with %v, want [%s]", fake.deleted, want)
+	}
+}
+
+// The queued and completed events must resolve to the same instance name from
+// only the job/run ids they share.
+func TestInstanceNameDeterministic(t *testing.T) {
+	a := instanceName("repo", 100, 42)
+	b := instanceName("repo", 100, 42)
+	if a != b {
+		t.Errorf("instanceName not deterministic: %q != %q", a, b)
+	}
+	if len(instanceName(strings.Repeat("x", 80), 100, 42)) > 63 {
+		t.Error("instanceName exceeds 63-char GCE limit")
+	}
+}
+
+// rfc1035 matches the GCE instance-name grammar: lowercase, starts with a
+// letter, only [a-z0-9-] after, no trailing hyphen, <=63 chars.
+var rfc1035 = regexp.MustCompile(`^[a-z]([-a-z0-9]*[a-z0-9])?$`)
+
+// A repo with uppercase and an underscore must sanitize to an RFC1035-valid
+// name, and the queued/completed paths (same args) must agree on it.
+func TestInstanceNameSanitizesRepo(t *testing.T) {
+	name := instanceName("My_Repo", 100, 42)
+	if !rfc1035.MatchString(name) {
+		t.Errorf("instanceName(%q) = %q, not RFC1035-valid", "My_Repo", name)
+	}
+	if len(name) > 63 {
+		t.Errorf("instanceName = %q (%d chars), exceeds 63", name, len(name))
+	}
+	if got := instanceName("My_Repo", 100, 42); got != name {
+		t.Errorf("queued/completed disagree: %q != %q", got, name)
+	}
+}
+
+// Truncation must not leave a trailing hyphen.
+func TestInstanceNameNoTrailingHyphenAfterTruncation(t *testing.T) {
+	// "a-" repeated lands a hyphen at the 63-char boundary before trimming.
+	repo := strings.Repeat("a-", 60)
+	name := instanceName(repo, 1, 2)
+	if strings.HasSuffix(name, "-") {
+		t.Errorf("instanceName = %q ends in a hyphen", name)
+	}
+	if len(name) > 63 {
+		t.Errorf("instanceName = %q (%d chars), exceeds 63", name, len(name))
+	}
+	if !rfc1035.MatchString(name) {
+		t.Errorf("instanceName = %q, not RFC1035-valid", name)
 	}
 }
 

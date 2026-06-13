@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# GCE startup-script for an ephemeral GitHub Actions runner on a Spot VM.
+# Installs Docker + the runner, registers --ephemeral, runs one job, then exits.
+#
+# Teardown is control-plane-driven: the webhook host deletes this VM on the
+# workflow_job "completed" event (it runs as runner-control, which has
+# instanceAdmin). The runner-node SA attached here is log-only by design, so a
+# compromised CI job cannot delete instances. Do NOT re-add a self-delete here;
+# the cleanup reaper and Spot termination-action=DELETE cover the edge cases.
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update
+apt-get install -y docker.io build-essential curl git jq unzip \
+  libyaml-dev libssl-dev zlib1g-dev
+systemctl enable docker
+systemctl start docker
+
+id -u runner &>/dev/null || useradd -m -s /bin/bash runner
+usermod -aG docker runner
+
+mkdir -p /opt/hostedtoolcache && chown runner:runner /opt/hostedtoolcache
+
+# Install the GitHub Actions runner with checksum verification.
+mkdir -p /home/runner/actions-runner
+cd /home/runner/actions-runner
+RUNNER_URL="https://github.com/actions/runner/releases/download/v{{.RunnerVersion}}/actions-runner-linux-x64-{{.RunnerVersion}}.tar.gz"
+curl -fsSL -o actions-runner.tar.gz "$RUNNER_URL"
+curl -fsSL -o actions-runner.tar.gz.sha256 "$RUNNER_URL.sha256"
+sha256sum -c actions-runner.tar.gz.sha256
+tar xzf actions-runner.tar.gz
+rm actions-runner.tar.gz actions-runner.tar.gz.sha256
+chown -R runner:runner /home/runner/actions-runner
+
+# Token passed via startup-script params; written then shredded after config.
+echo '{{.RunnerToken}}' > /home/runner/.runner-token
+chmod 600 /home/runner/.runner-token
+chown runner:runner /home/runner/.runner-token
+
+su - runner -c '
+  cd /home/runner/actions-runner
+  TOKEN=$(cat /home/runner/.runner-token)
+  ./config.sh \
+    --url "https://github.com/{{.RunnerRepo}}" \
+    --token "$TOKEN" \
+    --name "{{.RunnerName}}" \
+    --labels "{{.RunnerLabels}}" \
+    --ephemeral \
+    --unattended
+  shred -u /home/runner/.runner-token
+  ./run.sh
+'
