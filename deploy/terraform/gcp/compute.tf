@@ -29,7 +29,10 @@ resource "google_compute_instance_template" "runner" {
 
   network_interface {
     subnetwork = google_compute_subnetwork.runners.id
-    # No access_config block => no external IP. Egress is via Cloud NAT.
+    # Ephemeral external IP for egress only. Cheaper than a 24/7 Cloud NAT
+    # gateway for bursty ephemeral runners; deny_all_ingress keeps the VM
+    # unreachable inbound, so the public IP is outbound-only.
+    access_config {}
   }
 
   service_account {
@@ -78,7 +81,9 @@ resource "google_compute_instance" "webhook_host" {
 
   network_interface {
     subnetwork = google_compute_subnetwork.runners.id
-    # No access_config => no external IP.
+    # Ephemeral external IP for egress (reach GitHub + GCP APIs and open the
+    # cloudflared tunnel outbound). deny_all_ingress keeps it unreachable inbound.
+    access_config {}
   }
 
   service_account {

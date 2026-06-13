@@ -9,7 +9,7 @@ creates and tears down runner VMs in response to GitHub job events.
 - `versions.tf`   provider/backend pinning
 - `project.tf`    project + enabled APIs
 - `iam.tf`        the two service accounts and their (least-privilege) bindings
-- `network.tf`    VPC, subnet, Cloud Router + NAT, firewall
+- `network.tf`    VPC, subnet, firewall (egress via ephemeral IPs)
 - `secrets.tf`    four Secret Manager secret shells (no values)
 - `compute.tf`    Spot runner instance template + webhook host VM
 - `variables.tf`  all knobs
@@ -32,7 +32,7 @@ Terraform resolves most of this through `depends_on`, but the intended order is:
 2. `google_project_service.enabled` — compute, iam, secretmanager, logging.
    Everything else depends on these.
 3. Service accounts (`runner-control`, `runner-node`) and their IAM bindings.
-4. Network: VPC → subnet → router → NAT → firewall.
+4. Network: VPC → subnet → firewall (ephemeral egress IPs, no NAT).
 5. Secrets (shells only).
 6. Compute: runner instance template, then the webhook host.
 
@@ -62,9 +62,11 @@ Only the `runner-control` SA can read these secrets (per-secret
 
 ## Networking and ingress
 
-Runner VMs have no external IP and reach GitHub through Cloud NAT. There is no
-inbound firewall allow rule; an explicit `deny-all-ingress` rule documents the
-fail-closed posture. GitHub webhook delivery reaches the webhook host over a
+Runner VMs reach GitHub through an ephemeral external IP (egress only); there is
+no Cloud NAT, because its fixed hourly gateway charge would dominate the bill for
+bursty ephemeral runners. There is no inbound firewall allow rule; an explicit
+`deny-all-ingress` rule keeps every VM unreachable inbound, so the egress IP is
+outbound-only. GitHub webhook delivery reaches the webhook host over a
 **cloudflared tunnel provisioned separately** (an outbound connection from the
 host to Cloudflare's edge); nothing is opened inbound here.
 

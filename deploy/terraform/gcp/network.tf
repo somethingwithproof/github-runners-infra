@@ -23,34 +23,9 @@ resource "google_compute_subnetwork" "runners" {
   }
 }
 
-resource "google_compute_router" "runners" {
-  project = google_project.runners.project_id
-  name    = "runners-router"
-  region  = var.region
-  network = google_compute_network.runners.id
-}
-
-# NAT gives no-public-IP VMs outbound internet. Subnet-scoped, auto IP
-# allocation. No inbound is possible through NAT.
-resource "google_compute_router_nat" "runners" {
-  project = google_project.runners.project_id
-  name    = "runners-nat"
-  router  = google_compute_router.runners.name
-  region  = var.region
-
-  nat_ip_allocate_option             = "AUTO_ONLY"
-  source_subnetwork_ip_ranges_to_nat = "LIST_OF_SUBNETWORKS"
-
-  subnetwork {
-    name                    = google_compute_subnetwork.runners.id
-    source_ip_ranges_to_nat = ["ALL_IP_RANGES"]
-  }
-
-  log_config {
-    enable = true
-    filter = "ERRORS_ONLY"
-  }
-}
+# Egress is via per-VM ephemeral external IPs (set in compute.tf), not Cloud NAT:
+# a 24/7 NAT gateway's fixed hourly charge dominates the bill for bursty ephemeral
+# runners. deny_all_ingress below keeps every VM unreachable inbound regardless.
 
 # --- Firewall ---------------------------------------------------------------
 # Fail-closed posture: no ingress allow rule for runner or webhook VMs from the
