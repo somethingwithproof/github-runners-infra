@@ -75,7 +75,8 @@ variable "runner_startup_script" {
   description = <<-EOT
     Startup script (cloud-init style) for ephemeral runners. The default is a
     placeholder. The real script installs Docker and the GitHub Actions runner,
-    registers it with --ephemeral, runs a single job, then deletes its own VM.
+    registers it with --ephemeral and runs a single job. The control plane deletes
+    the VM after completion.
     Supply the production script via tfvars or wire it to a cloud-init file.
   EOT
   default     = <<-EOT
@@ -86,7 +87,7 @@ variable "runner_startup_script" {
     #   2. fetch a short-lived registration token (webhook host mints it)
     #   3. ./config.sh --ephemeral --url <repo/org> --token <token>
     #   4. ./run.sh           # processes exactly one job then exits
-    #   5. gcloud compute instances delete "$(hostname)" --zone <zone> -q
+    #   5. exit; the control plane observes completion and deletes this VM
     echo "runner startup placeholder"
   EOT
 }

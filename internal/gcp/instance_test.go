@@ -110,6 +110,9 @@ func TestNewClientRequiresProjectAndZone(t *testing.T) {
 	if _, err := newClientWithAPI(&fakeInstancesAPI{}, Config{Project: "p", StartupScriptPath: path}); err == nil {
 		t.Error("expected error when zone is empty")
 	}
+	if _, err := newClientWithAPI(&fakeInstancesAPI{}, Config{Project: "p", Zone: "z"}); err == nil {
+		t.Error("expected error when startup-script path is empty")
+	}
 }
 
 func TestCreateBuildsSpotInstance(t *testing.T) {

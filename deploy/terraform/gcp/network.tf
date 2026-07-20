@@ -1,5 +1,5 @@
-# Custom-mode VPC. Runner VMs have no public IP; they reach GitHub and the
-# package registries through Cloud NAT. No ingress is opened to runners.
+# Custom-mode VPC. Runner VMs use ephemeral public IPs for egress to GitHub and
+# package registries. No ingress is opened to runners.
 
 resource "google_compute_network" "runners" {
   project                 = google_project.runners.project_id
@@ -53,7 +53,7 @@ resource "google_compute_firewall" "deny_all_ingress" {
 
 # Allow all egress. Runners need to reach GitHub, container registries, and
 # package mirrors over a changing set of IPs; pinning egress destinations is not
-# practical for general CI. Egress still flows through Cloud NAT only.
+# practical for general CI. Egress uses each VM's ephemeral external IP.
 resource "google_compute_firewall" "allow_egress" {
   project   = google_project.runners.project_id
   name      = "allow-all-egress"

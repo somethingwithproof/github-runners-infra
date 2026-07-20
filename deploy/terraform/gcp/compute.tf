@@ -1,7 +1,7 @@
 # --- Ephemeral Spot runner instance template --------------------------------
 # The control plane (runner-control SA on the webhook host) creates VMs from
 # this template, one per job. Spot pricing because a preempted CI job just
-# re-queues. No external IP; outbound via Cloud NAT only.
+# re-queues. Ephemeral external IPs provide outbound access; ingress is denied.
 resource "google_compute_instance_template" "runner" {
   project     = google_project.runners.project_id
   name_prefix = "runner-"
@@ -61,7 +61,7 @@ resource "google_compute_instance_template" "runner" {
 # receiver and the control loop that mints registration tokens and spins runner
 # VMs up/down. Carries the runner-control SA.
 #
-# No public IP and no inbound firewall rule. GitHub webhook delivery arrives
+# No inbound firewall rule. Its ephemeral public IP is egress-only; GitHub webhook delivery arrives
 # through a cloudflared tunnel that is provisioned separately (outbound
 # connection from this host to Cloudflare's edge; nothing is opened inbound).
 resource "google_compute_instance" "webhook_host" {

@@ -2,9 +2,8 @@
 #   echo -n "<value>" | gcloud secrets versions add <name> --data-file=- \
 #     --project=swp-ci-runners
 #
-# Terraform manages the secret containers and their access policy, not the
-# version payloads. The ignore_changes on the resource keeps a manually added
-# version from showing as drift.
+# Terraform manages the secret containers and their access policy, not Secret
+# Manager version resources or payloads added out of band.
 
 locals {
   runner_secrets = {

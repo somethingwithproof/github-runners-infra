@@ -101,6 +101,9 @@ func newClientWithAPI(api instancesAPI, cfg Config) (*Client, error) {
 	if cfg.Zone == "" {
 		return nil, fmt.Errorf("GCP zone is required")
 	}
+	if cfg.StartupScriptPath == "" {
+		return nil, fmt.Errorf("GCP startup-script path is required")
+	}
 
 	tmpl, err := template.ParseFiles(cfg.StartupScriptPath)
 	if err != nil {
