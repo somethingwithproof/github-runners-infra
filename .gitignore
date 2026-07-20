@@ -18,3 +18,9 @@ bin/
 # OS
 .DS_Store
 Thumbs.db
+
+# terraform local cache
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info

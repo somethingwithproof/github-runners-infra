@@ -12,41 +12,34 @@ import (
 	"time"
 
 	"github.com/thomasvincent/github-runners-infra/internal/digitalocean"
+	"github.com/thomasvincent/github-runners-infra/internal/envutil"
+	"github.com/thomasvincent/github-runners-infra/internal/gcp"
 	gh "github.com/thomasvincent/github-runners-infra/internal/github"
+	"github.com/thomasvincent/github-runners-infra/internal/provider"
 	"github.com/thomasvincent/github-runners-infra/internal/webhook"
 )
 
 func main() {
-	appID, err := strconv.ParseInt(mustEnv("APP_ID"), 10, 64)
+	appID, err := strconv.ParseInt(envutil.MustEnv("APP_ID"), 10, 64)
 	if err != nil {
 		log.Fatalf("Invalid APP_ID: %v", err)
 	}
 
-	installID, err := strconv.ParseInt(mustEnv("APP_INSTALLATION_ID"), 10, 64)
+	installID, err := strconv.ParseInt(envutil.MustEnv("APP_INSTALLATION_ID"), 10, 64)
 	if err != nil {
 		log.Fatalf("Invalid APP_INSTALLATION_ID: %v", err)
 	}
 
 	// Only support file-based private key loading (#5)
-	keyPath := mustEnv("APP_PRIVATE_KEY_FILE")
+	keyPath := envutil.MustEnv("APP_PRIVATE_KEY_FILE")
 	privateKey, err := os.ReadFile(keyPath)
 	if err != nil {
 		log.Fatalf("Failed to read private key file %s: %v", keyPath, err)
 	}
 
-	webhookSecret := []byte(mustEnv("WEBHOOK_SECRET"))
-	doToken := mustEnv("DIGITALOCEAN_TOKEN")
-
-	cloudInitPath := envOrDefault("CLOUD_INIT_PATH", "cloud-init/runner.yaml.tmpl")
-	region := envOrDefault("DO_REGION", "nyc3")
-	size := envOrDefault("DO_SIZE", "s-4vcpu-8gb")
-	requiredLabel := envOrDefault("REQUIRED_LABEL", "self-hosted")
-	listenAddr := envOrDefault("LISTEN_ADDR", ":8080")
-
-	var sshFingerprints []string
-	if fp := os.Getenv("DO_SSH_FINGERPRINTS"); fp != "" {
-		sshFingerprints = strings.Split(fp, ",")
-	}
+	webhookSecret := []byte(envutil.MustEnv("WEBHOOK_SECRET"))
+	requiredLabel := envutil.OrDefault("REQUIRED_LABEL", "self-hosted")
+	listenAddr := envutil.OrDefault("LISTEN_ADDR", ":8080")
 
 	githubApp := &gh.App{
 		AppID:          appID,
@@ -54,21 +47,15 @@ func main() {
 		PrivateKey:     privateKey,
 	}
 
-	doClient, err := digitalocean.NewClient(digitalocean.Config{
-		Token:           doToken,
-		Region:          region,
-		Size:            size,
-		CloudInitPath:   cloudInitPath,
-		SSHFingerprints: sshFingerprints,
-	})
+	prov, doToken, err := buildProvisioner(context.Background())
 	if err != nil {
-		log.Fatalf("Failed to create DO client: %v", err)
+		log.Fatalf("Failed to create runner provisioner: %v", err)
 	}
 
 	handler := webhook.NewHandler(webhook.Config{
 		WebhookSecret: webhookSecret,
 		GitHubApp:     githubApp,
-		DOClient:      doClient,
+		Provisioner:   prov,
 		DOToken:       doToken,
 		RequiredLabel: requiredLabel,
 	})
@@ -111,17 +98,46 @@ func main() {
 	log.Printf("Server stopped")
 }
 
-func mustEnv(key string) string {
-	v := os.Getenv(key)
-	if v == "" {
-		log.Fatalf("Required environment variable %s is not set", key)
-	}
-	return v
-}
+// buildProvisioner selects the runner backend from RUNNER_PROVIDER (default
+// "digitalocean"). It returns the DO token separately because the DO startup
+// path needs it for self-deletion; GCP uses the instance service account, so
+// the token is empty there.
+func buildProvisioner(ctx context.Context) (provider.Provisioner, string, error) {
+	switch strings.ToLower(envutil.OrDefault("RUNNER_PROVIDER", "digitalocean")) {
+	case "gcp":
+		startupPath := envutil.OrDefault("GCP_STARTUP_SCRIPT", "cloud-init/runner-gcp.sh.tmpl")
+		client, err := gcp.NewClient(ctx, gcp.Config{
+			Project:           envutil.MustEnv("GCP_PROJECT"),
+			Zone:              envutil.MustEnv("GCP_ZONE"),
+			MachineType:       envutil.OrDefault("GCP_MACHINE_TYPE", "e2-custom-4-8192"),
+			RunnerSA:          os.Getenv("GCP_RUNNER_SA"),
+			Network:           os.Getenv("GCP_NETWORK"),
+			Subnet:            os.Getenv("GCP_SUBNET"),
+			SourceImage:       os.Getenv("GCP_IMAGE"),
+			StartupScriptPath: startupPath,
+		})
+		if err != nil {
+			return nil, "", err
+		}
+		return client, "", nil
 
-func envOrDefault(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+	default:
+		doToken := envutil.MustEnv("DIGITALOCEAN_TOKEN")
+		cloudInitPath := envutil.OrDefault("CLOUD_INIT_PATH", "cloud-init/runner.yaml.tmpl")
+		var sshFingerprints []string
+		if fp := os.Getenv("DO_SSH_FINGERPRINTS"); fp != "" {
+			sshFingerprints = strings.Split(fp, ",")
+		}
+		client, err := digitalocean.NewClient(digitalocean.Config{
+			Token:           doToken,
+			Region:          envutil.OrDefault("DO_REGION", "nyc3"),
+			Size:            envutil.OrDefault("DO_SIZE", "s-4vcpu-8gb"),
+			CloudInitPath:   cloudInitPath,
+			SSHFingerprints: sshFingerprints,
+		})
+		if err != nil {
+			return nil, "", err
+		}
+		return client, doToken, nil
 	}
-	return fallback
 }
