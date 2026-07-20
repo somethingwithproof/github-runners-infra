@@ -150,10 +150,13 @@ func TestCreateBuildsSpotInstance(t *testing.T) {
 		t.Errorf("termination action = %q, want DELETE", got.GetScheduling().GetInstanceTerminationAction())
 	}
 
-	// No external IP: NetworkInterface must carry no AccessConfigs.
+	// The runner needs an ephemeral external IP for GitHub and GCP API egress.
 	ifaces := got.GetNetworkInterfaces()
-	if len(ifaces) != 1 || len(ifaces[0].GetAccessConfigs()) != 0 {
-		t.Errorf("expected single interface with no access configs, got %+v", ifaces)
+	if len(ifaces) != 1 || len(ifaces[0].GetAccessConfigs()) != 1 {
+		t.Fatalf("expected single interface with one access config, got %+v", ifaces)
+	}
+	if access := ifaces[0].GetAccessConfigs()[0]; access.GetName() != "External NAT" || access.GetType() != "ONE_TO_ONE_NAT" {
+		t.Errorf("unexpected access config: %+v", access)
 	}
 	if ifaces[0].GetSubnetwork() != "regions/us-central1/subnetworks/runners" {
 		t.Errorf("subnet = %q", ifaces[0].GetSubnetwork())

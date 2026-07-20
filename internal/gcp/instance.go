@@ -136,8 +136,8 @@ func newClientWithAPI(api instancesAPI, cfg Config) (*Client, error) {
 	}, nil
 }
 
-// Create spins up a SPOT runner instance for one job. The instance has no
-// external IP, runs the rendered startup script (installs Docker + the runner,
+// Create spins up a SPOT runner instance for one job. The instance has an
+// ephemeral external IP for outbound access and runs the rendered startup script (installs Docker + the runner,
 // registers --ephemeral, runs one job, exits), and is labelled so cleanup can
 // reap it. Teardown is control-plane-driven: the webhook deletes the VM on the
 // job's completed event, with the reaper as backstop.
@@ -170,7 +170,12 @@ func (c *Client) buildInstance(name, startupScript string) *computepb.Instance {
 
 	netIface := &computepb.NetworkInterface{
 		Network: proto.String(c.network),
-		// No AccessConfigs => no external IP.
+		AccessConfigs: []*computepb.AccessConfig{
+			{
+				Name: proto.String("External NAT"),
+				Type: proto.String("ONE_TO_ONE_NAT"),
+			},
+		},
 	}
 	if c.subnet != "" {
 		netIface.Subnetwork = proto.String(c.subnet)

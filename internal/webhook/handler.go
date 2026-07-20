@@ -247,9 +247,11 @@ func (h *Handler) handleCompleted(w http.ResponseWriter, event WorkflowJobEvent)
 		w.WriteHeader(http.StatusAccepted)
 		_, _ = fmt.Fprint(w, "tearing down")
 	default:
-		// Backstopped by the reaper; shed load rather than queue unbounded.
+		// Backstopped by the reaper; acknowledge the event so GitHub does not
+		// retry it and create duplicate teardown attempts while the pool is full.
 		log.Printf("WARN: worker pool full, deferring teardown of job %d to reaper", event.WorkflowJob.ID)
-		http.Error(w, "system busy", http.StatusServiceUnavailable)
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = fmt.Fprint(w, "teardown deferred to reaper")
 	}
 }
 

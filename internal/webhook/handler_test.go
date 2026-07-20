@@ -38,7 +38,10 @@ func (f *fakeProvisioner) Delete(_ context.Context, name string) error {
 	f.mu.Lock()
 	f.deleted = append(f.deleted, name)
 	f.mu.Unlock()
-	f.done <- struct{}{}
+	select {
+	case f.done <- struct{}{}:
+	default:
+	}
 	return nil
 }
 
@@ -432,6 +435,31 @@ func TestWorkerPoolFull(t *testing.T) {
 	}
 
 	// Drain the pool
+	<-h.workerPool
+}
+
+func TestWorkerPoolFullAcknowledgesCompletedEvent(t *testing.T) {
+	h := NewHandler(Config{
+		WebhookSecret: []byte(testSecret),
+		MaxConcurrent: 1,
+	})
+	h.workerPool <- struct{}{}
+
+	event := WorkflowJobEvent{
+		Action:      "completed",
+		WorkflowJob: WorkflowJob{ID: 1, Labels: []string{"self-hosted"}},
+		Repo:        RepoInfo{FullName: "org/repo"},
+	}
+	body, _ := json.Marshal(event)
+	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(string(body)))
+	req.Header.Set("X-Hub-Signature-256", signPayload(body, testSecret))
+	req.Header.Set("X-GitHub-Event", "workflow_job")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Errorf("expected 202 when teardown is deferred, got %d", w.Code)
+	}
 	<-h.workerPool
 }
 
