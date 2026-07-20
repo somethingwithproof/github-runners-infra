@@ -221,6 +221,16 @@ func TestInstanceNameNoTrailingHyphenAfterTruncation(t *testing.T) {
 	}
 }
 
+func TestInstanceNamePreservesRunAndJobIDsWhenRepoIsTruncated(t *testing.T) {
+	name := instanceName(strings.Repeat("long-repository-", 10), 9223372036854775807, 8123456789012345678)
+	if !strings.HasSuffix(name, "-9223372036854775807-8123456789012345678") {
+		t.Errorf("instanceName lost distinguishing IDs: %q", name)
+	}
+	if len(name) > 63 || !rfc1035.MatchString(name) {
+		t.Errorf("instanceName = %q is not RFC1035-valid", name)
+	}
+}
+
 func TestMissingRequiredLabel(t *testing.T) {
 	h := newTestHandler()
 	event := WorkflowJobEvent{

@@ -356,12 +356,17 @@ func (h *Handler) teardownRunner(event WorkflowJobEvent) {
 // paths derive the same name from the same inputs. An unsanitized name is
 // rejected by GCE at insert time and the job silently hangs to timeout.
 func instanceName(repo string, runID, jobID int64) string {
-	name := fmt.Sprintf("eph-%s-%d-%d", sanitizeNameSegment(repo), runID, jobID)
-	if len(name) > 63 {
-		name = name[:63]
+	const prefix = "eph-"
+	suffix := fmt.Sprintf("-%d-%d", runID, jobID)
+	repoSegment := sanitizeNameSegment(repo)
+	if repoSegment == "" {
+		repoSegment = "repo"
 	}
-	// Truncation can land on a hyphen; RFC1035 forbids a trailing one.
-	return strings.TrimRight(name, "-")
+	maxRepoLength := 63 - len(prefix) - len(suffix)
+	if len(repoSegment) > maxRepoLength {
+		repoSegment = strings.TrimRight(repoSegment[:maxRepoLength], "-")
+	}
+	return prefix + repoSegment + suffix
 }
 
 // sanitizeNameSegment lowercases s and replaces every run of characters outside
