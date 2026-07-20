@@ -32,6 +32,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
@@ -40,6 +41,8 @@ jobs:
           cache: true
       - run: go test -race -coverprofile=coverage.out ./...
       - uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354 # v4
+        with:
+          use_oidc: true
 
   build:
     runs-on: ubuntu-latest
