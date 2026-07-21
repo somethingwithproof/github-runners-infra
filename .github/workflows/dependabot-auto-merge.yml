@@ -21,7 +21,7 @@ jobs:
   merge:
     if: >-
       github.event_name != 'pull_request_target' ||
-      github.actor == 'dependabot[bot]'
+      github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Merge Dependabot pull requests with successful checks
