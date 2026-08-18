@@ -2,8 +2,10 @@ package webhook
 
 import (
 	"context"
-	"crypto/subtle"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,207 +15,247 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/ssm"
-	"github.com/aws/aws-sdk-go-v2/service/ssm/types"
-	"github.com/thomasvincent/github-runners-infra/internal/digitalocean"
+	"github.com/thomasvincent/github-runners-infra/internal/compute"
 	gh "github.com/thomasvincent/github-runners-infra/internal/github"
+	"github.com/thomasvincent/github-runners-infra/internal/state"
 )
 
-const maxBodySize = 1 * 1024 * 1024 // 1 MB (#3)
+const maxBodySize = 1 * 1024 * 1024
 
-// Input validation regexes (#9)
 var (
-	safeNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
-	repoRegex     = regexp.MustCompile(`^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$`)
+	safeNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$`)
+	deliveryRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)
+	checksumRegex = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
+	versionRegex  = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
 )
 
-// WorkflowJobEvent represents the GitHub workflow_job webhook payload.
+// WorkflowJobEvent contains only the fields used by the controller.
 type WorkflowJobEvent struct {
-	Action      string      `json:"action"`
-	WorkflowJob WorkflowJob `json:"workflow_job"`
-	Org         *OrgInfo    `json:"organization,omitempty"`
-	Repo        RepoInfo    `json:"repository"`
+	Action       string      `json:"action"`
+	WorkflowJob  WorkflowJob `json:"workflow_job"`
+	Repo         RepoInfo    `json:"repository"`
+	Installation struct {
+		ID int64 `json:"id"`
+	} `json:"installation"`
 }
 
 type WorkflowJob struct {
-	ID     int64    `json:"id"`
-	Name   string   `json:"name"`
-	Labels []string `json:"labels"`
-}
-
-type OrgInfo struct {
-	Login string `json:"login"`
+	ID         int64    `json:"id"`
+	Name       string   `json:"name"`
+	Labels     []string `json:"labels"`
+	RunnerID   int64    `json:"runner_id"`
+	RunnerName string   `json:"runner_name"`
 }
 
 type RepoInfo struct {
 	FullName string `json:"full_name"`
 	Name     string `json:"name"`
+	Private  bool   `json:"private"`
 	Owner    struct {
 		Login string `json:"login"`
 	} `json:"owner"`
 }
 
-// Handler processes incoming GitHub webhooks.
+// GitHubClient is the narrow control-plane contract required by the worker.
+type GitHubClient interface {
+	GenerateRepoJITConfig(context.Context, string, string, string, int64, []string) (gh.JITConfig, error)
+	RemoveRepoRunner(context.Context, string, string, int64) error
+}
+
+// ComputeClient owns cloud resources. Provider credentials stay behind this
+// interface and are never rendered into runner user data.
+type ComputeClient interface {
+	Provider() string
+	FindRunner(context.Context, string) (*compute.RunnerInstance, bool, error)
+	CreateRunner(context.Context, compute.RunnerParams) (*compute.RunnerInstance, error)
+	DeleteRunner(context.Context, string, string) error
+	CleanupRunner(context.Context, string) error
+}
+
+// Handler authenticates webhooks and drives durable runner lifecycle workers.
 type Handler struct {
 	webhookSecret         []byte
-	githubApp             *gh.App
-	doClient              *digitalocean.Client
-	doToken               string
+	githubClient          GitHubClient
+	computeClient         ComputeClient
+	store                 state.Store
 	requiredLabel         string
+	allowedLabels         map[string]string
+	allowedRepositories   map[string]struct{}
 	runnerVersion         string
-	callbackSecret        string
-	callbackSecretSSMPath string
-	callbackURL           string
+	runnerSHA256          string
 	chefInstallerSHA256   string
-	workerPool            chan struct{}    // concurrency limiter (#8)
-	rateLimiter           *repoRateLimiter // per-repo rate limiter (#7)
-	ssmClient             *ssm.Client
+	runnerGroupID         int64
+	maxAttempts           int
+	workerCount           int
+	pollInterval          time.Duration
+	maxRunnerAge          time.Duration
+	cancelledRunnerTTL    time.Duration
+	livenessSettleWindow  time.Duration
+	livenessConfirmations int
+	reaperTimeout         time.Duration
+	installationID        int64
+	provider              string
+	notify                chan struct{}
+	wg                    sync.WaitGroup
 }
 
-// Config holds handler configuration.
+// Config holds controller configuration. Repository and label allowlists are
+// mandatory so installing the GitHub App does not implicitly grant runner use.
 type Config struct {
-	WebhookSecret         []byte
-	GitHubApp             *gh.App
-	DOClient              *digitalocean.Client
-	DOToken               string
-	RequiredLabel         string
-	RunnerVersion         string
-	CallbackSecret        string
-	CallbackSecretSSMPath string
-	CallbackURL           string
-	MaxConcurrent         int
-	MaxPerRepoPerMin      int
-	ChefInstallerSHA256   string
+	WebhookSecret       []byte
+	GitHubClient        GitHubClient
+	ComputeClient       ComputeClient
+	Store               state.Store
+	RequiredLabel       string
+	AllowedLabels       []string
+	AllowedRepositories []string
+	RunnerVersion       string
+	RunnerSHA256        string
+	ChefInstallerSHA256 string
+	RunnerGroupID       int64
+	WorkerCount         int
+	MaxLiveRunners      int
+	MaxAttempts         int
+	PollInterval        time.Duration
+	MaxRunnerAge        time.Duration
+	CancelledRunnerTTL  time.Duration
+	InstallationID      int64
 }
 
-// repoRateLimiter implements a simple per-repo token bucket. (#7)
-type repoRateLimiter struct {
-	mu      sync.Mutex
-	buckets map[string][]time.Time
-	limit   int
-	window  time.Duration
-}
-
-func newRepoRateLimiter(limit int) *repoRateLimiter {
-	return &repoRateLimiter{
-		buckets: make(map[string][]time.Time),
-		limit:   limit,
-		window:  time.Minute,
-	}
-}
-
-func (rl *repoRateLimiter) allow(repo string) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-
-	now := time.Now()
-	cutoff := now.Add(-rl.window)
-
-	// Remove expired entries
-	valid := rl.buckets[repo][:0]
-	for _, t := range rl.buckets[repo] {
-		if t.After(cutoff) {
-			valid = append(valid, t)
-		}
-	}
-
-	if len(valid) >= rl.limit {
-		rl.buckets[repo] = valid
-		return false
-	}
-
-	rl.buckets[repo] = append(valid, now)
-	return true
-}
-
-// NewHandler creates a new webhook handler, returning an error instead of
-// calling log.Fatalf so callers can handle failures gracefully.
 func NewHandler(cfg Config) (*Handler, error) {
-	label := cfg.RequiredLabel
-	if label == "" {
-		label = "self-hosted"
+	if len(cfg.WebhookSecret) < 32 {
+		return nil, fmt.Errorf("webhook secret must be at least 32 bytes")
 	}
-	version := cfg.RunnerVersion
-	if version == "" {
-		version = "2.331.0"
+	if cfg.GitHubClient == nil || cfg.ComputeClient == nil || cfg.Store == nil {
+		return nil, fmt.Errorf("GitHub client, compute client, and state store are required")
 	}
-	maxConcurrent := cfg.MaxConcurrent
-	if maxConcurrent <= 0 {
-		maxConcurrent = 10
+	if cfg.InstallationID <= 0 {
+		return nil, fmt.Errorf("GitHub App installation ID is required")
 	}
-	maxPerRepo := cfg.MaxPerRepoPerMin
-	if maxPerRepo <= 0 {
-		maxPerRepo = 20
+	if !versionRegex.MatchString(cfg.RunnerVersion) {
+		return nil, fmt.Errorf("runner version must use numeric x.y.z format")
 	}
-
-	// Initialize AWS SSM client
-	awsCfg, err := config.LoadDefaultConfig(context.Background())
-	if err != nil {
-		return nil, fmt.Errorf("loading AWS config: %w", err)
+	if !checksumRegex.MatchString(cfg.RunnerSHA256) {
+		return nil, fmt.Errorf("runner SHA-256 must be exactly 64 hexadecimal characters")
 	}
-	ssmClient := ssm.NewFromConfig(awsCfg)
-
-	// Set SSM path for callback secret — this is the single source of truth.
-	// The handler fetches the secret from SSM at startup so that runners and
-	// the destroy-callback endpoint use the same value.
-	ssmPath := cfg.CallbackSecretSSMPath
-	if ssmPath == "" {
-		ssmPath = "/github-runners/callback-secret"
+	if !checksumRegex.MatchString(cfg.ChefInstallerSHA256) {
+		return nil, fmt.Errorf("chef installer SHA-256 must be exactly 64 hexadecimal characters")
 	}
 
-	// Resolve callback secret from SSM (single source of truth)
-	callbackSecret, err := resolveCallbackSecret(context.Background(), ssmClient, ssmPath, cfg.CallbackSecret)
-	if err != nil {
-		return nil, fmt.Errorf("resolving callback secret: %w", err)
+	requiredLabel := strings.ToLower(strings.TrimSpace(cfg.RequiredLabel))
+	if requiredLabel == "" {
+		requiredLabel = "self-hosted"
+	}
+	allowedLabels := make(map[string]string, len(cfg.AllowedLabels))
+	for _, raw := range cfg.AllowedLabels {
+		label := strings.TrimSpace(raw)
+		if !safeNameRegex.MatchString(label) {
+			return nil, fmt.Errorf("invalid allowed runner label %q", raw)
+		}
+		allowedLabels[strings.ToLower(label)] = label
+	}
+	if _, ok := allowedLabels[requiredLabel]; !ok {
+		return nil, fmt.Errorf("required label %q must be present in allowed labels", requiredLabel)
+	}
+
+	allowedRepositories := make(map[string]struct{}, len(cfg.AllowedRepositories))
+	for _, raw := range cfg.AllowedRepositories {
+		repo := strings.ToLower(strings.TrimSpace(raw))
+		if !validRepository(repo) {
+			return nil, fmt.Errorf("invalid allowed repository %q", raw)
+		}
+		allowedRepositories[repo] = struct{}{}
+	}
+	if len(allowedRepositories) == 0 {
+		return nil, fmt.Errorf("at least one allowed repository is required")
+	}
+
+	workerCount := cfg.WorkerCount
+	if workerCount <= 0 {
+		workerCount = 4
+	}
+	maxLiveRunners := cfg.MaxLiveRunners
+	if maxLiveRunners <= 0 {
+		maxLiveRunners = 20
+	}
+	if err := cfg.Store.SetMaxLiveRunners(maxLiveRunners); err != nil {
+		return nil, err
+	}
+	maxAttempts := cfg.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 5
+	}
+	pollInterval := cfg.PollInterval
+	if pollInterval <= 0 {
+		pollInterval = time.Second
+	}
+	maxRunnerAge := cfg.MaxRunnerAge
+	if maxRunnerAge <= 0 {
+		maxRunnerAge = 6 * time.Hour
+	}
+	if maxRunnerAge < time.Hour {
+		return nil, fmt.Errorf("maximum runner age must be at least one hour")
+	}
+	cancelledRunnerTTL := cfg.CancelledRunnerTTL
+	if cancelledRunnerTTL <= 0 {
+		cancelledRunnerTTL = 5 * time.Minute
+	}
+	if cancelledRunnerTTL < time.Minute {
+		return nil, fmt.Errorf("cancelled runner TTL must be at least one minute")
+	}
+	runnerGroupID := cfg.RunnerGroupID
+	if runnerGroupID <= 0 {
+		runnerGroupID = 1
 	}
 
 	return &Handler{
-		webhookSecret:         cfg.WebhookSecret,
-		githubApp:             cfg.GitHubApp,
-		doClient:              cfg.DOClient,
-		doToken:               cfg.DOToken,
-		requiredLabel:         label,
-		runnerVersion:         version,
-		callbackSecret:        callbackSecret,
-		callbackSecretSSMPath: ssmPath,
-		callbackURL:           cfg.CallbackURL,
-		chefInstallerSHA256:   cfg.ChefInstallerSHA256,
-		workerPool:            make(chan struct{}, maxConcurrent),
-		rateLimiter:           newRepoRateLimiter(maxPerRepo),
-		ssmClient:             ssmClient,
+		webhookSecret:         append([]byte(nil), cfg.WebhookSecret...),
+		githubClient:          cfg.GitHubClient,
+		computeClient:         cfg.ComputeClient,
+		store:                 cfg.Store,
+		requiredLabel:         requiredLabel,
+		allowedLabels:         allowedLabels,
+		allowedRepositories:   allowedRepositories,
+		runnerVersion:         cfg.RunnerVersion,
+		runnerSHA256:          strings.ToLower(cfg.RunnerSHA256),
+		chefInstallerSHA256:   strings.ToLower(cfg.ChefInstallerSHA256),
+		runnerGroupID:         runnerGroupID,
+		maxAttempts:           maxAttempts,
+		workerCount:           workerCount,
+		pollInterval:          pollInterval,
+		maxRunnerAge:          maxRunnerAge,
+		cancelledRunnerTTL:    cancelledRunnerTTL,
+		livenessSettleWindow:  2 * time.Minute,
+		livenessConfirmations: 3,
+		reaperTimeout:         45 * time.Second,
+		installationID:        cfg.InstallationID,
+		provider:              cfg.ComputeClient.Provider(),
+		notify:                make(chan struct{}, 1),
 	}, nil
 }
 
-// resolveCallbackSecret loads the callback secret from SSM. If SSM is
-// unreachable or the parameter doesn't exist yet, it falls back to the
-// supplied envSecret. This ensures both the destroy-callback handler and
-// the runner cloud-init derive the secret from a single authoritative
-// location (SSM), eliminating the previous two-source divergence.
-func resolveCallbackSecret(ctx context.Context, client *ssm.Client, ssmPath, envSecret string) (string, error) {
-	out, err := client.GetParameter(ctx, &ssm.GetParameterInput{
-		Name:           &ssmPath,
-		WithDecryption: boolPtr(true),
-	})
-	if err == nil && out.Parameter != nil && out.Parameter.Value != nil {
-		return *out.Parameter.Value, nil
+// Start launches durable workers. Pending work is loaded from the store, so a
+// process restart does not lose an accepted webhook.
+func (h *Handler) Start(ctx context.Context) {
+	for i := 0; i < h.workerCount; i++ {
+		h.wg.Add(1)
+		go h.worker(ctx)
 	}
-	// Fallback: use the env-supplied secret (e.g. first deploy before SSM is populated)
-	if envSecret != "" {
-		log.Printf("WARN: callback secret not found in SSM (%s), using env fallback", ssmPath)
-		return envSecret, nil
-	}
-	return "", fmt.Errorf("callback secret not available from SSM (%s) and no env fallback provided", ssmPath)
+	h.wg.Add(1)
+	go h.reaper(ctx)
+	h.signal()
 }
 
-// ServeHTTP handles webhook requests.
+// Wait blocks until all workers have stopped after their context is canceled.
+func (h *Handler) Wait() {
+	h.wg.Wait()
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
-	// Limit request body size (#3)
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -221,21 +263,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientIP := r.Header.Get("X-Forwarded-For")
-	if clientIP == "" {
-		clientIP = r.RemoteAddr
-	}
-
-	sig := r.Header.Get("X-Hub-Signature-256")
-	if !gh.VerifyWebhookSignature(body, sig, h.webhookSecret, clientIP) {
+	clientIP := r.RemoteAddr
+	if !gh.VerifyWebhookSignature(body, r.Header.Get("X-Hub-Signature-256"), h.webhookSecret, clientIP) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-
-	eventType := r.Header.Get("X-GitHub-Event")
-	if eventType != "workflow_job" {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "ok")
+	if r.Header.Get("X-GitHub-Event") != "workflow_job" {
+		writeResponse(w, http.StatusOK, "ignored")
 		return
 	}
 
@@ -244,199 +278,500 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
-
-	if event.Action != "queued" {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "ok")
+	if event.Installation.ID != h.installationID {
+		log.Printf("SECURITY: rejected GitHub App installation %d", event.Installation.ID)
+		http.Error(w, "installation not authorized", http.StatusForbidden)
 		return
 	}
-
-	if !h.hasRequiredLabel(event.WorkflowJob.Labels) {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "ok")
-		return
-	}
-
-	// Rate limit per repo (#7)
-	repoKey := event.Repo.FullName
-	if !h.rateLimiter.allow(repoKey) {
-		log.Printf("SECURITY: rate limit exceeded for %s from %s", repoKey, clientIP)
-		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
-		return
-	}
-
-	// Worker pool for bounded concurrency (#8)
-	select {
-	case h.workerPool <- struct{}{}:
-		go func() {
-			defer func() { <-h.workerPool }()
-			h.provisionRunner(event)
-		}()
-		w.WriteHeader(http.StatusAccepted)
-		fmt.Fprint(w, "provisioning")
-	default:
-		log.Printf("WARN: worker pool full, rejecting job %d", event.WorkflowJob.ID)
-		http.Error(w, "system busy", http.StatusServiceUnavailable)
-	}
-}
-
-func (h *Handler) hasRequiredLabel(labels []string) bool {
-	for _, l := range labels {
-		if strings.EqualFold(l, h.requiredLabel) {
-			return true
-		}
-	}
-	return false
-}
-
-func (h *Handler) provisionRunner(event WorkflowJobEvent) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	owner := event.Repo.Owner.Login
-	repo := event.Repo.Name
-
-	// Validate inputs (#9)
-	if !safeNameRegex.MatchString(owner) || !safeNameRegex.MatchString(repo) {
-		log.Printf("ERROR: invalid owner/repo: %s/%s", owner, repo)
-		return
-	}
-
-	runnerToken, err := h.githubApp.GenerateRepoRunnerToken(owner, repo)
+	repository, err := h.validateRepository(event.Repo)
 	if err != nil {
-		log.Printf("ERROR: runner token for %s/%s: %v", owner, repo, err)
+		log.Printf("SECURITY: rejected workflow job %d: %v", event.WorkflowJob.ID, err)
+		http.Error(w, "repository not authorized", http.StatusForbidden)
 		return
 	}
+	key := jobKey(repository, event.WorkflowJob.ID)
 
-	runnerName := fmt.Sprintf("eph-%s-%d-%d", repo, event.WorkflowJob.ID, time.Now().Unix())
-	if len(runnerName) > 63 {
-		runnerName = runnerName[:63]
+	switch event.Action {
+	case "queued":
+		h.handleQueued(w, r, event, repository, key)
+	case "completed":
+		if _, err := h.validateLabels(event.WorkflowJob.Labels); err != nil {
+			writeResponse(w, http.StatusOK, "ignored")
+			return
+		}
+		if err := h.store.RecordCompletion(r.Context(), state.Record{
+			Key: key, JobID: event.WorkflowJob.ID, Owner: event.Repo.Owner.Login,
+			Repository: event.Repo.Name, Provider: h.provider,
+			GitHubRunnerID: event.WorkflowJob.RunnerID, RunnerName: event.WorkflowJob.RunnerName,
+			NextAttemptAt: time.Now().UTC().Add(h.cancelledRunnerTTL),
+		}); err != nil {
+			http.Error(w, "state unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		h.signal()
+		writeResponse(w, http.StatusAccepted, "completion recorded")
+	default:
+		writeResponse(w, http.StatusOK, "ignored")
 	}
+}
 
-	// Store runner token in SSM Parameter Store with an expiration policy.
-	// Tokens are ephemeral — schedule cleanup even if the runner never
-	// calls back (e.g. provisioning failure). We tag with an expiry
-	// timestamp and also defer a goroutine-based cleanup as a safety net.
-	tokenParamName := fmt.Sprintf("/github-runners/tokens/%s", runnerName)
-	expiresAt := time.Now().Add(30 * time.Minute).UTC().Format(time.RFC3339)
-	_, err = h.ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
-		Name:      &tokenParamName,
-		Value:     &runnerToken,
-		Type:      types.ParameterTypeSecureString,
-		Overwrite: boolPtr(true),
-		Tags: []types.Tag{
-			{Key: strPtr("expires-at"), Value: &expiresAt},
-			{Key: strPtr("runner-name"), Value: &runnerName},
-		},
+func (h *Handler) handleQueued(w http.ResponseWriter, r *http.Request, event WorkflowJobEvent, repository, key string) {
+	deliveryID := r.Header.Get("X-GitHub-Delivery")
+	if !deliveryRegex.MatchString(deliveryID) {
+		http.Error(w, "missing or invalid delivery ID", http.StatusBadRequest)
+		return
+	}
+	labels, err := h.validateLabels(event.WorkflowJob.Labels)
+	if err != nil {
+		log.Printf("SECURITY: rejected labels for %s job %d: %v", repository, event.WorkflowJob.ID, err)
+		http.Error(w, "runner labels not authorized", http.StatusForbidden)
+		return
+	}
+	created, err := h.store.Create(r.Context(), state.Record{
+		Key:        key,
+		DeliveryID: deliveryID,
+		JobID:      event.WorkflowJob.ID,
+		Owner:      event.Repo.Owner.Login,
+		Repository: event.Repo.Name,
+		Labels:     labels,
+		Provider:   h.provider,
 	})
 	if err != nil {
-		log.Printf("ERROR: failed to store runner token in SSM: %v", err)
+		log.Printf("ERROR: persist job %s: %v", key, err)
+		http.Error(w, "state unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	if !created {
+		writeResponse(w, http.StatusOK, "duplicate")
+		return
+	}
+	h.signal()
+	writeResponse(w, http.StatusAccepted, "queued")
+}
 
-	// Schedule automatic cleanup of the token parameter after 30 minutes.
-	// This prevents token accumulation if the runner never self-destructs.
-	go func(paramName string) {
-		time.Sleep(30 * time.Minute)
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cleanupCancel()
-		_, err := h.ssmClient.DeleteParameter(cleanupCtx, &ssm.DeleteParameterInput{
-			Name: &paramName,
-		})
+func (h *Handler) worker(ctx context.Context) {
+	defer h.wg.Done()
+	ticker := time.NewTicker(h.pollInterval)
+	defer ticker.Stop()
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		record, kind, err := h.store.ClaimNext(ctx, time.Now(), h.maxAttempts)
 		if err != nil {
-			log.Printf("WARN: failed to cleanup expired token param %s: %v", paramName, err)
-		} else {
-			log.Printf("Cleaned up expired token param %s", paramName)
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("ERROR: claim runner work: %v", err)
+		} else if record != nil {
+			if ctx.Err() != nil {
+				if releaseErr := h.store.ReleaseClaim(context.Background(), record.Key, kind); releaseErr != nil {
+					log.Printf("ERROR: release unstarted %s claim for %s: %v", kind, record.Key, releaseErr)
+				}
+				return
+			}
+			h.process(ctx, *record, kind)
+			continue
 		}
-	}(tokenParamName)
-
-	// Validate and sanitize labels (#9)
-	var safeLabels []string
-	for _, l := range event.WorkflowJob.Labels {
-		cleaned := strings.TrimSpace(l)
-		if safeNameRegex.MatchString(cleaned) {
-			safeLabels = append(safeLabels, cleaned)
+		select {
+		case <-ctx.Done():
+			return
+		case <-h.notify:
+		case <-ticker.C:
 		}
 	}
-	labels := strings.Join(safeLabels, ",")
-
-	repoFull := fmt.Sprintf("%s/%s", owner, repo)
-	if !repoRegex.MatchString(repoFull) {
-		log.Printf("ERROR: invalid repo format: %s", repoFull)
-		return
-	}
-
-	params := digitalocean.RunnerParams{
-		RunnerName:             runnerName,
-		RunnerTokenSSMParam:    tokenParamName,
-		RunnerLabels:           labels,
-		RunnerOrg:              owner,
-		RunnerRepo:             repoFull,
-		DOToken:                h.doToken,
-		RunnerVersion:          h.runnerVersion,
-		CallbackSecretSSMParam: h.callbackSecretSSMPath,
-		CallbackURL:            h.callbackURL,
-		ChefInstallerSHA256:    h.chefInstallerSHA256,
-	}
-
-	droplet, err := h.doClient.CreateRunner(ctx, params)
-	if err != nil {
-		log.Printf("ERROR: create droplet for job %d: %v", event.WorkflowJob.ID, err)
-		return
-	}
-
-	log.Printf("Provisioned runner %s (droplet %d) for %s job %d",
-		runnerName, droplet.ID, repoFull, event.WorkflowJob.ID)
 }
 
-// HandleDestroy processes self-destruct callbacks from runner droplets. (#1)
-func (h *Handler) HandleDestroy(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+func (h *Handler) reaper(ctx context.Context) {
+	defer h.wg.Done()
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		if err := h.reapOnce(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("ERROR: reconcile expired runners: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
+}
 
-	secret := r.Header.Get("X-Callback-Secret")
-	if secret == "" || subtle.ConstantTimeCompare([]byte(secret), []byte(h.callbackSecret)) != 1 {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	r.Body = http.MaxBytesReader(w, r.Body, 1024)
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return
-	}
-
-	var req struct {
-		DropletID int `json:"droplet_id"`
-	}
-	if err := json.Unmarshal(body, &req); err != nil || req.DropletID == 0 {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func (h *Handler) reapOnce(ctx context.Context) error {
+	reapCtx, cancel := context.WithTimeout(ctx, h.reaperTimeout)
 	defer cancel()
+	return h.expireRunners(reapCtx)
+}
 
-	if err := h.doClient.DeleteDroplet(ctx, req.DropletID); err != nil {
-		log.Printf("ERROR: callback delete droplet %d: %v", req.DropletID, err)
-		http.Error(w, "delete failed", http.StatusInternalServerError)
+func (h *Handler) expireRunners(ctx context.Context) error {
+	var reconciliationErrors []error
+	if _, err := h.store.PruneDeleted(ctx); err != nil {
+		reconciliationErrors = append(reconciliationErrors, fmt.Errorf("prune deleted lifecycle records: %w", err))
+	}
+	provisioned, err := h.store.ListProvisioned(ctx)
+	if err != nil {
+		reconciliationErrors = append(reconciliationErrors, fmt.Errorf("list provisioned runners: %w", err))
+	} else {
+		for _, record := range provisioned {
+			if record.Provider != h.provider {
+				continue
+			}
+			_, found, findErr := h.computeClient.FindRunner(ctx, record.Key)
+			if findErr != nil {
+				reconciliationErrors = append(reconciliationErrors, fmt.Errorf("check runner liveness for %s: %w", record.Key, findErr))
+				continue
+			}
+			if found {
+				if record.MissingChecks != 0 {
+					if seenErr := h.store.RecordRunnerSeen(ctx, record.Key); seenErr != nil {
+						reconciliationErrors = append(reconciliationErrors, fmt.Errorf("record runner seen for %s: %w", record.Key, seenErr))
+					}
+				}
+				continue
+			}
+			confirmed, observeErr := h.store.ObserveRunnerMissing(
+				ctx, record.Key, time.Now(), h.livenessSettleWindow, h.livenessConfirmations,
+			)
+			if observeErr != nil {
+				reconciliationErrors = append(reconciliationErrors, fmt.Errorf("record missing runner %s: %w", record.Key, observeErr))
+				continue
+			}
+			if !confirmed {
+				continue
+			}
+			if record.GitHubRunnerID != 0 && record.GitHubRunnerOwned {
+				if removeErr := h.githubClient.RemoveRepoRunner(ctx, record.Owner, record.Repository, record.GitHubRunnerID); removeErr != nil {
+					reconciliationErrors = append(reconciliationErrors, fmt.Errorf("remove missing instance JIT runner %d: %w", record.GitHubRunnerID, removeErr))
+					continue
+				}
+			}
+			if requeueErr := h.store.RequeueMissingRunner(ctx, record.Key, h.maxAttempts); requeueErr != nil {
+				reconciliationErrors = append(reconciliationErrors, fmt.Errorf("requeue missing runner %s: %w", record.Key, requeueErr))
+				continue
+			}
+			log.Printf("WARN: provider instance for %s disappeared; queued a replacement", record.Key)
+			h.signal()
+		}
+	}
+	records, err := h.store.ListExpired(ctx, time.Now().Add(-h.maxRunnerAge))
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		if record.Provider != h.provider {
+			err := fmt.Errorf("cannot expire runner %s owned by provider %q with configured provider %q", record.Key, record.Provider, h.provider)
+			log.Printf("ERROR: %v", err)
+			reconciliationErrors = append(reconciliationErrors, err)
+			continue
+		}
+		if record.InstanceID == "" {
+			if record.GitHubRunnerID != 0 && record.GitHubRunnerOwned {
+				if err := h.githubClient.RemoveRepoRunner(ctx, record.Owner, record.Repository, record.GitHubRunnerID); err != nil {
+					reconciliationErrors = append(reconciliationErrors, fmt.Errorf("remove expired JIT runner %d: %w", record.GitHubRunnerID, err))
+					continue
+				}
+			}
+			if err := h.computeClient.CleanupRunner(ctx, record.Key); err != nil {
+				reconciliationErrors = append(reconciliationErrors, fmt.Errorf("clean up untracked provider resources for %s: %w", record.Key, err))
+				continue
+			}
+			if err := h.store.MarkDeleted(ctx, record.Key); err != nil {
+				reconciliationErrors = append(reconciliationErrors, err)
+				continue
+			}
+			continue
+		}
+		if record.DeferDeletion && record.GitHubRunnerID != 0 && record.GitHubRunnerOwned {
+			// Deregistration fails while GitHub considers a runner busy. Doing it
+			// before cloud deletion both prevents new assignment and fails closed
+			// if a cancelled job's runner picked up different work.
+			if err := h.githubClient.RemoveRepoRunner(ctx, record.Owner, record.Repository, record.GitHubRunnerID); err != nil {
+				reconciliationErrors = append(reconciliationErrors, fmt.Errorf("deregister deferred-cancellation runner %d: %w", record.GitHubRunnerID, err))
+				continue
+			}
+			if err := h.store.ClearJIT(ctx, record.Key); err != nil {
+				reconciliationErrors = append(reconciliationErrors, fmt.Errorf("clear deferred-cancellation runner %d: %w", record.GitHubRunnerID, err))
+				continue
+			}
+		}
+		log.Printf("WARN: runner %s exceeded maximum lifetime; scheduling owned instance %s for deletion", record.Key, record.InstanceID)
+		if err := h.store.ScheduleDeletion(ctx, record.Key); err != nil {
+			reconciliationErrors = append(reconciliationErrors, err)
+			continue
+		}
+	}
+	if len(records) != 0 {
+		h.signal()
+	}
+	return errors.Join(reconciliationErrors...)
+}
+
+func (h *Handler) process(parent context.Context, record state.Record, kind state.WorkKind) {
+	if parent.Err() != nil {
+		if err := h.store.ReleaseClaim(context.Background(), record.Key, kind); err != nil {
+			log.Printf("ERROR: release canceled %s claim for %s: %v", kind, record.Key, err)
+		}
 		return
 	}
-
-	log.Printf("Callback: deleted droplet %d", req.DropletID)
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, "deleted")
+	if record.Provider != h.provider {
+		err := fmt.Errorf("state record belongs to provider %q, controller is configured for %q", record.Provider, h.provider)
+		switch kind {
+		case state.WorkProvision:
+			h.provisionFailed(record, err)
+		case state.WorkDelete:
+			if stateErr := h.store.MarkOrphaned(context.Background(), record.Key, err.Error()); stateErr != nil {
+				log.Printf("ERROR: persist provider mismatch for %s: %v", record.Key, stateErr)
+			}
+		}
+		return
+	}
+	ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
+	defer cancel()
+	switch kind {
+	case state.WorkProvision:
+		h.provision(ctx, record)
+	case state.WorkDelete:
+		h.delete(ctx, record)
+	}
 }
 
-// boolPtr returns a pointer to a bool value
-func boolPtr(b bool) *bool {
-	return &b
+func (h *Handler) provision(ctx context.Context, record state.Record) {
+	runnerName := runnerName(record.Repository, record.JobID)
+	existing, found, err := h.computeClient.FindRunner(ctx, record.Key)
+	if err != nil {
+		h.provisionFailed(record, fmt.Errorf("reconcile runner instance: %w", err))
+		return
+	}
+	if found {
+		if record.GitHubRunnerID == 0 {
+			if deleteErr := h.computeClient.DeleteRunner(ctx, existing.ID, record.Key); deleteErr != nil {
+				h.provisionFailed(record, fmt.Errorf("delete runner with missing JIT identity: %w", deleteErr))
+				return
+			}
+			h.provisionFailed(record, fmt.Errorf("removed runner with missing JIT identity"))
+			return
+		}
+		if err := h.store.MarkProvisioned(context.Background(), record.Key, existing.ID, record.GitHubRunnerID, existing.Name); err != nil {
+			log.Printf("ERROR: persist reconciled runner %s: %v", record.Key, err)
+			h.provisionFailed(record, fmt.Errorf("persist reconciled runner: %w", err))
+		}
+		h.signal()
+		return
+	}
+	if record.GitHubRunnerID != 0 && record.GitHubRunnerOwned {
+		if err := h.githubClient.RemoveRepoRunner(ctx, record.Owner, record.Repository, record.GitHubRunnerID); err != nil {
+			h.provisionFailed(record, fmt.Errorf("remove stale JIT runner %d: %w", record.GitHubRunnerID, err))
+			return
+		}
+		if err := h.store.ClearJIT(context.Background(), record.Key); err != nil {
+			h.provisionFailed(record, fmt.Errorf("clear stale JIT runner state: %w", err))
+			return
+		}
+	}
+	jit, err := h.githubClient.GenerateRepoJITConfig(
+		ctx, record.Owner, record.Repository, runnerName, h.runnerGroupID, record.Labels,
+	)
+	if err != nil {
+		h.provisionFailed(record, fmt.Errorf("generate JIT config: %w", err))
+		return
+	}
+	if err := h.store.MarkJITCreated(context.Background(), record.Key, jit.RunnerID, runnerName); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		cleanupErr := h.githubClient.RemoveRepoRunner(cleanupCtx, record.Owner, record.Repository, jit.RunnerID)
+		cancel()
+		if cleanupErr != nil {
+			log.Printf("WARN: remove unpersisted JIT runner %d: %v", jit.RunnerID, cleanupErr)
+		}
+		h.provisionFailed(record, fmt.Errorf("persist JIT runner identity: %w", err))
+		return
+	}
+	record.GitHubRunnerID = jit.RunnerID
+	record.RunnerName = runnerName
+
+	instance, err := h.computeClient.CreateRunner(ctx, compute.RunnerParams{
+		JobKey:              record.Key,
+		ProvisionEpoch:      record.ProvisionEpoch,
+		RunnerName:          runnerName,
+		RunnerJITConfig:     jit.EncodedConfig,
+		RunnerVersion:       h.runnerVersion,
+		RunnerSHA256:        h.runnerSHA256,
+		ChefInstallerSHA256: h.chefInstallerSHA256,
+	})
+	if err != nil {
+		h.provisionFailed(record, fmt.Errorf("create runner instance: %w", err))
+		return
+	}
+	if err := h.store.MarkProvisioned(context.Background(), record.Key, instance.ID, jit.RunnerID, runnerName); err != nil {
+		log.Printf("ERROR: persist provisioned runner %s: %v", record.Key, err)
+		h.provisionFailed(record, fmt.Errorf("persist provisioned runner: %w", err))
+		return
+	}
+	log.Printf("Provisioned runner %s (instance %s) for %s/%s job %d", runnerName, instance.ID, record.Owner, record.Repository, record.JobID)
+	h.signal()
 }
 
-// strPtr returns a pointer to a string value
-func strPtr(s string) *string {
-	return &s
+func (h *Handler) provisionFailed(record state.Record, err error) {
+	if record.Attempts >= h.maxAttempts {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		cleanupErr := h.computeClient.CleanupRunner(cleanupCtx, record.Key)
+		cancel()
+		if errors.Is(cleanupErr, compute.ErrOwnershipMismatch) {
+			if record.GitHubRunnerID != 0 {
+				removeCtx, removeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				removeErr := h.githubClient.RemoveRepoRunner(removeCtx, record.Owner, record.Repository, record.GitHubRunnerID)
+				removeCancel()
+				if removeErr == nil {
+					_ = h.store.ClearJIT(context.Background(), record.Key)
+				}
+			}
+			if stateErr := h.store.MarkOrphaned(context.Background(), record.Key, cleanupErr.Error()); stateErr != nil {
+				log.Printf("ERROR: persist orphaned failed provision for %s: %v", record.Key, stateErr)
+			}
+			log.Printf("ERROR: failed provision for %s requires operator cleanup: %v", record.Key, cleanupErr)
+			return
+		}
+		if cleanupErr != nil {
+			log.Printf("WARN: clean up exhausted provision for %s: %v", record.Key, cleanupErr)
+		}
+		if record.GitHubRunnerID != 0 {
+			removeCtx, removeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			removeErr := h.githubClient.RemoveRepoRunner(removeCtx, record.Owner, record.Repository, record.GitHubRunnerID)
+			removeCancel()
+			if removeErr != nil {
+				log.Printf("WARN: deregister exhausted JIT runner %d: %v", record.GitHubRunnerID, removeErr)
+			} else if clearErr := h.store.ClearJIT(context.Background(), record.Key); clearErr != nil {
+				log.Printf("WARN: clear exhausted JIT runner %d: %v", record.GitHubRunnerID, clearErr)
+			}
+		}
+	}
+	retryAt := time.Now().Add(retryDelay(record.Attempts))
+	if stateErr := h.store.MarkProvisionFailed(context.Background(), record.Key, err.Error(), retryAt, h.maxAttempts); stateErr != nil {
+		log.Printf("ERROR: persist provisioning failure for %s: %v", record.Key, stateErr)
+	}
+	log.Printf("ERROR: provision attempt %d for %s: %v", record.Attempts, record.Key, err)
+	h.signal()
+}
+
+func (h *Handler) delete(ctx context.Context, record state.Record) {
+	if err := h.computeClient.DeleteRunner(ctx, record.InstanceID, record.Key); err != nil {
+		if errors.Is(err, compute.ErrOwnershipMismatch) {
+			if stateErr := h.store.MarkOrphaned(context.Background(), record.Key, err.Error()); stateErr != nil {
+				log.Printf("ERROR: persist orphaned runner %s: %v", record.Key, stateErr)
+			}
+			log.Printf("ERROR: runner %s requires operator cleanup: %v", record.Key, err)
+			return
+		}
+		retryAt := time.Now().Add(retryDelay(record.DeleteAttempts))
+		if stateErr := h.store.MarkDeleteFailed(context.Background(), record.Key, err.Error(), retryAt, h.maxAttempts); stateErr != nil {
+			log.Printf("ERROR: persist deletion failure for %s: %v", record.Key, stateErr)
+		}
+		log.Printf("ERROR: delete attempt %d for %s: %v", record.DeleteAttempts, record.Key, err)
+		h.signal()
+		return
+	}
+	if record.GitHubRunnerID != 0 {
+		if err := h.githubClient.RemoveRepoRunner(ctx, record.Owner, record.Repository, record.GitHubRunnerID); err != nil {
+			retryAt := time.Now().Add(retryDelay(record.DeleteAttempts))
+			if stateErr := h.store.MarkDeleteFailed(context.Background(), record.Key, err.Error(), retryAt, h.maxAttempts); stateErr != nil {
+				log.Printf("ERROR: persist GitHub runner deletion failure for %s: %v", record.Key, stateErr)
+			}
+			h.signal()
+			return
+		}
+	}
+	if err := h.store.MarkDeleted(context.Background(), record.Key); err != nil {
+		log.Printf("ERROR: persist deleted runner %s: %v", record.Key, err)
+		return
+	}
+	log.Printf("Deleted owned runner instance %s for %s", record.InstanceID, record.Key)
+}
+
+func (h *Handler) validateRepository(repo RepoInfo) (string, error) {
+	if !safeNameRegex.MatchString(repo.Owner.Login) || !safeNameRegex.MatchString(repo.Name) {
+		return "", fmt.Errorf("invalid owner or repository name")
+	}
+	fullName := strings.ToLower(repo.Owner.Login + "/" + repo.Name)
+	if !strings.EqualFold(repo.FullName, fullName) {
+		return "", fmt.Errorf("repository identity fields disagree")
+	}
+	if !repo.Private {
+		return "", fmt.Errorf("public repositories are not permitted")
+	}
+	if _, ok := h.allowedRepositories[fullName]; !ok {
+		return "", fmt.Errorf("repository %s is not allowlisted", fullName)
+	}
+	return fullName, nil
+}
+
+func (h *Handler) validateLabels(requested []string) ([]string, error) {
+	seenRequired := false
+	result := make([]string, 0, len(requested))
+	seen := make(map[string]struct{}, len(requested))
+	for _, raw := range requested {
+		key := strings.ToLower(strings.TrimSpace(raw))
+		canonical, ok := h.allowedLabels[key]
+		if !ok {
+			return nil, fmt.Errorf("label %q is not allowlisted", raw)
+		}
+		if key == h.requiredLabel {
+			seenRequired = true
+		}
+		if _, duplicate := seen[key]; !duplicate {
+			result = append(result, canonical)
+			seen[key] = struct{}{}
+		}
+	}
+	if !seenRequired {
+		return nil, fmt.Errorf("required label %q is missing", h.requiredLabel)
+	}
+	return result, nil
+}
+
+func (h *Handler) signal() {
+	select {
+	case h.notify <- struct{}{}:
+	default:
+	}
+}
+
+func validRepository(repo string) bool {
+	parts := strings.Split(repo, "/")
+	return len(parts) == 2 && safeNameRegex.MatchString(parts[0]) && safeNameRegex.MatchString(parts[1])
+}
+
+func jobKey(repository string, jobID int64) string {
+	return fmt.Sprintf("%s:%d", strings.ToLower(repository), jobID)
+}
+
+func runnerName(repository string, jobID int64) string {
+	base := strings.Map(func(character rune) rune {
+		if character >= 'a' && character <= 'z' || character >= '0' && character <= '9' {
+			return character
+		}
+		return '-'
+	}, strings.ToLower(repository))
+	hash := sha256.Sum256([]byte(jobKey(repository, jobID)))
+	suffix := "-" + hex.EncodeToString(hash[:6])
+	maxBase := 63 - len("eph-") - len(suffix)
+	if len(base) > maxBase {
+		base = base[:maxBase]
+	}
+	base = strings.TrimRight(base, "-")
+	return "eph-" + base + suffix
+}
+
+func retryDelay(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	if attempt > 6 {
+		attempt = 6
+	}
+	return time.Duration(1<<(attempt-1)) * 5 * time.Second
+}
+
+func writeResponse(w http.ResponseWriter, status int, message string) {
+	w.WriteHeader(status)
+	_, _ = fmt.Fprint(w, message)
 }

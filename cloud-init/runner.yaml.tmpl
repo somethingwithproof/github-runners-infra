@@ -1,18 +1,19 @@
 #cloud-config
 
+ssh_pwauth: false
+disable_root: true
+
 users:
   - name: runner
     shell: /bin/bash
     groups: docker
-    sudo: |
-      runner ALL=(ALL) NOPASSWD: /usr/bin/docker
 
 package_update: true
 
 packages:
   - docker.io
-  - awscli
   - build-essential
+  - ca-certificates
   - curl
   - git
   - jq
@@ -22,72 +23,50 @@ packages:
   - zlib1g-dev
 
 runcmd:
-  - systemctl enable docker
-  - systemctl start docker
-
-  # Install Chef Workstation (includes Ruby, bundler, test-kitchen, etc.)
   - |
-    set -ex
-    CHEF_INSTALLER="/tmp/chef-install.sh"
-    CHEF_CHECKSUM="{{.ChefInstallerSHA256}}"
-    curl -fsSL -o "$CHEF_INSTALLER" https://omnitruck.chef.io/install.sh
-    ACTUAL=$(sha256sum "$CHEF_INSTALLER" | awk '{print $1}')
-    if [ "$ACTUAL" != "$CHEF_CHECKSUM" ]; then
-      echo "FATAL: Chef installer checksum mismatch: expected=$CHEF_CHECKSUM actual=$ACTUAL" >&2
-      exit 1
-    fi
+    set -eu
+    systemctl enable --now docker
+
+    CHEF_INSTALLER=/tmp/chef-install.sh
+    CHEF_SHA256='{{.ChefInstallerSHA256}}'
+    curl --fail --silent --show-error --location \
+      --proto '=https' --tlsv1.2 \
+      --output "$CHEF_INSTALLER" \
+      https://omnitruck.chef.io/install.sh
+    printf '%s  %s\n' "$CHEF_SHA256" "$CHEF_INSTALLER" | \
+      sha256sum --check --strict -
     bash "$CHEF_INSTALLER" -P chef-workstation
-    rm -f "$CHEF_INSTALLER"
+    shred --remove "$CHEF_INSTALLER"
 
-  # Create tool cache directory for actions like setup-ruby
-  - mkdir -p /opt/hostedtoolcache && chown runner:runner /opt/hostedtoolcache
-
-  # Set up GitHub Actions runner with checksum verification
-  - |
-    set -ex
-    mkdir -p /home/runner/actions-runner
+    install -d -o runner -g runner /opt/hostedtoolcache
+    install -d -o runner -g runner /home/runner/actions-runner
     cd /home/runner/actions-runner
-    RUNNER_TARBALL="actions-runner-linux-x64-{{.RunnerVersion}}.tar.gz"
-    RUNNER_URL="https://github.com/actions/runner/releases/download/v{{.RunnerVersion}}/${RUNNER_TARBALL}"
-    curl -fsSL -o "$RUNNER_TARBALL" "$RUNNER_URL"
-    curl -fsSL -o "${RUNNER_TARBALL}.sha256" "${RUNNER_URL}.sha256"
-    sha256sum -c "${RUNNER_TARBALL}.sha256"
-    tar xzf "$RUNNER_TARBALL"
-    rm "$RUNNER_TARBALL" "${RUNNER_TARBALL}.sha256"
+
+    RUNNER_TARBALL='actions-runner-linux-x64-{{.RunnerVersion}}.tar.gz'
+    RUNNER_SHA256='{{.RunnerSHA256}}'
+    RUNNER_RELEASE='https://github.com/actions/runner/releases/download'
+    RUNNER_URL="${RUNNER_RELEASE}/v{{.RunnerVersion}}/${RUNNER_TARBALL}"
+    curl --fail --silent --show-error --location \
+      --proto '=https' --tlsv1.2 \
+      --output "$RUNNER_TARBALL" \
+      "$RUNNER_URL"
+    printf '%s  %s\n' "$RUNNER_SHA256" "$RUNNER_TARBALL" | \
+      sha256sum --check --strict -
+    tar --extract --gzip --file "$RUNNER_TARBALL"
+    shred --remove "$RUNNER_TARBALL"
     chown -R runner:runner /home/runner/actions-runner
 
-  # Fetch runner token from AWS SSM Parameter Store
-  - |
-    set -ex
-    TOKEN_PARAM="{{.RunnerTokenSSMParam}}"
-    aws ssm get-parameter --name "$TOKEN_PARAM" --with-decryption --query 'Parameter.Value' --output text > /home/runner/.runner-token
-    chmod 600 /home/runner/.runner-token
-    chown runner:runner /home/runner/.runner-token
+    install -m 0600 -o runner -g runner /dev/null /home/runner/.jit-config
+    printf '%s' '{{.RunnerJITConfig}}' > /home/runner/.jit-config
+    JIT_CONFIG=$(cat /home/runner/.jit-config)
+    shred --remove /home/runner/.jit-config
 
-  # Configure and start ephemeral runner
-  - |
-    set -ex
-    su - runner -c '
-      cd /home/runner/actions-runner
-      TOKEN=$(cat /home/runner/.runner-token)
-      ./config.sh \
-        --url https://github.com/{{.RunnerRepo}} \
-        --token "$TOKEN" \
-        --name {{.RunnerName}} \
-        --labels {{.RunnerLabels}} \
-        --ephemeral \
-        --unattended
-      shred -u /home/runner/.runner-token
-      ./run.sh
-    '
+    RUNNER_EXIT=0
+    runuser -u runner -- ./run.sh --jitconfig "$JIT_CONFIG" || RUNNER_EXIT=$?
+    unset JIT_CONFIG
 
-  # Self-destruct: call back to webhook controller
-  - |
-    DROPLET_ID=$(curl -s http://169.254.169.254/metadata/v1/id)
-    CALLBACK_SECRET_PARAM="{{.CallbackSecretSSMParam}}"
-    CALLBACK_SECRET=$(aws ssm get-parameter --name "$CALLBACK_SECRET_PARAM" --with-decryption --query 'Parameter.Value' --output text)
-    curl -s -X POST \
-      -H "Content-Type: application/json" \
-      -H "X-Callback-Secret: $CALLBACK_SECRET" \
-      -d "{\"droplet_id\": ${DROPLET_ID}}" \
-      "{{.CallbackURL}}/callback/destroy"
+    # The trusted controller deletes the droplet after the workflow_job
+    # completion event. Power off immediately to stop workload execution while
+    # waiting for that control-plane deletion or TTL reconciliation.
+    shutdown --poweroff now
+    exit "$RUNNER_EXIT"
