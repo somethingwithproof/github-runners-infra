@@ -12,6 +12,11 @@ import (
 	"strings"
 )
 
+const (
+	authTokenPrefix  = "token "
+	acceptGitHubJSON = "application/vnd.github+json"
+)
+
 func decodeJSON(r io.Reader, v any) error {
 	return json.NewDecoder(r).Decode(v)
 }
@@ -28,8 +33,8 @@ func (a *App) GenerateRunnerToken(org string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "token "+token)
-	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Authorization", authTokenPrefix+token)
+	req.Header.Set("Accept", acceptGitHubJSON)
 
 	resp, err := HTTPClient.Do(req)
 	if err != nil {
@@ -62,8 +67,8 @@ func (a *App) GenerateRepoRunnerToken(owner, repo string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "token "+token)
-	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Authorization", authTokenPrefix+token)
+	req.Header.Set("Accept", acceptGitHubJSON)
 
 	resp, err := HTTPClient.Do(req)
 	if err != nil {
@@ -106,8 +111,8 @@ func (a *App) ListRepoRunners(owner, repo string) ([]Runner, error) {
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Authorization", "token "+token)
-		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("Authorization", authTokenPrefix+token)
+		req.Header.Set("Accept", acceptGitHubJSON)
 
 		resp, err := HTTPClient.Do(req)
 		if err != nil {
@@ -150,8 +155,8 @@ func (a *App) RemoveRepoRunner(owner, repo string, runnerID int64) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "token "+token)
-	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Authorization", authTokenPrefix+token)
+	req.Header.Set("Accept", acceptGitHubJSON)
 
 	resp, err := HTTPClient.Do(req)
 	if err != nil {
@@ -202,8 +207,8 @@ func (a *App) ListInstallationRepos() ([][2]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Authorization", "token "+token)
-		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("Authorization", authTokenPrefix+token)
+		req.Header.Set("Accept", acceptGitHubJSON)
 
 		resp, err := HTTPClient.Do(req)
 		if err != nil {
