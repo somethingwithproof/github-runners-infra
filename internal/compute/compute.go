@@ -13,6 +13,14 @@ import (
 // controller cannot safely mutate.
 var ErrOwnershipMismatch = errors.New("provider resource ownership mismatch")
 
+// ErrDuplicateInstances marks multiple controller-owned resources for one job.
+// Callers must reconcile all of them rather than retrying creation.
+var ErrDuplicateInstances = errors.New("duplicate provider instances")
+
+// ErrCreateOutcomeUnknown marks a provider create that may have succeeded even
+// though no resource identity was returned. Retrying would risk duplication.
+var ErrCreateOutcomeUnknown = errors.New("provider create outcome unknown")
+
 var controllerIDRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$`)
 
 // ValidControllerID applies the provider-safe controller ownership identifier

@@ -4,6 +4,9 @@ ssh_pwauth: false
 disable_root: true
 
 users:
+  # Docker group membership is intentionally root-equivalent. Each runner is
+  # single-use, receives no controller credentials, and is destroyed after one
+  # trusted private-repository job; sudo removal is not a job/host boundary.
   - name: runner
     shell: /bin/bash
     groups: docker
@@ -27,6 +30,9 @@ runcmd:
     set -eu
     systemctl enable --now docker
 
+    # Template sources and controller validation restrict these single-quoted
+    # values to URLs, hex digests, versions, and base64 without apostrophes.
+    # Revisit shell quoting before changing those sources or validators.
     CHEF_INSTALLER=/tmp/chef-install.sh
     CHEF_SHA256='{{.ChefInstallerSHA256}}'
     curl --fail --silent --show-error --location \

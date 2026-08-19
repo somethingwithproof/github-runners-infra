@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"text/template"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -32,10 +33,12 @@ type ec2API interface {
 // Config configures the EC2 runner pool. The SDK default credential chain is
 // used; static cloud credentials are intentionally not accepted here.
 type Config struct {
-	Region             string
-	AMI                string
-	InstanceType       string
-	SubnetID           string
+	Region       string
+	AMI          string
+	InstanceType string
+	SubnetID     string
+	// SecurityGroupIDs are operator/IaC-managed. This adapter defaults to no
+	// public IP but cannot infer intended private-network ingress policy.
 	SecurityGroupIDs   []string
 	InstanceProfileARN string
 	KeyName            string
@@ -100,34 +103,40 @@ func (c *Client) FindRunner(ctx context.Context, jobKey string) (*compute.Runner
 		return nil, false, nil
 	}
 	if len(instances) > 1 {
-		return nil, false, fmt.Errorf("multiple EC2 instances exist for job %s", jobKey)
+		return nil, false, fmt.Errorf("%w: multiple EC2 instances exist for job %s", compute.ErrDuplicateInstances, jobKey)
 	}
 	instance := instances[0]
 	return &compute.RunnerInstance{ID: *instance.InstanceId, Name: tagValue(instance.Tags, "Name")}, true, nil
 }
 
 func (c *Client) listJobInstances(ctx context.Context, jobKey string) ([]types.Instance, error) {
-	out, err := c.api.DescribeInstances(ctx, &ec2.DescribeInstancesInput{Filters: []types.Filter{
+	input := &ec2.DescribeInstancesInput{Filters: []types.Filter{
 		{Name: aws.String("tag:" + controllerTagKey), Values: []string{c.controllerID}},
 		{Name: aws.String("tag:" + jobTagKey), Values: []string{jobTag(jobKey)}},
 		{Name: aws.String("instance-state-name"), Values: []string{"pending", "running", "stopping", "stopped"}},
-	}})
-	if err != nil {
-		return nil, fmt.Errorf("find EC2 runner: %w", err)
-	}
+	}}
 	var instances []types.Instance
-	for _, reservation := range out.Reservations {
-		for _, instance := range reservation.Instances {
-			if instance.InstanceId == nil {
-				continue
-			}
-			if tagValue(instance.Tags, controllerTagKey) != c.controllerID || tagValue(instance.Tags, jobTagKey) != jobTag(jobKey) {
-				return nil, fmt.Errorf("%w: EC2 instance %s lacks controller or job ownership tags", compute.ErrOwnershipMismatch, *instance.InstanceId)
-			}
-			instances = append(instances, instance)
+	for {
+		out, err := c.api.DescribeInstances(ctx, input)
+		if err != nil {
+			return nil, fmt.Errorf("find EC2 runner: %w", err)
 		}
+		for _, reservation := range out.Reservations {
+			for _, instance := range reservation.Instances {
+				if instance.InstanceId == nil {
+					continue
+				}
+				if tagValue(instance.Tags, controllerTagKey) != c.controllerID || tagValue(instance.Tags, jobTagKey) != jobTag(jobKey) {
+					return nil, fmt.Errorf("%w: EC2 instance %s lacks controller or job ownership tags", compute.ErrOwnershipMismatch, *instance.InstanceId)
+				}
+				instances = append(instances, instance)
+			}
+		}
+		if out.NextToken == nil || *out.NextToken == "" {
+			return instances, nil
+		}
+		input.NextToken = out.NextToken
 	}
-	return instances, nil
 }
 
 func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) (*compute.RunnerInstance, error) {
@@ -199,6 +208,9 @@ func (c *Client) DeleteRunner(ctx context.Context, instanceID, jobKey string) er
 	if instance == nil {
 		return nil
 	}
+	if instance.State != nil && (instance.State.Name == types.InstanceStateNameShuttingDown || instance.State.Name == types.InstanceStateNameTerminated) {
+		return nil
+	}
 	if tagValue(instance.Tags, controllerTagKey) != c.controllerID || tagValue(instance.Tags, jobTagKey) != jobTag(jobKey) {
 		return fmt.Errorf("%w: refusing to delete EC2 instance %s without controller and job ownership tags", compute.ErrOwnershipMismatch, instanceID)
 	}
@@ -228,6 +240,48 @@ func (c *Client) CleanupRunner(ctx context.Context, jobKey string) error {
 		}
 	}
 	return nil
+}
+
+// SweepOrphanedRunners reclaims old controller-owned EC2 instances that no
+// longer have a durable lifecycle record.
+func (c *Client) SweepOrphanedRunners(ctx context.Context, known map[string]struct{}, cutoff time.Time) (int, error) {
+	input := &ec2.DescribeInstancesInput{Filters: []types.Filter{
+		{Name: aws.String("tag:" + controllerTagKey), Values: []string{c.controllerID}},
+		{Name: aws.String("instance-state-name"), Values: []string{"pending", "running", "stopping", "stopped"}},
+	}}
+	deleted := 0
+	for {
+		out, err := c.api.DescribeInstances(ctx, input)
+		if err != nil {
+			return deleted, fmt.Errorf("list controller EC2 instances for orphan sweep: %w", err)
+		}
+		for _, reservation := range out.Reservations {
+			for _, instance := range reservation.Instances {
+				if instance.InstanceId == nil {
+					return deleted, fmt.Errorf("controller EC2 instance has no instance ID")
+				}
+				id := *instance.InstanceId
+				if tagValue(instance.Tags, controllerTagKey) != c.controllerID {
+					return deleted, fmt.Errorf("%w: EC2 orphan sweep returned unowned instance %s", compute.ErrOwnershipMismatch, id)
+				}
+				if instance.LaunchTime == nil {
+					return deleted, fmt.Errorf("controller-owned EC2 instance %s has no launch time", id)
+				}
+				if _, ok := known[id]; ok || !instance.LaunchTime.Before(cutoff) {
+					continue
+				}
+				if _, err := c.api.TerminateInstances(ctx, &ec2.TerminateInstancesInput{InstanceIds: []string{id}}); err != nil && !isNotFound(err) {
+					return deleted, fmt.Errorf("terminate orphaned controller EC2 instance %s: %w", id, err)
+				}
+				deleted++
+			}
+		}
+		if out.NextToken == nil || *out.NextToken == "" {
+			break
+		}
+		input.NextToken = out.NextToken
+	}
+	return deleted, nil
 }
 
 func tagValue(tags []types.Tag, key string) string {

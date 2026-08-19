@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"os/signal"
@@ -32,18 +33,17 @@ func main() {
 func run() error {
 	processCtx, stopProcess := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stopProcess()
-	appID := mustConfig(requiredPositiveInt64("APP_ID"))
-	installationID := mustConfig(requiredPositiveInt64("APP_INSTALLATION_ID"))
-	privateKeyPath := mustConfig(requiredEnv("APP_PRIVATE_KEY_FILE"))
-	privateKey, err := os.ReadFile(privateKeyPath)
+	cfg, err := loadRuntimeConfig()
+	if err != nil {
+		return fmt.Errorf("invalid configuration: %w", err)
+	}
+	privateKey, err := os.ReadFile(cfg.privateKeyPath)
 	if err != nil {
 		return fmt.Errorf("read GitHub App private key file: %w", err)
 	}
-	allowedRepositories := splitCSV(mustConfig(requiredEnv("ALLOWED_REPOSITORIES")))
-
 	stateStore, err := state.OpenFileStore(
-		envOrDefault("STATE_FILE", "/var/lib/github-runners/state.json"),
-		state.WithDeletedRetention(mustConfig(envDuration("DELETED_RECORD_RETENTION", 24*time.Hour))),
+		cfg.stateFile,
+		state.WithDeletedRetention(cfg.deletedRetention),
 	)
 	if err != nil {
 		return fmt.Errorf("open lifecycle state: %w", err)
@@ -54,46 +54,48 @@ func run() error {
 		}
 	}()
 
-	computeClient, closeCompute, err := newComputeClient(processCtx)
+	startupCtx, cancelStartup := context.WithTimeout(processCtx, 30*time.Second)
+	computeClient, closeCompute, err := newComputeClient(startupCtx, processCtx)
+	cancelStartup()
 	if err != nil {
 		return fmt.Errorf("create compute client: %w", err)
 	}
 	defer closeCompute()
 
 	githubClient := &gh.App{
-		AppID:               appID,
-		InstallationID:      installationID,
+		AppID:               cfg.appID,
+		InstallationID:      cfg.installationID,
 		PrivateKey:          privateKey,
-		AllowedRepositories: allowedRepositories,
+		AllowedRepositories: cfg.allowedRepositories,
 	}
-	if err := githubClient.ValidateTokenScope(processCtx); err != nil {
+	if err := validateGitHubTokenScope(processCtx, githubClient.ValidateTokenScope); err != nil {
 		return fmt.Errorf("validate GitHub token scope: %w", err)
 	}
 	handler, err := webhook.NewHandler(webhook.Config{
-		WebhookSecret:       []byte(mustConfig(requiredEnv("WEBHOOK_SECRET"))),
-		GitHubClient:        githubClient,
-		ComputeClient:       computeClient,
-		Store:               stateStore,
-		RequiredLabel:       envOrDefault("REQUIRED_LABEL", "self-hosted"),
-		AllowedLabels:       splitCSV(mustConfig(requiredEnv("ALLOWED_LABELS"))),
-		AllowedRepositories: allowedRepositories,
-		RunnerVersion:       mustConfig(requiredEnv("RUNNER_VERSION")),
-		RunnerSHA256:        mustConfig(requiredEnv("RUNNER_SHA256")),
-		ChefInstallerSHA256: mustConfig(requiredEnv("CHEF_INSTALLER_SHA256")),
-		RunnerGroupID:       mustConfig(envPositiveInt64("RUNNER_GROUP_ID", 1)),
-		WorkerCount:         mustConfig(envPositiveInt("WORKER_COUNT", 4)),
-		MaxLiveRunners:      mustConfig(envPositiveInt("MAX_LIVE_RUNNERS", 20)),
-		MaxAttempts:         mustConfig(envPositiveInt("MAX_ATTEMPTS", 5)),
-		MaxRunnerAge:        mustConfig(envDuration("MAX_RUNNER_AGE", 6*time.Hour)),
-		CancelledRunnerTTL:  mustConfig(envDuration("CANCELLED_RUNNER_TTL", 5*time.Minute)),
-		InstallationID:      installationID,
+		WebhookSecret:         []byte(cfg.webhookSecret),
+		GitHubClient:          githubClient,
+		ComputeClient:         computeClient,
+		Store:                 stateStore,
+		RequiredLabel:         cfg.requiredLabel,
+		AllowedLabels:         cfg.allowedLabels,
+		AllowedRepositories:   cfg.allowedRepositories,
+		RunnerVersion:         cfg.runnerVersion,
+		RunnerSHA256:          cfg.runnerSHA256,
+		ChefInstallerSHA256:   cfg.chefInstallerSHA256,
+		RunnerGroupID:         cfg.runnerGroupID,
+		WorkerCount:           cfg.workerCount,
+		MaxLiveRunners:        cfg.maxLiveRunners,
+		MaxAttempts:           cfg.maxAttempts,
+		MaxRunnerAge:          cfg.maxRunnerAge,
+		CancelledRunnerTTL:    cfg.cancelledRunnerTTL,
+		RegistrationTimeout:   cfg.registrationTimeout,
+		LivenessSettleWindow:  cfg.livenessSettleWindow,
+		LivenessConfirmations: cfg.livenessConfirmations,
+		InstallationID:        cfg.installationID,
 	})
 	if err != nil {
 		return fmt.Errorf("create webhook handler: %w", err)
 	}
-
-	workerCtx, cancelWorkers := context.WithCancel(context.Background())
-	handler.Start(workerCtx)
 
 	mux := http.NewServeMux()
 	mux.Handle("/webhook", handler)
@@ -107,7 +109,7 @@ func run() error {
 	})
 
 	srv := &http.Server{
-		Addr:              envOrDefault("LISTEN_ADDR", ":8080"),
+		Addr:              cfg.listenAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
@@ -115,10 +117,23 @@ func run() error {
 		IdleTimeout:       60 * time.Second,
 	}
 
+	return serveUntilShutdown(processCtx, srv, handler.Start, handler.Wait, srv.ListenAndServe)
+}
+
+func serveUntilShutdown(
+	processCtx context.Context,
+	srv *http.Server,
+	startWorkers func(context.Context),
+	waitWorkers func(),
+	listen func() error,
+) error {
+	workerCtx, cancelWorkers := context.WithCancel(context.Background())
+	startWorkers(workerCtx)
+
 	serverErr := make(chan error, 1)
 	go func() {
 		log.Printf("Webhook listener starting on %s", srv.Addr)
-		serverErr <- srv.ListenAndServe()
+		serverErr <- listen()
 	}()
 
 	var listenerErr error
@@ -135,8 +150,73 @@ func run() error {
 		log.Printf("HTTP shutdown: %v", err)
 	}
 	cancelWorkers()
-	handler.Wait()
+	waitWorkers()
 	return listenerErr
+}
+
+func validateGitHubTokenScope(ctx context.Context, validate func(context.Context) error) error {
+	return validateGitHubTokenScopeWithPolicy(ctx, validate, tokenValidationRetryPolicy{
+		minDelay: 5 * time.Second, jitter: time.Second, maxElapsed: 5 * time.Minute, maxAttempts: 5,
+		now: time.Now, wait: waitForTokenRetry,
+	})
+}
+
+type tokenValidationRetryPolicy struct {
+	minDelay, jitter, maxElapsed time.Duration
+	maxAttempts                  int
+	now                          func() time.Time
+	wait                         func(context.Context, time.Duration) error
+}
+
+func validateGitHubTokenScopeWithPolicy(
+	ctx context.Context,
+	validate func(context.Context) error,
+	policy tokenValidationRetryPolicy,
+) error {
+	started := policy.now()
+	for attempt := 1; attempt <= policy.maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := validate(ctx)
+		if err == nil {
+			return nil
+		}
+		resetAt, rateLimited := gh.RateLimitReset(err)
+		if !rateLimited {
+			return err
+		}
+		if attempt == policy.maxAttempts {
+			return fmt.Errorf("GitHub token-scope validation remained rate limited after %d attempts: %w", attempt, err)
+		}
+		delay := resetAt.Sub(policy.now())
+		if delay < policy.minDelay {
+			delay = policy.minDelay
+		}
+		if policy.jitter > 0 {
+			delay += time.Duration(rand.Int64N(int64(policy.jitter)))
+		}
+		if policy.now().Add(delay).After(started.Add(policy.maxElapsed)) {
+			return fmt.Errorf("GitHub token-scope validation throttle exceeds %s startup budget: %w", policy.maxElapsed, err)
+		}
+		retryAt := policy.now().Add(delay)
+		log.Printf("WARN: GitHub token-scope validation rate limited; retrying at %s", retryAt.Format(time.RFC3339))
+		if err := policy.wait(ctx, delay); err != nil {
+			return err
+		}
+	}
+	return errors.New("GitHub token-scope validation retry policy is invalid")
+}
+
+func waitForTokenRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func unexpectedListenerError(err error) error {
@@ -146,18 +226,18 @@ func unexpectedListenerError(err error) error {
 	return fmt.Errorf("HTTP server failed: %w", err)
 }
 
-func newComputeClient(ctx context.Context) (webhook.ComputeClient, func(), error) {
+func newComputeClient(startupCtx, lifetimeCtx context.Context) (webhook.ComputeClient, func(), error) {
 	provider := strings.ToLower(envOrDefault("COMPUTE_PROVIDER", "digitalocean"))
 	controllerID, err := requiredEnv("CONTROLLER_ID")
 	if err != nil {
-		return nil, func() {}, err
+		return nil, noopClose, err
 	}
 	cloudInitPath := envOrDefault("CLOUD_INIT_PATH", "/opt/github-runners/cloud-init/runner.yaml.tmpl")
 	spot, err := envBoolValue("RUNNER_SPOT", false)
 	if err != nil {
-		return nil, func() {}, err
+		return nil, noopClose, err
 	}
-	noClose := func() {}
+	noClose := noopClose
 
 	switch provider {
 	case "digitalocean":
@@ -174,7 +254,10 @@ func newComputeClient(ctx context.Context) (webhook.ComputeClient, func(), error
 			SSHFingerprints: splitCSV(os.Getenv("DO_SSH_FINGERPRINTS")), CloudInitPath: cloudInitPath, ControllerID: controllerID,
 			VPCUUID: required["DO_VPC_UUID"], FirewallID: required["DO_FIREWALL_ID"],
 		})
-		return client, noClose, err
+		if err != nil {
+			return nil, noClose, err
+		}
+		return client, noClose, nil
 	case "aws":
 		required, err := requiredValues("AWS_REGION", "AWS_AMI_ID", "AWS_INSTANCE_TYPE", "AWS_SUBNET_ID", "AWS_SECURITY_GROUP_IDS")
 		if err != nil {
@@ -184,15 +267,21 @@ func newComputeClient(ctx context.Context) (webhook.ComputeClient, func(), error
 		if err != nil {
 			return nil, noClose, err
 		}
-		client, err := aws.NewClient(ctx, aws.Config{
+		client, err := aws.NewClient(startupCtx, aws.Config{
 			Region: required["AWS_REGION"], AMI: required["AWS_AMI_ID"], InstanceType: required["AWS_INSTANCE_TYPE"],
 			SubnetID: required["AWS_SUBNET_ID"], SecurityGroupIDs: splitCSV(required["AWS_SECURITY_GROUP_IDS"]),
 			InstanceProfileARN: os.Getenv("AWS_INSTANCE_PROFILE_ARN"), KeyName: os.Getenv("AWS_KEY_NAME"),
 			CloudInitPath: cloudInitPath, ControllerID: controllerID, Spot: spot, ExternalIP: externalIP,
 		})
-		return client, noClose, err
+		if err != nil {
+			return nil, noClose, err
+		}
+		return client, noClose, nil
 	case "gcp":
-		required, err := requiredValues("GCP_PROJECT_ID", "GCP_ZONE", "GCP_MACHINE_TYPE", "GCP_SOURCE_IMAGE", "GCP_SUBNETWORK")
+		required, err := requiredValues(
+			"GCP_PROJECT_ID", "GCP_ZONE", "GCP_MACHINE_TYPE", "GCP_SOURCE_IMAGE", "GCP_SUBNETWORK",
+			"GCP_RUNNER_SERVICE_ACCOUNT_EMAIL",
+		)
 		if err != nil {
 			return nil, noClose, err
 		}
@@ -200,19 +289,19 @@ func newComputeClient(ctx context.Context) (webhook.ComputeClient, func(), error
 		if err != nil {
 			return nil, noClose, err
 		}
-		client, err := gcp.NewClient(ctx, gcp.Config{
+		// The legacy Google auth transport retained by the pinned client uses
+		// its constructor context for later token refreshes. Give it the process
+		// lifetime instead of the short startup-validation deadline.
+		client, err := gcp.NewClient(lifetimeCtx, gcp.Config{
 			ProjectID: required["GCP_PROJECT_ID"], Zone: required["GCP_ZONE"], MachineType: required["GCP_MACHINE_TYPE"],
 			SourceImage: required["GCP_SOURCE_IMAGE"], Subnetwork: required["GCP_SUBNETWORK"],
-			CloudInitPath: cloudInitPath, ControllerID: controllerID, Spot: spot, ExternalIP: externalIP,
+			ServiceAccountEmail: required["GCP_RUNNER_SERVICE_ACCOUNT_EMAIL"],
+			CloudInitPath:       cloudInitPath, ControllerID: controllerID, Spot: spot, ExternalIP: externalIP,
 		})
 		if err != nil {
 			return nil, noClose, err
 		}
-		return client, func() {
-			if err := client.Close(); err != nil {
-				log.Printf("Close GCP Compute client: %v", err)
-			}
-		}, nil
+		return client, func() { closeGCPClient(client) }, nil
 	case "azure":
 		required, err := requiredValues(
 			"AZURE_SSH_PUBLIC_KEY_FILE", "AZURE_SUBSCRIPTION_ID", "AZURE_RESOURCE_GROUP", "AZURE_LOCATION",
@@ -232,21 +321,128 @@ func newComputeClient(ctx context.Context) (webhook.ComputeClient, func(), error
 			SSHPublicKey: strings.TrimSpace(string(sshPublicKey)), CloudInitPath: cloudInitPath, ControllerID: controllerID,
 			Spot: spot,
 		})
-		return client, noClose, err
+		if err != nil {
+			return nil, noClose, err
+		}
+		return client, noClose, nil
 	default:
 		return nil, noClose, fmt.Errorf("unsupported COMPUTE_PROVIDER %q (expected digitalocean, aws, gcp, or azure)", provider)
 	}
 }
 
-func mustConfig[T any](value T, err error) T {
-	if err != nil {
-		log.Fatalf("Invalid configuration: %v", err)
+func noopClose() {
+	// Provider clients without an explicit Close method require no cleanup.
+}
+
+func closeGCPClient(client interface{ Close() error }) {
+	if err := client.Close(); err != nil {
+		log.Printf("ERROR: close GCP Compute client: %v", err)
 	}
-	return value
+}
+
+type runtimeConfig struct {
+	appID, installationID              int64
+	privateKeyPath, stateFile          string
+	requiredLabel, listenAddr          string
+	webhookSecret, runnerVersion       string
+	runnerSHA256, chefInstallerSHA256  string
+	allowedLabels, allowedRepositories []string
+	runnerGroupID                      int64
+	workerCount, maxLiveRunners        int
+	maxAttempts                        int
+	maxRunnerAge, cancelledRunnerTTL   time.Duration
+	registrationTimeout                time.Duration
+	livenessSettleWindow               time.Duration
+	livenessConfirmations              int
+	deletedRetention                   time.Duration
+}
+
+func loadRuntimeConfig() (runtimeConfig, error) {
+	var cfg runtimeConfig
+	var err error
+	if cfg.appID, err = requiredPositiveInt64("APP_ID"); err != nil {
+		return cfg, err
+	}
+	if cfg.installationID, err = requiredPositiveInt64("APP_INSTALLATION_ID"); err != nil {
+		return cfg, err
+	}
+	if cfg.privateKeyPath, err = requiredEnv("APP_PRIVATE_KEY_FILE"); err != nil {
+		return cfg, err
+	}
+	allowedRepositories, err := requiredEnv("ALLOWED_REPOSITORIES")
+	if err != nil {
+		return cfg, err
+	}
+	cfg.allowedRepositories = splitCSV(allowedRepositories)
+	if len(cfg.allowedRepositories) == 0 {
+		return cfg, fmt.Errorf("ALLOWED_REPOSITORIES must contain at least one non-empty value")
+	}
+	allowedLabels, err := requiredEnv("ALLOWED_LABELS")
+	if err != nil {
+		return cfg, err
+	}
+	cfg.allowedLabels = splitCSV(allowedLabels)
+	if len(cfg.allowedLabels) == 0 {
+		return cfg, fmt.Errorf("ALLOWED_LABELS must contain at least one non-empty value")
+	}
+	if cfg.webhookSecret, err = requiredRawEnv("WEBHOOK_SECRET"); err != nil {
+		return cfg, err
+	}
+	if cfg.runnerVersion, err = requiredEnv("RUNNER_VERSION"); err != nil {
+		return cfg, err
+	}
+	if cfg.runnerSHA256, err = requiredEnv("RUNNER_SHA256"); err != nil {
+		return cfg, err
+	}
+	if cfg.chefInstallerSHA256, err = requiredEnv("CHEF_INSTALLER_SHA256"); err != nil {
+		return cfg, err
+	}
+	if cfg.runnerGroupID, err = envPositiveInt64("RUNNER_GROUP_ID", 1); err != nil {
+		return cfg, err
+	}
+	if cfg.workerCount, err = envPositiveInt("WORKER_COUNT", 4); err != nil {
+		return cfg, err
+	}
+	if cfg.maxLiveRunners, err = envPositiveInt("MAX_LIVE_RUNNERS", 20); err != nil {
+		return cfg, err
+	}
+	if cfg.maxAttempts, err = envPositiveInt("MAX_ATTEMPTS", 5); err != nil {
+		return cfg, err
+	}
+	if cfg.maxRunnerAge, err = envDuration("MAX_RUNNER_AGE", 6*time.Hour); err != nil {
+		return cfg, err
+	}
+	if cfg.cancelledRunnerTTL, err = envDuration("CANCELLED_RUNNER_TTL", 5*time.Minute); err != nil {
+		return cfg, err
+	}
+	if cfg.registrationTimeout, err = envDuration("RUNNER_REGISTRATION_TIMEOUT", 10*time.Minute); err != nil {
+		return cfg, err
+	}
+	if cfg.livenessSettleWindow, err = envDuration("LIVENESS_SETTLE_WINDOW", 2*time.Minute); err != nil {
+		return cfg, err
+	}
+	if cfg.livenessConfirmations, err = envPositiveInt("LIVENESS_CONFIRMATIONS", 3); err != nil {
+		return cfg, err
+	}
+	if cfg.deletedRetention, err = envDuration("DELETED_RECORD_RETENTION", 24*time.Hour); err != nil {
+		return cfg, err
+	}
+	cfg.stateFile = envOrDefault("STATE_FILE", "/var/lib/github-runners/state.json")
+	cfg.requiredLabel = envOrDefault("REQUIRED_LABEL", "self-hosted")
+	cfg.listenAddr = envOrDefault("LISTEN_ADDR", ":8080")
+	return cfg, nil
 }
 
 func requiredEnv(key string) (string, error) {
 	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return "", fmt.Errorf("required environment variable %s is not set", key)
+	}
+	return value, nil
+}
+
+func requiredRawEnv(key string) (string, error) {
+	value := os.Getenv(key)
 	if value == "" {
 		return "", fmt.Errorf("required environment variable %s is not set", key)
 	}

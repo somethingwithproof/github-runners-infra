@@ -8,12 +8,25 @@ repos:
       - id: check-added-large-files
       - id: check-merge-conflict
 
-  - repo: https://github.com/dnephin/pre-commit-golang
-    rev: v0.5.1
+  # Go itself is pinned by go.mod/toolchain.
+  - repo: local
     hooks:
       - id: go-fmt
+        name: go fmt
+        entry: gofmt -w
+        language: system
+        types: [go]
       - id: go-build
-      - id: golangci-lint
+        name: go build ./...
+        entry: go build ./...
+        language: system
+        pass_filenames: false
+        files: '(^|/)(.*\.go|go\.(mod|sum))$'
+
+  - repo: https://github.com/golangci/golangci-lint
+    rev: v2.12.2
+    hooks:
+      - id: golangci-lint-full
 
   - repo: local
     hooks:
@@ -22,7 +35,7 @@ repos:
         entry: go vet ./...
         language: system
         pass_filenames: false
-        types: [go]
+        files: '(^|/)(.*\.go|go\.(mod|sum))$'
 
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.21.2

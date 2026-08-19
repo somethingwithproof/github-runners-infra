@@ -62,7 +62,7 @@ func (a *App) GenerateJWT() (string, error) {
 	if err != nil {
 		parsed, pkcs8Err := x509.ParsePKCS8PrivateKey(block.Bytes)
 		if pkcs8Err != nil {
-			return "", fmt.Errorf("parse RSA private key: %w", err)
+			return "", fmt.Errorf("parse RSA private key as PKCS#1 (%v) or PKCS#8: %w", err, pkcs8Err)
 		}
 		var ok bool
 		key, ok = parsed.(*rsa.PrivateKey)
@@ -123,7 +123,7 @@ func (a *App) InstallationTokenContext(ctx context.Context) (string, error) {
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusCreated {
-		return "", fmt.Errorf("unexpected status %d requesting installation token", resp.StatusCode)
+		return "", apiStatusError(resp, "requesting installation token")
 	}
 
 	var result struct {
@@ -167,7 +167,11 @@ func (a *App) tokenScope() ([]string, []string, string, error) {
 	seen := make(map[string]struct{}, len(a.AllowedRepositories))
 	for _, raw := range a.AllowedRepositories {
 		parts := strings.Split(strings.ToLower(strings.TrimSpace(raw)), "/")
-		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		if len(parts) != 2 {
+			return nil, nil, "", fmt.Errorf("invalid installation token repository %q", raw)
+		}
+		parts[0], parts[1] = strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+		if parts[0] == "" || parts[1] == "" {
 			return nil, nil, "", fmt.Errorf("invalid installation token repository %q", raw)
 		}
 		if owner != "" && owner != parts[0] {
