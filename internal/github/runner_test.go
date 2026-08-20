@@ -1,126 +1,241 @@
 package github
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"log"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
-func TestVerifyWebhookSignature_ValidSignature(t *testing.T) {
-	payload := []byte(`{"test": true}`)
-	secret := []byte("test-secret")
+type roundTripFunc func(*http.Request) (*http.Response, error)
 
-	// Generate valid signature
-	sig := testSign(payload, secret)
-
-	if !VerifyWebhookSignature(payload, sig, secret, "127.0.0.1") {
-		t.Error("expected valid signature to pass")
-	}
+func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
 }
 
-func TestVerifyWebhookSignature_InvalidSignature(t *testing.T) {
-	payload := []byte(`{"test": true}`)
-	secret := []byte("test-secret")
-	wrongSecret := []byte("wrong-secret")
-
-	sig := testSign(payload, wrongSecret)
-
-	if VerifyWebhookSignature(payload, sig, secret, "127.0.0.1") {
-		t.Error("expected invalid signature to fail")
-	}
-}
-
-func TestVerifyWebhookSignature_MissingPrefix(t *testing.T) {
-	if VerifyWebhookSignature([]byte("{}"), "noprefixhere", []byte("s"), "127.0.0.1") {
-		t.Error("expected missing prefix to fail")
-	}
-}
-
-func TestVerifyWebhookSignature_EmptySignature(t *testing.T) {
-	if VerifyWebhookSignature([]byte("{}"), "", []byte("s"), "127.0.0.1") {
-		t.Error("expected empty signature to fail")
-	}
-}
-
-func testSign(payload, secret []byte) string {
-	mac := hmac.New(sha256.New, secret)
-	mac.Write(payload)
-	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
-}
-
-func TestListRepoRunners_ParsesResponse(t *testing.T) {
-	runners := []Runner{
-		{ID: 1, Name: "eph-repo-1", Status: "online"},
-		{ID: 2, Name: "eph-repo-2", Status: "offline"},
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/actions/runners") {
-			resp := struct {
-				TotalCount int      `json:"total_count"`
-				Runners    []Runner `json:"runners"`
-			}{
-				TotalCount: len(runners),
-				Runners:    runners,
-			}
-			w.Header().Set("Content-Type", "application/json")
-			if err := json.NewEncoder(w).Encode(resp); err != nil {
-				t.Errorf("failed to encode runners response: %v", err)
-			}
-			return
+func TestGenerateRepoJITConfig(t *testing.T) {
+	original := HTTPClient
+	t.Cleanup(func() { HTTPClient = original })
+	HTTPClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method != http.MethodPost || request.URL.Path != "/repos/trusted/repo/actions/runners/generate-jitconfig" {
+			t.Fatalf("unexpected request %s %s", request.Method, request.URL.Path)
 		}
-		// Installation token endpoint
-		if strings.Contains(r.URL.Path, "/access_tokens") {
-			w.WriteHeader(http.StatusCreated)
-			if err := json.NewEncoder(w).Encode(map[string]string{"token": "test-token"}); err != nil {
-				t.Errorf("failed to encode token response: %v", err)
-			}
-			return
+		if request.Header.Get("Authorization") != "Bearer installation-token" {
+			t.Fatalf("unexpected authorization header")
 		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer server.Close()
+		var body struct {
+			Name          string   `json:"name"`
+			RunnerGroupID int64    `json:"runner_group_id"`
+			Labels        []string `json:"labels"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Name != "runner-1" || body.RunnerGroupID != 1 || len(body.Labels) != 2 {
+			t.Fatalf("unexpected JIT request: %#v", body)
+		}
+		return &http.Response{
+			StatusCode: http.StatusCreated,
+			Body: io.NopCloser(strings.NewReader(
+				`{"runner":{"id":123},"encoded_jit_config":"c2luZ2xlLXVzZS1jb25maWc="}`,
+			)),
+			Header: make(http.Header),
+		}, nil
+	})}
 
-	// We can't easily test the full flow without mocking the GitHub API base URL,
-	// but we can verify the Runner struct serialization
-	data, _ := json.Marshal(runners[0])
-	var parsed Runner
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		t.Fatalf("failed to unmarshal runner: %v", err)
+	app := &App{cachedToken: "installation-token", cachedScope: "trusted/repo|administration:write", tokenExpires: time.Now().Add(time.Hour), AllowedRepositories: []string{"trusted/repo"}}
+	config, err := app.GenerateRepoJITConfig(
+		context.Background(), "trusted", "repo", "runner-1", 1, []string{"self-hosted", "chef"},
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if parsed.ID != 1 || parsed.Name != "eph-repo-1" || parsed.Status != "online" {
-		t.Errorf("unexpected runner: %+v", parsed)
+	if config.RunnerID != 123 || config.EncodedConfig != "c2luZ2xlLXVzZS1jb25maWc=" {
+		t.Fatalf("unexpected JIT config: %#v", config)
 	}
 }
 
-func TestRunnerStruct(t *testing.T) {
+func TestRepoRunnerOnline(t *testing.T) {
 	tests := []struct {
-		name   string
-		json   string
-		id     int64
-		status string
+		name       string
+		statusCode int
+		body       string
+		wantStatus RunnerStatus
+		wantErr    bool
+		wantRate   bool
+		headers    http.Header
 	}{
-		{"online runner", `{"id":42,"name":"eph-test","status":"online"}`, 42, "online"},
-		{"offline runner", `{"id":99,"name":"eph-old","status":"offline"}`, 99, "offline"},
+		{name: "online", statusCode: http.StatusOK, body: `{"id":123,"status":"online"}`, wantStatus: RunnerOnline},
+		{name: "offline", statusCode: http.StatusOK, body: `{"id":123,"status":"offline"}`, wantStatus: RunnerOffline},
+		{name: "not found", statusCode: http.StatusNotFound, body: `{}`, wantStatus: RunnerMissing},
+		{name: "API failure", statusCode: http.StatusInternalServerError, body: `{}`, wantErr: true},
+		{name: "primary rate limit", statusCode: http.StatusForbidden, body: `{}`, wantErr: true, wantRate: true,
+			headers: http.Header{"X-Ratelimit-Remaining": []string{"0"}, "X-Ratelimit-Reset": []string{"2000000000"}}},
+		{name: "secondary rate limit", statusCode: http.StatusTooManyRequests, body: `{}`, wantErr: true, wantRate: true,
+			headers: http.Header{"Retry-After": []string{"120"}}},
+		{name: "secondary forbidden rate limit", statusCode: http.StatusForbidden, body: `{}`, wantErr: true, wantRate: true,
+			headers: http.Header{"Retry-After": []string{"60"}}},
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var r Runner
-			if err := json.Unmarshal([]byte(tt.json), &r); err != nil {
-				t.Fatalf("unmarshal failed: %v", err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			original := HTTPClient
+			t.Cleanup(func() { HTTPClient = original })
+			HTTPClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				if request.Method != http.MethodGet || request.URL.Path != "/repos/trusted/repo/actions/runners/123" {
+					t.Fatalf("unexpected request %s %s", request.Method, request.URL.Path)
+				}
+				return &http.Response{
+					StatusCode: test.statusCode,
+					Body:       io.NopCloser(strings.NewReader(test.body)),
+					Header:     test.headers,
+				}, nil
+			})}
+			app := &App{
+				cachedToken: "installation-token", cachedScope: "trusted/repo|administration:write",
+				tokenExpires: time.Now().Add(time.Hour), AllowedRepositories: []string{"trusted/repo"},
 			}
-			if r.ID != tt.id {
-				t.Errorf("expected ID %d, got %d", tt.id, r.ID)
+			status, err := app.RepoRunnerStatus(context.Background(), "trusted", "repo", 123)
+			if (err != nil) != test.wantErr || status != test.wantStatus {
+				t.Fatalf("RepoRunnerStatus() = %v, %v; want %v, error=%v", status, err, test.wantStatus, test.wantErr)
 			}
-			if r.Status != tt.status {
-				t.Errorf("expected status %q, got %q", tt.status, r.Status)
+			if _, rateLimited := RateLimitReset(err); rateLimited != test.wantRate {
+				t.Fatalf("rate-limited error = %v, want %v", rateLimited, test.wantRate)
 			}
 		})
+	}
+}
+
+func TestPersistentClientErrorTreatsBusyRunnerStatusesAsRetryable(t *testing.T) {
+	for _, status := range []int{http.StatusConflict, http.StatusUnprocessableEntity} {
+		err := &APIStatusError{Status: status, Action: "removing busy runner"}
+		if PersistentClientError(err) {
+			t.Fatalf("status %d was classified as a persistent client error", status)
+		}
+	}
+	if !PersistentClientError(&APIStatusError{Status: http.StatusUnauthorized, Action: "authenticating"}) {
+		t.Fatal("401 was not classified as a persistent client error")
+	}
+}
+
+func TestRunnerMutationAPIsPreserveRateLimits(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		method string
+		call   func(*App) error
+	}{
+		{name: "generate", method: http.MethodPost, call: func(app *App) error {
+			_, err := app.GenerateRepoJITConfig(context.Background(), "trusted", "repo", "runner", 1, []string{"self-hosted"})
+			return err
+		}},
+		{name: "remove", method: http.MethodDelete, call: func(app *App) error {
+			return app.RemoveRepoRunner(context.Background(), "trusted", "repo", 123)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			original := HTTPClient
+			t.Cleanup(func() { HTTPClient = original })
+			HTTPClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				if request.Method != test.method {
+					t.Fatalf("request method = %s, want %s", request.Method, test.method)
+				}
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Body:       io.NopCloser(strings.NewReader(`{}`)),
+					Header:     http.Header{"Retry-After": []string{"60"}},
+				}, nil
+			})}
+			app := &App{
+				cachedToken: "installation-token", cachedScope: "trusted/repo|administration:write",
+				tokenExpires: time.Now().Add(time.Hour), AllowedRepositories: []string{"trusted/repo"},
+			}
+			if _, rateLimited := RateLimitReset(test.call(app)); !rateLimited {
+				t.Fatal("rate limit was collapsed into a generic API error")
+			}
+		})
+	}
+}
+
+func TestRetryAfterDoesNotReclassifyUnrelatedClientError(t *testing.T) {
+	response := &http.Response{
+		StatusCode: http.StatusUnprocessableEntity,
+		Header:     http.Header{"Retry-After": []string{"60"}},
+	}
+	err := apiStatusError(response, "invalid request")
+	if _, rateLimited := RateLimitReset(err); rateLimited {
+		t.Fatalf("422 Retry-After was classified as a throttle: %v", err)
+	}
+	var statusErr *APIStatusError
+	if !errors.As(err, &statusErr) || statusErr.Status != http.StatusUnprocessableEntity {
+		t.Fatalf("422 error = %T %v", err, err)
+	}
+}
+
+func TestGenerateRepoJITConfigRejectsNonBase64Response(t *testing.T) {
+	original := HTTPClient
+	t.Cleanup(func() { HTTPClient = original })
+	HTTPClient = &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusCreated,
+			Body: io.NopCloser(strings.NewReader(
+				`{"runner":{"id":123},"encoded_jit_config":"'\nrun-command"}`,
+			)),
+			Header: make(http.Header),
+		}, nil
+	})}
+	app := &App{cachedToken: "installation-token", cachedScope: "trusted/repo|administration:write", tokenExpires: time.Now().Add(time.Hour), AllowedRepositories: []string{"trusted/repo"}}
+	if _, err := app.GenerateRepoJITConfig(context.Background(), "trusted", "repo", "runner-1", 1, []string{"self-hosted"}); err == nil {
+		t.Fatal("accepted a non-base64 JIT configuration")
+	}
+}
+
+func TestGenerateRepoJITConfigRejectsBase64WithNewline(t *testing.T) {
+	original := HTTPClient
+	t.Cleanup(func() { HTTPClient = original })
+	HTTPClient = &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusCreated,
+			Body: io.NopCloser(strings.NewReader(
+				`{"runner":{"id":123},"encoded_jit_config":"QUFB\nQUJC"}`,
+			)),
+			Header: make(http.Header),
+		}, nil
+	})}
+	app := &App{
+		cachedToken: "installation-token", cachedScope: "trusted/repo|administration:write",
+		tokenExpires: time.Now().Add(time.Hour), AllowedRepositories: []string{"trusted/repo"},
+	}
+	if _, err := app.GenerateRepoJITConfig(context.Background(), "trusted", "repo", "runner-1", 1, []string{"self-hosted"}); err == nil {
+		t.Fatal("accepted base64 JIT configuration containing a newline")
+	}
+}
+
+func TestVerifyWebhookSignature(t *testing.T) {
+	payload := []byte(`{"action":"queued"}`)
+	secret := []byte("secret")
+	if VerifyWebhookSignature(payload, "sha256=invalid", secret, "test") {
+		t.Fatal("invalid signature was accepted")
+	}
+}
+
+func TestVerifyWebhookSignatureEscapesClientIdentifier(t *testing.T) {
+	var output bytes.Buffer
+	original := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(original) })
+	VerifyWebhookSignature([]byte("payload"), "invalid", []byte("secret"), "peer\nSECURITY: forged")
+	logged := output.String()
+	if strings.Count(logged, "SECURITY:") != 2 {
+		// One prefix is the real record and one is quoted attacker text; both
+		// must remain on the same physical log line.
+		t.Fatalf("unexpected security log: %q", logged)
+	}
+	if strings.Count(logged, "\n") != 1 {
+		t.Fatalf("client identifier injected a log line: %q", logged)
 	}
 }

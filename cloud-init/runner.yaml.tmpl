@@ -1,17 +1,22 @@
 #cloud-config
 
+ssh_pwauth: false
+disable_root: true
+
 users:
+  # Docker group membership is intentionally root-equivalent. Each runner is
+  # single-use, receives no controller credentials, and is destroyed after one
+  # trusted private-repository job; sudo removal is not a job/host boundary.
   - name: runner
     shell: /bin/bash
     groups: docker
-    sudo: |
-      runner ALL=(ALL) NOPASSWD: /usr/bin/docker, /usr/bin/systemctl
 
 package_update: true
 
 packages:
   - docker.io
   - build-essential
+  - ca-certificates
   - curl
   - git
   - jq
@@ -21,83 +26,53 @@ packages:
   - zlib1g-dev
 
 runcmd:
-  - systemctl enable docker
-  - systemctl start docker
-
-  # Safety net: hard shutdown after 90 minutes regardless of state
   - |
-    nohup bash -c '
-      sleep 5400
-      DROPLET_ID=$(curl -sf --retry 3 http://169.254.169.254/metadata/v1/id)
-      if [ -z "$DROPLET_ID" ]; then exit 1; fi
-      for i in 1 2 3 4 5; do
-        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
-          -H "Authorization: Bearer {{.DOToken}}" \
-          "https://api.digitalocean.com/v2/droplets/${DROPLET_ID}")
-        if [ "$HTTP_CODE" = "204" ] || [ "$HTTP_CODE" = "404" ]; then exit 0; fi
-        sleep $((i * 5))
-      done
-    ' &>/dev/null &
+    set -eu
+    systemctl enable --now docker
 
-  # Install Chef Workstation (includes Ruby, bundler, test-kitchen, etc.)
-  - |
-    set -ex
-    CHEF_INSTALLER="/tmp/chef-install.sh"
-    curl -fsSL -o "$CHEF_INSTALLER" https://omnitruck.chef.io/install.sh
-    # Verify the download is non-empty and looks like a shell script
-    [ -s "$CHEF_INSTALLER" ] && head -1 "$CHEF_INSTALLER" | grep -q '^#!'
+    # Template sources and controller validation restrict these single-quoted
+    # values to URLs, hex digests, versions, and base64 without apostrophes.
+    # Revisit shell quoting before changing those sources or validators.
+    CHEF_INSTALLER=/tmp/chef-install.sh
+    CHEF_SHA256='{{.ChefInstallerSHA256}}'
+    curl --fail --silent --show-error --location \
+      --proto '=https' --tlsv1.2 \
+      --output "$CHEF_INSTALLER" \
+      https://omnitruck.chef.io/install.sh
+    printf '%s  %s\n' "$CHEF_SHA256" "$CHEF_INSTALLER" | \
+      sha256sum --check --strict -
     bash "$CHEF_INSTALLER" -P chef-workstation
-    rm -f "$CHEF_INSTALLER"
+    shred --remove "$CHEF_INSTALLER"
 
-  # Create tool cache directory for actions like setup-ruby
-  - mkdir -p /opt/hostedtoolcache && chown runner:runner /opt/hostedtoolcache
-
-  # Set up GitHub Actions runner with checksum verification
-  - |
-    set -ex
-    mkdir -p /home/runner/actions-runner
+    install -d -o runner -g runner /opt/hostedtoolcache
+    install -d -o runner -g runner /home/runner/actions-runner
     cd /home/runner/actions-runner
-    RUNNER_URL="https://github.com/actions/runner/releases/download/v{{.RunnerVersion}}/actions-runner-linux-x64-{{.RunnerVersion}}.tar.gz"
-    curl -fsSL -o actions-runner.tar.gz "$RUNNER_URL"
-    curl -fsSL -o actions-runner.tar.gz.sha256 "$RUNNER_URL.sha256"
-    sha256sum -c actions-runner.tar.gz.sha256
-    tar xzf actions-runner.tar.gz
-    rm actions-runner.tar.gz actions-runner.tar.gz.sha256
+
+    RUNNER_TARBALL='actions-runner-linux-x64-{{.RunnerVersion}}.tar.gz'
+    RUNNER_SHA256='{{.RunnerSHA256}}'
+    RUNNER_RELEASE='https://github.com/actions/runner/releases/download'
+    RUNNER_URL="${RUNNER_RELEASE}/v{{.RunnerVersion}}/${RUNNER_TARBALL}"
+    curl --fail --silent --show-error --location \
+      --proto '=https' --tlsv1.2 \
+      --output "$RUNNER_TARBALL" \
+      "$RUNNER_URL"
+    printf '%s  %s\n' "$RUNNER_SHA256" "$RUNNER_TARBALL" | \
+      sha256sum --check --strict -
+    tar --extract --gzip --file "$RUNNER_TARBALL"
+    shred --remove "$RUNNER_TARBALL"
     chown -R runner:runner /home/runner/actions-runner
 
-  # Write runner token (passed via cloud-init params)
-  - |
-    echo '{{.RunnerToken}}' > /home/runner/.runner-token
-    chmod 600 /home/runner/.runner-token
-    chown runner:runner /home/runner/.runner-token
+    install -m 0600 -o runner -g runner /dev/null /home/runner/.jit-config
+    printf '%s' '{{.RunnerJITConfig}}' > /home/runner/.jit-config
+    JIT_CONFIG=$(cat /home/runner/.jit-config)
+    shred --remove /home/runner/.jit-config
 
-  # Configure and start ephemeral runner
-  - |
-    set -ex
-    su - runner -c '
-      cd /home/runner/actions-runner
-      TOKEN=$(cat /home/runner/.runner-token)
-      ./config.sh \
-        --url "https://github.com/{{.RunnerRepo}}" \
-        --token "$TOKEN" \
-        --name "{{.RunnerName}}" \
-        --labels "{{.RunnerLabels}}" \
-        --ephemeral \
-        --unattended
-      shred -u /home/runner/.runner-token
-      ./run.sh
-    '
+    RUNNER_EXIT=0
+    runuser -u runner -- ./run.sh --jitconfig "$JIT_CONFIG" || RUNNER_EXIT=$?
+    unset JIT_CONFIG
 
-  # Self-destruct via DigitalOcean API (with retries)
-  - |
-    DROPLET_ID=$(curl -sf --retry 3 http://169.254.169.254/metadata/v1/id)
-    if [ -z "$DROPLET_ID" ]; then echo "ERROR: could not get droplet ID"; exit 1; fi
-    for i in 1 2 3 4 5; do
-      HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
-        -H "Authorization: Bearer {{.DOToken}}" \
-        "https://api.digitalocean.com/v2/droplets/${DROPLET_ID}")
-      if [ "$HTTP_CODE" = "204" ] || [ "$HTTP_CODE" = "404" ]; then exit 0; fi
-      echo "Self-destruct attempt $i failed (HTTP $HTTP_CODE), retrying..."
-      sleep $((i * 5))
-    done
-    echo "ERROR: self-destruct failed after 5 attempts"
+    # The trusted controller deletes the droplet after the workflow_job
+    # completion event. Power off immediately to stop workload execution while
+    # waiting for that control-plane deletion or TTL reconciliation.
+    shutdown --poweroff now
+    exit "$RUNNER_EXIT"
