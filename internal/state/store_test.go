@@ -724,6 +724,9 @@ func TestDeletedStateRejectsLateWorkerWrites(t *testing.T) {
 	if err := store.ScheduleDeletion(context.Background(), record.Key); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.MarkOrphaned(context.Background(), record.Key, "late orphan"); err != nil {
+		t.Fatal(err)
+	}
 	terminal, _, err := store.Get(context.Background(), record.Key)
 	if err != nil || terminal.Status != StatusDeleted || terminal.InstanceID != "" || terminal.GitHubRunnerID != 0 {
 		t.Fatalf("terminal record changed = %#v, %v", terminal, err)
@@ -1271,5 +1274,68 @@ func TestOpenNormalizesCompleteJournalEntryWithoutNewline(t *testing.T) {
 		if _, found, err := final.Get(context.Background(), key); err != nil || !found {
 			t.Fatalf("record %s after delimiter repair: found=%v err=%v", key, found, err)
 		}
+	}
+}
+
+// OwnsRunner must not depend on whether the controller has restarted.
+func TestOwnsRunnerIsStableAcrossRestartForDeletedRecords(t *testing.T) {
+	store := openTestStore(t)
+	record := Record{Key: "org/repo:7", JobID: 7, Owner: "org", Repository: "repo"}
+	if _, err := store.Create(context.Background(), record); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.ClaimNext(context.Background(), time.Now(), 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkJITCreated(context.Background(), record.Key, 4242, "runner-7"); err != nil {
+		t.Fatal(err)
+	}
+	owned, err := store.OwnsRunner(context.Background(), "org", "repo", 4242)
+	if err != nil || !owned {
+		t.Fatalf("OwnsRunner before deletion = %v, %v; want true", owned, err)
+	}
+
+	if err := store.MarkDeleted(context.Background(), record.Key); err != nil {
+		t.Fatal(err)
+	}
+	afterDelete, err := store.OwnsRunner(context.Background(), "org", "repo", 4242)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A restart rebuilds the index, which drops deleted records.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenFileStore(store.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	afterRestart, err := reopened.OwnsRunner(context.Background(), "org", "repo", 4242)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterDelete != afterRestart {
+		t.Fatalf("OwnsRunner changed across restart: before=%v after=%v", afterDelete, afterRestart)
+	}
+}
+
+// MarkProvisioned establishes a runner identity, so it must index it too.
+func TestMarkProvisionedIndexesRunnerIdentity(t *testing.T) {
+	store := openTestStore(t)
+	record := Record{Key: "org/repo:8", JobID: 8, Owner: "org", Repository: "repo"}
+	if _, err := store.Create(context.Background(), record); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.ClaimNext(context.Background(), time.Now(), 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkProvisioned(context.Background(), record.Key, "i-1", 5150, "runner-8"); err != nil {
+		t.Fatal(err)
+	}
+	owned, err := store.OwnsRunner(context.Background(), "org", "repo", 5150)
+	if err != nil || !owned {
+		t.Fatalf("OwnsRunner after MarkProvisioned = %v, %v; want true without a restart", owned, err)
 	}
 }

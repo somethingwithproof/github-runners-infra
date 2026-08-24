@@ -530,7 +530,9 @@ func (s *FileStore) OwnsRunner(_ context.Context, owner, repository string, runn
 		return false, nil
 	}
 	record, found := s.records[key]
-	return found && record.GitHubRunnerOwned && record.GitHubRunnerID == runnerID, nil
+	// rebuildRunnerIndexLocked drops StatusDeleted records, so answering true
+	// here would make ownership depend on whether the controller has restarted.
+	return found && record.Status != StatusDeleted && record.GitHubRunnerOwned && record.GitHubRunnerID == runnerID, nil
 }
 
 // SetMaxLiveRunners configures the atomic provisioning admission ceiling.
@@ -754,7 +756,11 @@ func (s *FileStore) ClearJIT(_ context.Context, key string) error {
 }
 
 func (s *FileStore) MarkProvisioned(_ context.Context, key, instanceID string, runnerID int64, runnerName string) error {
-	return s.update(key, func(record *Record) {
+	// MarkJITCreated was the only writer of s.runnerKeys, so an identity first
+	// seen here stayed unindexed until a restart rebuilt it. indexed captures
+	// whether this call established one worth recording.
+	var indexed *Record
+	err := s.update(key, func(record *Record) {
 		if record.Status == StatusDeleted || record.Status == StatusOrphaned {
 			return
 		}
@@ -774,7 +780,21 @@ func (s *FileStore) MarkProvisioned(_ context.Context, key, instanceID string, r
 		if record.Status != StatusCompleted {
 			record.Status = StatusProvisioned
 		}
+		if runnerID != 0 {
+			snapshot := clone(*record)
+			indexed = &snapshot
+		}
 	})
+	if err != nil || indexed == nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	identity := runnerIdentityKey(indexed.Owner, indexed.Repository, indexed.GitHubRunnerID)
+	if key != completionMarkerKey(indexed.Owner, indexed.Repository, indexed.GitHubRunnerID) {
+		s.runnerKeys[identity] = key
+	}
+	return nil
 }
 
 // ObserveRunnerMissing requires repeated observations across a settle window
@@ -1063,6 +1083,12 @@ func (s *FileStore) MarkDeleteFailed(_ context.Context, key, message string, ret
 // retrying unsafe provider mutation. A live instance still consumes admission.
 func (s *FileStore) MarkOrphaned(_ context.Context, key, message string) error {
 	return s.update(key, func(record *Record) {
+		// Every other mutator returns early here; without this a late worker
+		// write resurrects a deleted record, and PruneDeleted then never
+		// collects it because GitHubRunnerID is still set.
+		if record.Status == StatusDeleted {
+			return
+		}
 		record.Status = StatusOrphaned
 		record.ClaimedWork = ""
 		record.LastError = message
