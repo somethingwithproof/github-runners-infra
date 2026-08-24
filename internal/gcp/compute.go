@@ -258,6 +258,9 @@ func (c *Client) SweepOrphanedRunners(ctx context.Context, known map[string]stru
 		return 0, fmt.Errorf("list GCP instances for orphan sweep: %w", err)
 	}
 	deleted := 0
+	// One instance with an unreadable creation timestamp must not stop the
+	// sweep; otherwise a single bad record blocks reclamation indefinitely.
+	var parseErrs []error
 	for _, instance := range instances {
 		if instance == nil || instance.Labels[controllerLabel] != c.controllerHash {
 			continue
@@ -268,7 +271,9 @@ func (c *Client) SweepOrphanedRunners(ctx context.Context, known map[string]stru
 		}
 		created, err := time.Parse(time.RFC3339, instance.GetCreationTimestamp())
 		if err != nil {
-			return deleted, fmt.Errorf("parse creation time for controller GCP instance %s: %w", name, err)
+			// Age is unknown, so keep the instance rather than delete it blind.
+			parseErrs = append(parseErrs, fmt.Errorf("parse creation time for controller GCP instance %s: %w", name, err))
+			continue
 		}
 		if !created.Before(cutoff) {
 			continue
@@ -284,6 +289,9 @@ func (c *Client) SweepOrphanedRunners(ctx context.Context, known map[string]stru
 			return deleted, fmt.Errorf("wait for orphaned GCP instance deletion: %w", err)
 		}
 		deleted++
+	}
+	if len(parseErrs) > 0 {
+		return deleted, errors.Join(parseErrs...)
 	}
 	return deleted, nil
 }

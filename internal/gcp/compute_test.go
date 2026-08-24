@@ -15,14 +15,15 @@ import (
 )
 
 type fakeInstances struct {
-	instance  *computepb.Instance
-	getErr    error
-	insertOp  operation
-	insertErr error
-	deleteOp  operation
-	deleteErr error
-	deletes   int
-	instances []*computepb.Instance
+	instance     *computepb.Instance
+	getErr       error
+	insertOp     operation
+	insertErr    error
+	deleteOp     operation
+	deleteErr    error
+	deletes      int
+	deletedNames []string
+	instances    []*computepb.Instance
 }
 
 type fakeOperation struct{ err error }
@@ -37,8 +38,9 @@ func (f *fakeInstances) Insert(context.Context, *computepb.InsertInstanceRequest
 	return f.insertOp, f.insertErr
 }
 
-func (f *fakeInstances) Delete(context.Context, *computepb.DeleteInstanceRequest) (operation, error) {
+func (f *fakeInstances) Delete(_ context.Context, req *computepb.DeleteInstanceRequest) (operation, error) {
 	f.deletes++
+	f.deletedNames = append(f.deletedNames, req.GetInstance())
 	return f.deleteOp, f.deleteErr
 }
 
@@ -183,7 +185,9 @@ func TestSweepOrphanedRunnersDeletesOldUnknownInstance(t *testing.T) {
 	}
 }
 
-func TestSweepOrphanedRunnersFailsClosedOnInvalidTimestamp(t *testing.T) {
+// An instance whose age cannot be read is kept, but it must not stop the rest
+// of the sweep: otherwise one bad record blocks reclamation indefinitely.
+func TestSweepOrphanedRunnersKeepsUnknownAgeAndContinues(t *testing.T) {
 	invalidCreated := "not-a-timestamp"
 	validCreated := time.Now().Add(-2 * time.Hour).Format(time.RFC3339)
 	invalidName := "ghr-invalid-time"
@@ -197,8 +201,16 @@ func TestSweepOrphanedRunnersFailsClosedOnInvalidTimestamp(t *testing.T) {
 	}
 	client := testClient(instances)
 	deleted, err := client.SweepOrphanedRunners(context.Background(), nil, time.Now().Add(-time.Hour))
-	if err == nil || deleted != 0 || instances.deletes != 0 {
-		t.Fatalf("sweep with invalid timestamp = %d, %v, delete calls=%d", deleted, err, instances.deletes)
+	if err == nil {
+		t.Fatal("sweep must still report the unreadable timestamp")
+	}
+	if deleted != 1 || instances.deletes != 1 {
+		t.Fatalf("sweep = %d deleted, %d delete calls; want the valid orphan reclaimed", deleted, instances.deletes)
+	}
+	for _, name := range instances.deletedNames {
+		if name == invalidName {
+			t.Fatalf("deleted %s despite an unreadable creation timestamp", name)
+		}
 	}
 }
 

@@ -510,4 +510,19 @@ func setValidRuntimeEnvironment(t *testing.T) {
 	} {
 		t.Setenv(key, value)
 	}
+	// loadRuntimeConfig falls back to defaults for these, so an ambient value
+	// in the developer's or runner's environment would change what the tests
+	// observe. Clear them so every test starts from the documented defaults.
+	for _, key := range []string{
+		"AZURE_ADMIN_USERNAME", "CANCELLED_RUNNER_TTL", "CLOUD_INIT_PATH", "COMPUTE_PROVIDER",
+		"DELETED_RECORD_RETENTION", "DO_IMAGE", "DO_REGION", "DO_SIZE", "LISTEN_ADDR",
+		"LIVENESS_CONFIRMATIONS", "LIVENESS_SETTLE_WINDOW", "MAX_ATTEMPTS", "MAX_LIVE_RUNNERS",
+		"MAX_RUNNER_AGE", "REQUIRED_LABEL", "RUNNER_REGISTRATION_TIMEOUT", "STATE_FILE",
+		"WORKER_COUNT",
+	} {
+		t.Setenv(key, "")
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
