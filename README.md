@@ -262,9 +262,31 @@ for deletion. The controller also reconciles an orphaned controller-owned NIC af
 eviction. Runner NICs receive no public IP from this controller, so provide NAT
 or another controlled HTTPS egress path.
 
-Grant the controller identity only the VM and network-interface read/write/delete
-permissions required in the configured resource group and permission to join the
-selected subnet.
+Grant the controller identity only these actions. VM, disk and NIC actions are
+scoped to the configured resource group; the subnet join is scoped to the
+selected subnet, which usually lives in a different resource group.
+
+Scoped to the resource group:
+
+- `Microsoft.Compute/virtualMachines/read`
+- `Microsoft.Compute/virtualMachines/write`
+- `Microsoft.Compute/virtualMachines/delete`
+- `Microsoft.Compute/disks/read`
+- `Microsoft.Compute/disks/write`
+- `Microsoft.Compute/disks/delete`
+- `Microsoft.Network/networkInterfaces/read`
+- `Microsoft.Network/networkInterfaces/write`
+- `Microsoft.Network/networkInterfaces/delete`
+- `Microsoft.Network/networkInterfaces/join/action`
+
+Scoped to the selected subnet:
+
+- `Microsoft.Network/virtualNetworks/subnets/join/action`
+
+The disk and NIC entries are needed even though the controller never calls those
+APIs directly: the OS disk and NIC are created with `DeleteOption: Delete`, so
+Azure creates and removes them on the controller's behalf as part of the VM
+lifecycle.
 
 Drain all active records before changing `COMPUTE_PROVIDER`. State is bound to
 the provider that created each runner, and the controller fails closed instead

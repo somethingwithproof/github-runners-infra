@@ -1339,3 +1339,29 @@ func TestMarkProvisionedIndexesRunnerIdentity(t *testing.T) {
 		t.Fatalf("OwnsRunner after MarkProvisioned = %v, %v; want true without a restart", owned, err)
 	}
 }
+
+// A completion marker is bookkeeping, not a live instance; counting it would
+// consume admission capacity that no provider resource is using.
+func TestCompletionMarkerDoesNotConsumeAdmission(t *testing.T) {
+	store := openTestStore(t)
+	completion := Record{
+		Key: "org/repo:91", JobID: 91, Owner: "org", Repository: "repo",
+		Provider: "aws", GitHubRunnerID: 4242, InstanceID: "i-live",
+	}
+	if err := store.RecordCompletion(context.Background(), completion); err != nil {
+		t.Fatal(err)
+	}
+	known, err := store.KnownInstanceIDs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present := known["i-live"]; present {
+		t.Fatal("completion marker reported a live provider instance")
+	}
+	store.mu.Lock()
+	live := store.liveRunnerCountLocked()
+	store.mu.Unlock()
+	if live != 0 {
+		t.Fatalf("liveRunnerCountLocked = %d after only a completion; want 0", live)
+	}
+}

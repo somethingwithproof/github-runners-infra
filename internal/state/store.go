@@ -465,6 +465,11 @@ func (s *FileStore) addCompletionMarker(completion Record, now time.Time, before
 	marker.GitHubRunnerOwned = false
 	marker.DeferDeletion = true
 	marker.ClaimedWork = ""
+	// The marker is bookkeeping, not a live instance. Carrying the provider
+	// identity would make it count toward liveRunnerCountLocked and appear in
+	// KnownInstanceIDs, inflating the admission ceiling while DeferDeletion holds.
+	marker.InstanceID = ""
+	marker.DropletID = 0
 	marker.CreatedAt = now
 	marker.UpdatedAt = now
 	s.remember(before, marker.Key)
@@ -484,6 +489,8 @@ func (s *FileStore) reconcileEventCompletion(completion Record, matchedKey strin
 		completion.Status = StatusCompleted
 		completion.DeferDeletion = true
 		completion.ClaimedWork = ""
+		completion.InstanceID = ""
+		completion.DropletID = 0
 		completion.CreatedAt = now
 		completion.UpdatedAt = now
 		s.records[completion.Key] = clone(completion)
