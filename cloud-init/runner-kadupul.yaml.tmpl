@@ -75,6 +75,7 @@ runcmd:
     shred --remove /home/runner/.jit-config
 
     RUNNER_EXIT=0
+    export PATH="/home/runner/.local/bin:$PATH"
     runuser -u runner -- ./run.sh --jitconfig "$JIT_CONFIG" || RUNNER_EXIT=$?
     unset JIT_CONFIG
 
