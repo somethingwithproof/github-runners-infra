@@ -65,13 +65,14 @@ func main() {
 	}
 
 	handler := webhook.NewHandler(webhook.Config{
-		WebhookSecret:  webhookSecret,
-		GitHubApp:      githubApp,
-		DOClient:       doClient,
-		DOToken:        doToken,
-		RequiredLabel:  requiredLabel,
-		CallbackSecret: callbackSecret,
-		CallbackURL:    callbackURL,
+		AllowedRepositories: strings.Split(mustEnv("ALLOWED_REPOSITORIES"), ","),
+		WebhookSecret:       webhookSecret,
+		GitHubApp:           githubApp,
+		DOClient:            doClient,
+		DOToken:             doToken,
+		RequiredLabel:       requiredLabel,
+		CallbackSecret:      callbackSecret,
+		CallbackURL:         callbackURL,
 	})
 
 	mux := http.NewServeMux()

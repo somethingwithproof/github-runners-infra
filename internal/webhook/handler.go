@@ -26,6 +26,9 @@ var (
 
 // WorkflowJobEvent represents the GitHub workflow_job webhook payload.
 type WorkflowJobEvent struct {
+	Installation struct {
+		ID int64 `json:"id"`
+	} `json:"installation"`
 	Action      string      `json:"action"`
 	WorkflowJob WorkflowJob `json:"workflow_job"`
 	Org         *OrgInfo    `json:"organization,omitempty"`
@@ -52,30 +55,32 @@ type RepoInfo struct {
 
 // Handler processes incoming GitHub webhooks.
 type Handler struct {
-	webhookSecret  []byte
-	githubApp      *gh.App
-	doClient       *digitalocean.Client
-	doToken        string
-	requiredLabel  string
-	runnerVersion  string
-	callbackSecret string
-	callbackURL    string
-	workerPool     chan struct{}       // concurrency limiter (#8)
-	rateLimiter    *repoRateLimiter   // per-repo rate limiter (#7)
+	webhookSecret       []byte
+	githubApp           *gh.App
+	doClient            *digitalocean.Client
+	doToken             string
+	requiredLabel       string
+	runnerVersion       string
+	callbackSecret      string
+	callbackURL         string
+	allowedRepositories map[string]struct{}
+	workerPool          chan struct{}    // concurrency limiter (#8)
+	rateLimiter         *repoRateLimiter // per-repo rate limiter (#7)
 }
 
 // Config holds handler configuration.
 type Config struct {
-	WebhookSecret    []byte
-	GitHubApp        *gh.App
-	DOClient         *digitalocean.Client
-	DOToken          string
-	RequiredLabel    string
-	RunnerVersion    string
-	CallbackSecret   string
-	CallbackURL      string
-	MaxConcurrent    int
-	MaxPerRepoPerMin int
+	AllowedRepositories []string
+	WebhookSecret       []byte
+	GitHubApp           *gh.App
+	DOClient            *digitalocean.Client
+	DOToken             string
+	RequiredLabel       string
+	RunnerVersion       string
+	CallbackSecret      string
+	CallbackURL         string
+	MaxConcurrent       int
+	MaxPerRepoPerMin    int
 }
 
 // repoRateLimiter implements a simple per-repo token bucket. (#7)
@@ -120,6 +125,10 @@ func (rl *repoRateLimiter) allow(repo string) bool {
 
 // NewHandler creates a new webhook handler.
 func NewHandler(cfg Config) *Handler {
+	allowedRepositories := make(map[string]struct{}, len(cfg.AllowedRepositories))
+	for _, repository := range cfg.AllowedRepositories {
+		allowedRepositories[strings.ToLower(strings.TrimSpace(repository))] = struct{}{}
+	}
 	label := cfg.RequiredLabel
 	if label == "" {
 		label = "self-hosted"
@@ -137,16 +146,17 @@ func NewHandler(cfg Config) *Handler {
 		maxPerRepo = 20
 	}
 	return &Handler{
-		webhookSecret:  cfg.WebhookSecret,
-		githubApp:      cfg.GitHubApp,
-		doClient:       cfg.DOClient,
-		doToken:        cfg.DOToken,
-		requiredLabel:  label,
-		runnerVersion:  version,
-		callbackSecret: cfg.CallbackSecret,
-		callbackURL:    cfg.CallbackURL,
-		workerPool:     make(chan struct{}, maxConcurrent),
-		rateLimiter:    newRepoRateLimiter(maxPerRepo),
+		allowedRepositories: allowedRepositories,
+		webhookSecret:       cfg.WebhookSecret,
+		githubApp:           cfg.GitHubApp,
+		doClient:            cfg.DOClient,
+		doToken:             cfg.DOToken,
+		requiredLabel:       label,
+		runnerVersion:       version,
+		callbackSecret:      cfg.CallbackSecret,
+		callbackURL:         cfg.CallbackURL,
+		workerPool:          make(chan struct{}, maxConcurrent),
+		rateLimiter:         newRepoRateLimiter(maxPerRepo),
 	}
 }
 
@@ -186,6 +196,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var event WorkflowJobEvent
 	if err := json.Unmarshal(body, &event); err != nil {
 		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	// A valid App signature can originate from any installation once the App
+	// is public. Bind requests to this controller's installation and exact repos.
+	if h.githubApp == nil || h.githubApp.InstallationID <= 0 || event.Installation.ID != h.githubApp.InstallationID {
+		http.Error(w, "installation not authorized", http.StatusForbidden)
+		return
+	}
+	repository := strings.ToLower(event.Repo.Owner.Login + "/" + event.Repo.Name)
+	if !repoRegex.MatchString(repository) || !strings.EqualFold(repository, event.Repo.FullName) {
+		http.Error(w, "repository not authorized", http.StatusForbidden)
+		return
+	}
+	if _, ok := h.allowedRepositories[repository]; !ok {
+		http.Error(w, "repository not authorized", http.StatusForbidden)
 		return
 	}
 
@@ -274,11 +299,11 @@ func (h *Handler) provisionRunner(event WorkflowJobEvent) {
 	}
 
 	params := digitalocean.RunnerParams{
-		RunnerName:    runnerName,
-		RunnerToken:   runnerToken,
-		RunnerLabels:  labels,
-		RunnerOrg:     owner,
-		RunnerRepo:    repoFull,
+		RunnerName:     runnerName,
+		RunnerToken:    runnerToken,
+		RunnerLabels:   labels,
+		RunnerOrg:      owner,
+		RunnerRepo:     repoFull,
 		DOToken:        h.doToken,
 		RunnerVersion:  h.runnerVersion,
 		CallbackSecret: h.callbackSecret,
