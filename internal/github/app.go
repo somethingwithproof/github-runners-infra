@@ -37,6 +37,7 @@ type App struct {
 	InstallationID      int64
 	PrivateKey          []byte
 	AllowedRepositories []string
+	ReadWorkflowRuns    bool
 
 	tokenMu      sync.Mutex
 	cachedToken  string
@@ -101,10 +102,14 @@ func (a *App) InstallationTokenContext(ctx context.Context) (string, error) {
 	}
 
 	url := fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", a.InstallationID)
+	permissions := map[string]string{"administration": "write"}
+	if a.ReadWorkflowRuns {
+		permissions["actions"] = "read"
+	}
 	body, err := json.Marshal(struct {
 		Repositories []string          `json:"repositories"`
 		Permissions  map[string]string `json:"permissions"`
-	}{Repositories: repositoryNames, Permissions: map[string]string{"administration": "write"}})
+	}{Repositories: repositoryNames, Permissions: permissions})
 	if err != nil {
 		return "", fmt.Errorf("encode installation token scope: %w", err)
 	}
@@ -142,6 +147,9 @@ func (a *App) InstallationTokenContext(ctx context.Context) (string, error) {
 	}
 	if result.Permissions["administration"] != "write" {
 		return "", fmt.Errorf("GitHub installation token lacks administration:write scope")
+	}
+	if a.ReadWorkflowRuns && result.Permissions["actions"] != "read" {
+		return "", fmt.Errorf("GitHub installation token lacks actions:read scope")
 	}
 	actualRepositories := make([]string, 0, len(result.Repositories))
 	for _, repository := range result.Repositories {
@@ -189,5 +197,8 @@ func (a *App) tokenScope() ([]string, []string, string, error) {
 	sort.Strings(names)
 	sort.Strings(fullNames)
 	scope := strings.Join(fullNames, ",") + "|administration:write"
+	if a.ReadWorkflowRuns {
+		scope += "|actions:read"
+	}
 	return names, fullNames, scope, nil
 }

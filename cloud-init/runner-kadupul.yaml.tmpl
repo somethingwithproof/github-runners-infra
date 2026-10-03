@@ -1,0 +1,85 @@
+#cloud-config
+
+ssh_pwauth: false
+disable_root: true
+
+users:
+  # Docker group membership is intentionally root-equivalent. Each runner is
+  # single-use, receives no controller credentials, and is destroyed after one
+  # authorized same-repository job; sudo removal is not a job/host boundary.
+  - name: runner
+    shell: /bin/bash
+    groups: docker, sudo
+    sudo: ALL=(ALL) NOPASSWD:ALL
+
+# HTTPS mirrors match the dedicated firewall's HTTPS and DNS egress.
+apt:
+  primary:
+    - arches: [default]
+      uri: https://archive.ubuntu.com/ubuntu
+  security:
+    - arches: [default]
+      uri: https://security.ubuntu.com/ubuntu
+
+package_update: true
+
+packages:
+  - docker.io
+  - docker-compose-v2
+  - docker-buildx
+  - gh
+  - sudo
+  - libicu74
+  - build-essential
+  - ca-certificates
+  - curl
+  - git
+  - jq
+  - unzip
+  - pipx
+  - libyaml-dev
+  - libssl-dev
+  - zlib1g-dev
+
+runcmd:
+  - |
+    set -eu
+    systemctl enable --now docker
+
+    # Template sources and controller validation restrict these single-quoted
+    # values to URLs, hex digests, versions, and base64 without apostrophes.
+    # Revisit shell quoting before changing those sources or validators.
+    # Kadupul jobs do not use Chef Workstation.
+
+    install -d -o runner -g runner /opt/hostedtoolcache
+    install -d -o runner -g runner /home/runner/actions-runner
+    cd /home/runner/actions-runner
+
+    RUNNER_TARBALL='actions-runner-linux-x64-{{.RunnerVersion}}.tar.gz'
+    RUNNER_SHA256='{{.RunnerSHA256}}'
+    RUNNER_RELEASE='https://github.com/actions/runner/releases/download'
+    RUNNER_URL="${RUNNER_RELEASE}/v{{.RunnerVersion}}/${RUNNER_TARBALL}"
+    curl --fail --silent --show-error --location \
+      --proto '=https' --tlsv1.2 \
+      --output "$RUNNER_TARBALL" \
+      "$RUNNER_URL"
+    printf '%s  %s\n' "$RUNNER_SHA256" "$RUNNER_TARBALL" | \
+      sha256sum --check --strict -
+    tar --extract --gzip --file "$RUNNER_TARBALL"
+    shred --remove "$RUNNER_TARBALL"
+    chown -R runner:runner /home/runner/actions-runner
+
+    install -m 0600 -o runner -g runner /dev/null /home/runner/.jit-config
+    printf '%s' '{{.RunnerJITConfig}}' > /home/runner/.jit-config
+    JIT_CONFIG=$(cat /home/runner/.jit-config)
+    shred --remove /home/runner/.jit-config
+
+    RUNNER_EXIT=0
+    runuser -u runner -- ./run.sh --jitconfig "$JIT_CONFIG" || RUNNER_EXIT=$?
+    unset JIT_CONFIG
+
+    # The trusted controller deletes the droplet after the workflow_job
+    # completion event. Power off immediately to stop workload execution while
+    # waiting for that control-plane deletion or TTL reconciliation.
+    shutdown --poweroff now
+    exit "$RUNNER_EXIT"

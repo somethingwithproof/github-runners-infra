@@ -67,31 +67,33 @@ func run() error {
 		InstallationID:      cfg.installationID,
 		PrivateKey:          privateKey,
 		AllowedRepositories: cfg.allowedRepositories,
+		ReadWorkflowRuns:    len(cfg.allowedPublicRepositories) != 0,
 	}
 	if err := validateGitHubTokenScope(processCtx, githubClient.ValidateTokenScope); err != nil {
 		return fmt.Errorf("validate GitHub token scope: %w", err)
 	}
 	handler, err := webhook.NewHandler(webhook.Config{
-		WebhookSecret:         []byte(cfg.webhookSecret),
-		GitHubClient:          githubClient,
-		ComputeClient:         computeClient,
-		Store:                 stateStore,
-		RequiredLabel:         cfg.requiredLabel,
-		AllowedLabels:         cfg.allowedLabels,
-		AllowedRepositories:   cfg.allowedRepositories,
-		RunnerVersion:         cfg.runnerVersion,
-		RunnerSHA256:          cfg.runnerSHA256,
-		ChefInstallerSHA256:   cfg.chefInstallerSHA256,
-		RunnerGroupID:         cfg.runnerGroupID,
-		WorkerCount:           cfg.workerCount,
-		MaxLiveRunners:        cfg.maxLiveRunners,
-		MaxAttempts:           cfg.maxAttempts,
-		MaxRunnerAge:          cfg.maxRunnerAge,
-		CancelledRunnerTTL:    cfg.cancelledRunnerTTL,
-		RegistrationTimeout:   cfg.registrationTimeout,
-		LivenessSettleWindow:  cfg.livenessSettleWindow,
-		LivenessConfirmations: cfg.livenessConfirmations,
-		InstallationID:        cfg.installationID,
+		WebhookSecret:             []byte(cfg.webhookSecret),
+		GitHubClient:              githubClient,
+		ComputeClient:             computeClient,
+		Store:                     stateStore,
+		RequiredLabel:             cfg.requiredLabel,
+		AllowedLabels:             cfg.allowedLabels,
+		AllowedRepositories:       cfg.allowedRepositories,
+		AllowedPublicRepositories: cfg.allowedPublicRepositories,
+		RunnerVersion:             cfg.runnerVersion,
+		RunnerSHA256:              cfg.runnerSHA256,
+		ChefInstallerSHA256:       cfg.chefInstallerSHA256,
+		RunnerGroupID:             cfg.runnerGroupID,
+		WorkerCount:               cfg.workerCount,
+		MaxLiveRunners:            cfg.maxLiveRunners,
+		MaxAttempts:               cfg.maxAttempts,
+		MaxRunnerAge:              cfg.maxRunnerAge,
+		CancelledRunnerTTL:        cfg.cancelledRunnerTTL,
+		RegistrationTimeout:       cfg.registrationTimeout,
+		LivenessSettleWindow:      cfg.livenessSettleWindow,
+		LivenessConfirmations:     cfg.livenessConfirmations,
+		InstallationID:            cfg.installationID,
 	})
 	if err != nil {
 		return fmt.Errorf("create webhook handler: %w", err)
@@ -347,6 +349,7 @@ type runtimeConfig struct {
 	webhookSecret, runnerVersion       string
 	runnerSHA256, chefInstallerSHA256  string
 	allowedLabels, allowedRepositories []string
+	allowedPublicRepositories          []string
 	runnerGroupID                      int64
 	workerCount, maxLiveRunners        int
 	maxAttempts                        int
@@ -374,6 +377,7 @@ func loadRuntimeConfig() (runtimeConfig, error) {
 		return cfg, err
 	}
 	cfg.allowedRepositories = splitCSV(allowedRepositories)
+	cfg.allowedPublicRepositories = splitCSV(os.Getenv("ALLOWED_PUBLIC_REPOSITORIES"))
 	if len(cfg.allowedRepositories) == 0 {
 		return cfg, fmt.Errorf("ALLOWED_REPOSITORIES must contain at least one non-empty value")
 	}

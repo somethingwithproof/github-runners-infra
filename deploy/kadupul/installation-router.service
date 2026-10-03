@@ -1,0 +1,22 @@
+[Unit]
+Description=GitHub App installation router
+After=network.target webhook.service kadupul-webhook.service
+
+[Service]
+User=webhook
+Group=webhook
+Environment=LEGACY_INSTALLATION_ID=107420880
+Environment=KADUPUL_INSTALLATION_ID=167457495
+ExecStart=/usr/local/bin/kadupul-installation-router
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
