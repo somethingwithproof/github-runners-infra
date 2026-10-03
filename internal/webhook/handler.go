@@ -544,6 +544,7 @@ func (h *Handler) expireRunners(ctx context.Context) error {
 
 func (h *Handler) reconcileLiveness(ctx context.Context, cutoff time.Time) []error {
 	var reconciliationErrors []error
+	reconciliationErrors = append(reconciliationErrors, h.reconcileOrphanedInstances(ctx)...)
 	reconciliationErrors = append(reconciliationErrors, h.reconcileOrphanedGitHubRunners(ctx)...)
 	knownInstances, err := h.store.KnownInstanceIDs(ctx)
 	if err != nil {
@@ -579,6 +580,42 @@ func (h *Handler) expireAged(ctx context.Context, cutoff time.Time) []error {
 		h.signal()
 	}
 	return expirationErrors
+}
+
+// Providers may support checking an exact instance ID without mutating it.
+// A tag-based lookup cannot prove an orphan absent after ownership tags change.
+func (h *Handler) reconcileOrphanedInstances(ctx context.Context) []error {
+	checker, ok := h.computeClient.(interface {
+		RunnerAbsent(context.Context, string) (bool, error)
+	})
+	if !ok {
+		return nil
+	}
+	records, err := h.store.ListOrphaned(ctx)
+	if err != nil {
+		return []error{fmt.Errorf("list orphaned provider instances: %w", err)}
+	}
+	var reconciliationErrors []error
+	for _, record := range records {
+		if record.Provider != h.provider || record.InstanceID == "" {
+			continue
+		}
+		absent, err := checker.RunnerAbsent(ctx, record.InstanceID)
+		if err != nil {
+			reconciliationErrors = append(reconciliationErrors, err)
+			continue
+		}
+		if !absent {
+			continue
+		}
+		if err := h.store.ReleaseAbsentOrphan(context.WithoutCancel(ctx), record.Key, record.InstanceID); err != nil {
+			reconciliationErrors = append(reconciliationErrors, fmt.Errorf("release absent orphan %s: %w", record.Key, err))
+			continue
+		}
+		log.Printf("Released fleet reservation for verified absent runner instance %s (%s)", record.InstanceID, record.Key)
+		h.signal()
+	}
+	return reconciliationErrors
 }
 
 func (h *Handler) reconcileOrphanedGitHubRunners(ctx context.Context) []error {

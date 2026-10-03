@@ -348,6 +348,11 @@ Keep ordinary lint and unit jobs on GitHub-hosted runners.
 - Treat `MAX_RUNNER_AGE` as a fail-safe execution limit.
 - Set `MAX_LIVE_RUNNERS` to the maximum billed fleet size; `WORKER_COUNT` only
   controls how many lifecycle operations the controller processes in parallel.
+- DigitalOcean orphan records retain fleet reservations while their droplet IDs
+  still exist. Each reconciliation checks those exact IDs and releases a
+  reservation only after an authoritative 404, without waiting for
+  `MAX_RUNNER_AGE`. API failures and existing resources retain their slots;
+  GitHub identity cleanup and the original error history remain separate.
 - Cancelled jobs without an assigned runner are reclaimed after
   `CANCELLED_RUNNER_TTL` rather than the full maximum runner age.
 - Run exactly one controller process against a state file; it contains lifecycle
