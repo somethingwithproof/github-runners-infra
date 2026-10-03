@@ -69,6 +69,21 @@ runcmd:
     shred --remove "$RUNNER_TARBALL"
     chown -R runner:runner /home/runner/actions-runner
 
+    # CodeQL's TypeScript extractor needs a standalone node on PATH; the
+    # runner's bundled action runtime does not provide that command. Select
+    # Kadupul's pinned Node version through mise, including npm and npx.
+    MISE_RELEASE='https://github.com/jdx/mise/releases/download/v2026.10.0'
+    curl --fail --silent --show-error --location \
+      --proto '=https' --tlsv1.2 \
+      --output /usr/local/bin/mise \
+      "$MISE_RELEASE/mise-v2026.10.0-linux-x64"
+    printf '%s  %s\n' \
+      '57ced973f968b8fbab07aa8e32bd7077d4a357e200a22356d98963c723c6de0a' \
+      '/usr/local/bin/mise' | sha256sum --check --strict -
+    chmod 0755 /usr/local/bin/mise
+    runuser -u runner -- mise install node@22.22.2
+    runuser -u runner -- mise exec node@22.22.2 -- node --version
+
     install -m 0600 -o runner -g runner /dev/null /home/runner/.jit-config
     printf '%s' '{{.RunnerJITConfig}}' > /home/runner/.jit-config
     JIT_CONFIG=$(cat /home/runner/.jit-config)
@@ -76,7 +91,8 @@ runcmd:
 
     RUNNER_EXIT=0
     export PATH="/home/runner/.local/bin:$PATH"
-    runuser -u runner -- ./run.sh --jitconfig "$JIT_CONFIG" || RUNNER_EXIT=$?
+    runuser -u runner -- mise exec node@22.22.2 -- \
+      ./run.sh --jitconfig "$JIT_CONFIG" || RUNNER_EXIT=$?
     unset JIT_CONFIG
 
     # The trusted controller deletes the droplet after the workflow_job
