@@ -1,0 +1,44 @@
+[Unit]
+Description=GitHub Actions Runner Webhook Listener
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=webhook
+Group=webhook
+EnvironmentFile=/etc/github-runners/kadupul-env
+ExecStart=/usr/local/bin/kadupul-webhook
+Restart=always
+RestartSec=5
+StateDirectory=github-runners-kadupul
+StateDirectoryMode=0700
+UMask=0077
+
+# The controller needs network access and one writable state directory only.
+CapabilityBoundingSet=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectSystem=strict
+ReadWritePaths=/var/lib/github-runners-kadupul
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target

@@ -23,10 +23,11 @@ import (
 const maxBodySize = 1 * 1024 * 1024
 
 var (
-	safeNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$`)
-	deliveryRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)
-	checksumRegex = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
-	versionRegex  = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
+	safeNameRegex     = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$`)
+	safeRepoNameRegex = regexp.MustCompile(`^(\.github|[a-zA-Z0-9][a-zA-Z0-9._-]{0,99})$`)
+	deliveryRegex     = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,128}$`)
+	checksumRegex     = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
+	versionRegex      = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
 )
 
 // WorkflowJobEvent contains only the fields used by the controller.
@@ -40,6 +41,7 @@ type WorkflowJobEvent struct {
 }
 
 type WorkflowJob struct {
+	RunID      int64    `json:"run_id"`
 	ID         int64    `json:"id"`
 	Name       string   `json:"name"`
 	Labels     []string `json:"labels"`
@@ -58,6 +60,7 @@ type RepoInfo struct {
 
 // GitHubClient is the narrow control-plane contract required by the worker.
 type GitHubClient interface {
+	TrustedWorkflowRun(context.Context, string, string, int64) (bool, error)
 	GenerateRepoJITConfig(context.Context, string, string, string, int64, []string) (gh.JITConfig, error)
 	RepoRunnerStatus(context.Context, string, string, int64) (gh.RunnerStatus, error)
 	RemoveRepoRunner(context.Context, string, string, int64) error
@@ -76,59 +79,61 @@ type ComputeClient interface {
 
 // Handler authenticates webhooks and drives durable runner lifecycle workers.
 type Handler struct {
-	webhookSecret         []byte
-	githubClient          GitHubClient
-	computeClient         ComputeClient
-	store                 state.Store
-	requiredLabel         string
-	allowedLabels         map[string]string
-	allowedRepositories   map[string]struct{}
-	runnerVersion         string
-	runnerSHA256          string
-	chefInstallerSHA256   string
-	runnerGroupID         int64
-	maxAttempts           int
-	workerCount           int
-	pollInterval          time.Duration
-	maxRunnerAge          time.Duration
-	cancelledRunnerTTL    time.Duration
-	registrationTimeout   time.Duration
-	livenessSettleWindow  time.Duration
-	livenessConfirmations int
-	reaperTimeout         time.Duration
-	livenessCheckInterval time.Duration
-	installationID        int64
-	provider              string
-	notify                chan struct{}
-	ingestSlots           chan struct{}
-	ingestWait            time.Duration
-	wg                    sync.WaitGroup
+	webhookSecret             []byte
+	githubClient              GitHubClient
+	computeClient             ComputeClient
+	store                     state.Store
+	requiredLabel             string
+	allowedLabels             map[string]string
+	allowedRepositories       map[string]struct{}
+	allowedPublicRepositories map[string]struct{}
+	runnerVersion             string
+	runnerSHA256              string
+	chefInstallerSHA256       string
+	runnerGroupID             int64
+	maxAttempts               int
+	workerCount               int
+	pollInterval              time.Duration
+	maxRunnerAge              time.Duration
+	cancelledRunnerTTL        time.Duration
+	registrationTimeout       time.Duration
+	livenessSettleWindow      time.Duration
+	livenessConfirmations     int
+	reaperTimeout             time.Duration
+	livenessCheckInterval     time.Duration
+	installationID            int64
+	provider                  string
+	notify                    chan struct{}
+	ingestSlots               chan struct{}
+	ingestWait                time.Duration
+	wg                        sync.WaitGroup
 }
 
 // Config holds controller configuration. Repository and label allowlists are
 // mandatory so installing the GitHub App does not implicitly grant runner use.
 type Config struct {
-	WebhookSecret         []byte
-	GitHubClient          GitHubClient
-	ComputeClient         ComputeClient
-	Store                 state.Store
-	RequiredLabel         string
-	AllowedLabels         []string
-	AllowedRepositories   []string
-	RunnerVersion         string
-	RunnerSHA256          string
-	ChefInstallerSHA256   string
-	RunnerGroupID         int64
-	WorkerCount           int
-	MaxLiveRunners        int
-	MaxAttempts           int
-	PollInterval          time.Duration
-	MaxRunnerAge          time.Duration
-	CancelledRunnerTTL    time.Duration
-	RegistrationTimeout   time.Duration
-	LivenessSettleWindow  time.Duration
-	LivenessConfirmations int
-	InstallationID        int64
+	WebhookSecret             []byte
+	GitHubClient              GitHubClient
+	ComputeClient             ComputeClient
+	Store                     state.Store
+	RequiredLabel             string
+	AllowedLabels             []string
+	AllowedRepositories       []string
+	AllowedPublicRepositories []string
+	RunnerVersion             string
+	RunnerSHA256              string
+	ChefInstallerSHA256       string
+	RunnerGroupID             int64
+	WorkerCount               int
+	MaxLiveRunners            int
+	MaxAttempts               int
+	PollInterval              time.Duration
+	MaxRunnerAge              time.Duration
+	CancelledRunnerTTL        time.Duration
+	RegistrationTimeout       time.Duration
+	LivenessSettleWindow      time.Duration
+	LivenessConfirmations     int
+	InstallationID            int64
 }
 
 func NewHandler(cfg Config) (*Handler, error) {
@@ -143,6 +148,14 @@ func NewHandler(cfg Config) (*Handler, error) {
 	if err != nil {
 		return nil, err
 	}
+	allowedPublicRepositories := make(map[string]struct{}, len(cfg.AllowedPublicRepositories))
+	for _, raw := range cfg.AllowedPublicRepositories {
+		repository := strings.ToLower(strings.TrimSpace(raw))
+		if _, found := allowedRepositories[repository]; !found {
+			return nil, fmt.Errorf("public repository %q is outside repository allowlist", raw)
+		}
+		allowedPublicRepositories[repository] = struct{}{}
+	}
 	limits, err := resolveHandlerLimits(cfg)
 	if err != nil {
 		return nil, err
@@ -152,32 +165,33 @@ func NewHandler(cfg Config) (*Handler, error) {
 	}
 
 	return &Handler{
-		webhookSecret:         append([]byte(nil), cfg.WebhookSecret...),
-		githubClient:          cfg.GitHubClient,
-		computeClient:         cfg.ComputeClient,
-		store:                 cfg.Store,
-		requiredLabel:         requiredLabel,
-		allowedLabels:         allowedLabels,
-		allowedRepositories:   allowedRepositories,
-		runnerVersion:         cfg.RunnerVersion,
-		runnerSHA256:          strings.ToLower(cfg.RunnerSHA256),
-		chefInstallerSHA256:   strings.ToLower(cfg.ChefInstallerSHA256),
-		runnerGroupID:         limits.runnerGroupID,
-		maxAttempts:           limits.maxAttempts,
-		workerCount:           limits.workerCount,
-		pollInterval:          limits.pollInterval,
-		maxRunnerAge:          limits.maxRunnerAge,
-		cancelledRunnerTTL:    limits.cancelledRunnerTTL,
-		registrationTimeout:   limits.registrationTimeout,
-		livenessSettleWindow:  limits.livenessSettleWindow,
-		livenessConfirmations: limits.livenessConfirmations,
-		reaperTimeout:         max(5*time.Minute, time.Duration(limits.maxLiveRunners+10)*30*time.Second),
-		livenessCheckInterval: 5 * time.Minute,
-		installationID:        cfg.InstallationID,
-		provider:              cfg.ComputeClient.Provider(),
-		notify:                make(chan struct{}, 1),
-		ingestSlots:           make(chan struct{}, 64),
-		ingestWait:            3 * time.Second,
+		webhookSecret:             append([]byte(nil), cfg.WebhookSecret...),
+		githubClient:              cfg.GitHubClient,
+		computeClient:             cfg.ComputeClient,
+		store:                     cfg.Store,
+		requiredLabel:             requiredLabel,
+		allowedLabels:             allowedLabels,
+		allowedRepositories:       allowedRepositories,
+		allowedPublicRepositories: allowedPublicRepositories,
+		runnerVersion:             cfg.RunnerVersion,
+		runnerSHA256:              strings.ToLower(cfg.RunnerSHA256),
+		chefInstallerSHA256:       strings.ToLower(cfg.ChefInstallerSHA256),
+		runnerGroupID:             limits.runnerGroupID,
+		maxAttempts:               limits.maxAttempts,
+		workerCount:               limits.workerCount,
+		pollInterval:              limits.pollInterval,
+		maxRunnerAge:              limits.maxRunnerAge,
+		cancelledRunnerTTL:        limits.cancelledRunnerTTL,
+		registrationTimeout:       limits.registrationTimeout,
+		livenessSettleWindow:      limits.livenessSettleWindow,
+		livenessConfirmations:     limits.livenessConfirmations,
+		reaperTimeout:             max(5*time.Minute, time.Duration(limits.maxLiveRunners+10)*30*time.Second),
+		livenessCheckInterval:     5 * time.Minute,
+		installationID:            cfg.InstallationID,
+		provider:                  cfg.ComputeClient.Provider(),
+		notify:                    make(chan struct{}, 1),
+		ingestSlots:               make(chan struct{}, 64),
+		ingestWait:                3 * time.Second,
 	}, nil
 }
 
@@ -379,6 +393,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			log.Printf("SECURITY: rejected labels for %s job %d: %v", repository, event.WorkflowJob.ID, err)
 			http.Error(w, "runner labels not authorized", http.StatusForbidden)
 			return
+		}
+		if !event.Repo.Private || len(h.allowedPublicRepositories) > 0 {
+			trusted, err := h.githubClient.TrustedWorkflowRun(r.Context(), event.Repo.Owner.Login, event.Repo.Name, event.WorkflowJob.RunID)
+			if err != nil {
+				log.Printf("WARN: public workflow verification failed for %s run %d: %v", repository, event.WorkflowJob.RunID, err)
+				http.Error(w, "workflow verification unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			if !trusted {
+				http.Error(w, "workflow event not authorized", http.StatusForbidden)
+				return
+			}
 		}
 		h.handleQueued(w, r, event, repository, key, labels)
 	case "completed":
@@ -1089,7 +1115,7 @@ func (h *Handler) releaseCanceledDelete(ctx, persistCtx context.Context, record 
 }
 
 func (h *Handler) validateRepository(repo RepoInfo) (string, bool, error) {
-	if !safeNameRegex.MatchString(repo.Owner.Login) || !safeNameRegex.MatchString(repo.Name) {
+	if !safeNameRegex.MatchString(repo.Owner.Login) || !safeRepoNameRegex.MatchString(strings.ToLower(repo.Name)) {
 		return "", false, fmt.Errorf("invalid owner or repository name")
 	}
 	fullName := strings.ToLower(repo.Owner.Login + "/" + repo.Name)
@@ -1097,7 +1123,9 @@ func (h *Handler) validateRepository(repo RepoInfo) (string, bool, error) {
 		return "", false, fmt.Errorf("repository identity fields disagree")
 	}
 	if !repo.Private {
-		return fullName, false, nil
+		if _, ok := h.allowedPublicRepositories[fullName]; !ok {
+			return fullName, false, nil
+		}
 	}
 	if _, ok := h.allowedRepositories[fullName]; !ok {
 		return fullName, false, nil
@@ -1148,7 +1176,7 @@ func (h *Handler) signal() {
 
 func validRepository(repo string) bool {
 	parts := strings.Split(repo, "/")
-	return len(parts) == 2 && safeNameRegex.MatchString(parts[0]) && safeNameRegex.MatchString(parts[1])
+	return len(parts) == 2 && safeNameRegex.MatchString(parts[0]) && safeRepoNameRegex.MatchString(strings.ToLower(parts[1]))
 }
 
 func jobKey(repository string, jobID int64) string {

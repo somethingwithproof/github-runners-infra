@@ -24,14 +24,20 @@ import (
 const testWebhookSecret = "unit-test-webhook-secret-not-a-credential"
 
 type fakeGitHub struct {
-	mu             sync.Mutex
-	generated      int
-	generateErr    error
-	removed        []int64
-	removeErr      map[int64]error
-	runnerStatus   map[int64]gh.RunnerStatus
-	runnerStateErr error
-	statusChecks   int
+	workflowTrusted bool
+	workflowErr     error
+	mu              sync.Mutex
+	generated       int
+	generateErr     error
+	removed         []int64
+	removeErr       map[int64]error
+	runnerStatus    map[int64]gh.RunnerStatus
+	runnerStateErr  error
+	statusChecks    int
+}
+
+func (f *fakeGitHub) TrustedWorkflowRun(_ context.Context, _, _ string, runID int64) (bool, error) {
+	return runID > 0 && f.workflowTrusted, f.workflowErr
 }
 
 func (f *fakeGitHub) RepoRunnerStatus(_ context.Context, _, _ string, id int64) (gh.RunnerStatus, error) {

@@ -34,9 +34,15 @@ binary, configuration, snapshot, and WAL together, then confirming provider
 ownership before restarting. Never run old and new controllers against the same
 state or provider fleet concurrently.
 
-The controller rejects public repositories. Self-hosted workflows still execute
+The controller rejects public repositories by default. An explicit
+`ALLOWED_PUBLIC_REPOSITORIES` subset can opt trusted repositories into run-origin
+verification: GitHub's workflow-run record must show a non-fork head with the
+same repository identity, and pull-request head/base repository IDs must match.
+Fork PRs and unverified origins cannot provision runners. See
+[the Kadupul deployment](deploy/kadupul/README.md) for the isolated rollout.
+Self-hosted workflows still execute
 repository code with root-equivalent Docker access on an isolated VM, so permit
-only explicitly trusted private repositories. Prefer private subnets with
+only explicitly trusted repositories and same-repository code. Prefer private subnets with
 egress through NAT and security groups or firewall rules with no inbound access.
 
 ## Supported providers
@@ -144,7 +150,8 @@ reclaimed only after `MAX_RUNNER_AGE`.
 
 All allowlisted repositories must belong to the same GitHub App installation
 owner. Installation tokens are restricted to exactly those repository names and
-only the `administration: write` permission needed for runner management.
+only the `administration: write` permission needed for runner management, plus
+`actions: read` when public run-origin verification is enabled.
 
 Do not derive an integrity value and execute the artifact in the same automated
 step. Obtain runner digests from official release instructions and review the
