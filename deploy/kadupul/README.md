@@ -28,11 +28,13 @@ well as the workflows: a workflow label alone cannot authorize cloud capacity.
 
 Each VM receives a single-job JIT runner configuration, never a cloud token,
 App private key, or controller callback secret. The Kadupul template omits
-Chef, provides Docker/Compose/buildx/gh and a writable tool cache, and verifies
+Chef, provides Docker/Compose/buildx/gh, pipx, and a writable tool cache, and verifies
 the runner archive against the official release checksum. Docker and sudo are
 root-equivalent; same-repository code must remain trusted. The VM powers off
 after its job and the controller deletes it through ownership-tagged lifecycle
-state. TTL reconciliation backs up completion-event cleanup.
+state. TTL reconciliation backs up completion-event cleanup. A checksum-pinned
+mise installation selects Node 22.22.2, matching Kadupul's runtime configuration,
+and launches the runner with node/npm/npx on PATH for CodeQL TypeScript extraction.
 
 The pool uses a dedicated sfo3 VPC and a firewall targeting
 `runner-controller-kadupul`, with no inbound rules and HTTP/HTTPS/DNS outbound
