@@ -35,7 +35,9 @@ after its job and the controller deletes it through ownership-tagged lifecycle
 state. TTL reconciliation backs up completion-event cleanup.
 
 The pool uses a dedicated sfo3 VPC and a firewall targeting
-`runner-controller-kadupul`, with no inbound rules and HTTPS/DNS outbound access.
+`runner-controller-kadupul`, with no inbound rules and HTTP/HTTPS/DNS outbound
+access. Container builds need HTTP for their signed Debian package repositories;
+the VM's own APT mirrors use HTTPS.
 APT mirrors use HTTPS. The initial size is `s-8vcpu-16gb`, capped at 16 live
 runners with 8 controller workers. Jobs beyond that limit remain in durable
 pending state. Idle runner capacity is zero; the existing controller host stays

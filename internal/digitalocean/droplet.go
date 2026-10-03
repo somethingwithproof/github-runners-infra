@@ -307,6 +307,15 @@ func (c *Client) DeleteRunner(ctx context.Context, id, jobKey string) error {
 		}
 	}
 	if !owned || !correctJob {
+		// Another lifecycle worker may have deleted the droplet after this
+		// GET began. Confirm authoritative absence before latching an
+		// ownership error; a still-existing foreign resource stays untouched.
+		if _, _, confirmErr := c.client.Droplets.Get(ctx, numericID); confirmErr != nil {
+			if isNotFound(confirmErr) {
+				return nil
+			}
+			return fmt.Errorf("confirm droplet %s after ownership mismatch: %w", id, confirmErr)
+		}
 		return fmt.Errorf("%w: refusing to delete droplet %s without controller and job ownership tags", compute.ErrOwnershipMismatch, id)
 	}
 	_, err = c.client.Droplets.Delete(ctx, numericID)
