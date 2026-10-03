@@ -284,6 +284,20 @@ func (c *Client) FindRunner(ctx context.Context, jobKey string) (*compute.Runner
 	return &compute.RunnerInstance{ID: fmt.Sprint(droplet.ID), Name: droplet.Name}, true, nil
 }
 
+// RunnerAbsent verifies absence by ID, independently of mutable ownership tags.
+// Only an authoritative 404 releases a stale fleet reservation.
+func (c *Client) RunnerAbsent(ctx context.Context, id string) (bool, error) {
+	numericID, err := strconv.Atoi(id)
+	if err != nil || numericID <= 0 {
+		return false, fmt.Errorf("invalid DigitalOcean droplet ID %q", id)
+	}
+	_, _, err = c.client.Droplets.Get(ctx, numericID)
+	if err != nil && !isNotFound(err) {
+		return false, fmt.Errorf("confirm runner droplet %s absence: %w", id, err)
+	}
+	return isNotFound(err), nil
+}
+
 // DeleteRunner removes a droplet only after verifying controller ownership.
 func (c *Client) DeleteRunner(ctx context.Context, id, jobKey string) error {
 	numericID, err := strconv.Atoi(id)
