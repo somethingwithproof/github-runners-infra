@@ -597,8 +597,14 @@ func (s *FileStore) ClaimNext(ctx context.Context, now time.Time, maxAttempts in
 			continue
 		}
 		var kind WorkKind
+		// A failed create can retain an owned JIT registration. That record
+		// already occupies one admission slot; retrying it replaces that
+		// registration instead of consuming another slot. Without this case,
+		// a full pool of unused registrations prevents every retry forever.
+		reservedSlot := record.InstanceID != "" || (record.GitHubRunnerOwned && record.GitHubRunnerID != 0)
+		canProvision := liveRunners < s.maxLiveRunners || (liveRunners == s.maxLiveRunners && reservedSlot)
 		switch {
-		case record.ClaimedWork == "" && record.Status == StatusPending && record.Attempts < maxAttempts && liveRunners < s.maxLiveRunners:
+		case record.ClaimedWork == "" && record.Status == StatusPending && record.Attempts < maxAttempts && canProvision:
 			record.Status = StatusProvisioning
 			record.Attempts++
 			kind = WorkProvision

@@ -34,7 +34,7 @@ root-equivalent; same-repository code must remain trusted. The VM powers off
 after its job and the controller deletes it through ownership-tagged lifecycle
 state. TTL reconciliation backs up completion-event cleanup.
 
-The pool uses a dedicated nyc3 VPC and a firewall targeting
+The pool uses a dedicated sfo3 VPC and a firewall targeting
 `runner-controller-kadupul`, with no inbound rules and HTTPS/DNS outbound access.
 APT mirrors use HTTPS. The initial size is `s-8vcpu-16gb`, capped at 16 live
 runners with 8 controller workers. Jobs beyond that limit remain in durable
