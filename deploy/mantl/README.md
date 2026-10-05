@@ -13,7 +13,7 @@ origin before allocating capacity. Router selection grants no provisioning acces
 
 Use a dedicated sfo3 VPC and a firewall targeting `runner-controller-mantl` with
 no inbound rules and outbound HTTP/HTTPS/DNS. Start with four live
-`s-8vcpu-16gb` runners and four workers; there is no idle workload capacity.
+`s-8vcpu-16gb-amd` runners and four workers; there is no idle workload capacity.
 The existing controller host remains running. State lives in
 `/var/lib/github-runners-mantl`; the controller listens only on 127.0.0.1:8083.
 
