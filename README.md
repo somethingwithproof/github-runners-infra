@@ -353,6 +353,12 @@ Keep ordinary lint and unit jobs on GitHub-hosted runners.
   reservation only after an authoritative 404, without waiting for
   `MAX_RUNNER_AGE`. API failures and existing resources retain their slots;
   GitHub identity cleanup and the original error history remain separate.
+- Accepted DigitalOcean deletions are journaled against the exact droplet ID.
+  The controller checks for an authoritative 404 before duplicate cleanup or
+  releasing fleet capacity. While deletion propagates, it performs read-only
+  confirmation rather than deleting again or treating disappearing tags as an
+  ownership mismatch. Confirmation waits survive restarts and do not consume
+  the deletion retry budget; API failures retain the fleet reservation.
 - Cancelled jobs without an assigned runner are reclaimed after
   `CANCELLED_RUNNER_TTL` rather than the full maximum runner age.
 - Run exactly one controller process against a state file; it contains lifecycle

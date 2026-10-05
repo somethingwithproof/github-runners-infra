@@ -56,6 +56,9 @@ type Record struct {
 	// GitHubRunnerOwned proves the ID came from this controller's JIT request.
 	GitHubRunnerOwned bool   `json:"github_runner_owned,omitempty"`
 	InstanceID        string `json:"instance_id,omitempty"`
+	// DeletionAcceptedID records a successful, ownership-verified provider delete.
+	// Bind it to an exact ID so it can never authorize deletion of a replacement.
+	DeletionAcceptedID string `json:"deletion_accepted_id,omitempty"`
 	// DropletID is read only to migrate state written before provider-neutral IDs.
 	DropletID           int       `json:"droplet_id,omitempty"`
 	Status              Status    `json:"status"`
@@ -96,6 +99,8 @@ type Store interface {
 	MarkCompleted(context.Context, string) error
 	ScheduleDeletion(context.Context, string) error
 	MarkDeleted(context.Context, string) error
+	MarkDeletionAccepted(context.Context, string, string) error
+	DeferDeletionConfirmation(context.Context, string, string, time.Time) error
 	BeginCleanupAttempt(context.Context, string, int) (int, bool, error)
 	MarkDeleteFailed(context.Context, string, string, time.Time, int) error
 	MarkOrphaned(context.Context, string, string) error
@@ -779,6 +784,9 @@ func (s *FileStore) MarkProvisioned(_ context.Context, key, instanceID string, r
 			return
 		}
 		record.InstanceID = instanceID
+		if record.DeletionAcceptedID != instanceID {
+			record.DeletionAcceptedID = ""
+		}
 		record.DropletID = 0
 		record.GitHubRunnerID = runnerID
 		record.GitHubRunnerOwned = true
@@ -1032,6 +1040,40 @@ func (s *FileStore) ScheduleDeletion(_ context.Context, key string) error {
 	})
 }
 
+// MarkDeletionAccepted journals provider acceptance before any follow-up cleanup.
+func (s *FileStore) MarkDeletionAccepted(_ context.Context, key, instanceID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record, ok := s.records[key]
+	if !ok || instanceID == "" || record.InstanceID != instanceID || record.Status != StatusDeleting || record.ClaimedWork != WorkDelete {
+		return fmt.Errorf("cannot record deletion acceptance for unclaimed instance %q", instanceID)
+	}
+	before := clone(record)
+	record.DeletionAcceptedID = instanceID
+	record.UpdatedAt = time.Now().UTC()
+	s.records[key] = record
+	s.markDirty(key)
+	if err := s.saveLocked(); err != nil {
+		s.records[key] = before
+		return err
+	}
+	return nil
+}
+
+// Confirmation is a read-only wait, not another deletion attempt. Keep the
+// instance reserved until authoritative absence, without exhausting retry budget.
+func (s *FileStore) DeferDeletionConfirmation(_ context.Context, key, message string, retryAt time.Time) error {
+	return s.update(key, func(record *Record) {
+		if record.Status != StatusDeleting || record.ClaimedWork != WorkDelete || record.DeletionAcceptedID == "" || record.DeletionAcceptedID != record.InstanceID {
+			return
+		}
+		releaseDeleteClaim(record)
+		record.ClaimedWork = ""
+		record.LastError = message
+		record.NextAttemptAt = retryAt.UTC()
+	})
+}
+
 func (s *FileStore) MarkDeleted(_ context.Context, key string) error {
 	return s.update(key, func(record *Record) {
 		record.Status = StatusDeleted
@@ -1205,6 +1247,7 @@ func (s *FileStore) RequeueMissingRunner(_ context.Context, key string, maxAttem
 			return
 		}
 		record.InstanceID = ""
+		record.DeletionAcceptedID = ""
 		record.ProvisionedAt = time.Time{}
 		record.RegisteredAt = time.Time{}
 		record.ReconciledAt = time.Time{}

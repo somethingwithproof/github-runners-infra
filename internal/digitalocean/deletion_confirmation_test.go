@@ -3,6 +3,7 @@ package digitalocean
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 
@@ -71,4 +72,39 @@ func TestRunnerAbsentRequiresAuthoritative404(t *testing.T) {
 			t.Fatalf("transport failure: absent=%v err=%v", absent, err)
 		}
 	})
+}
+
+func TestCleanupExcludesConfirmedAbsentIDFromStaleTagIndex(t *testing.T) {
+	for _, foreign := range []bool{false, true} {
+		t.Run(map[bool]string{false: "owned duplicate", true: "foreign duplicate"}[foreign], func(t *testing.T) {
+			deleted := 0
+			client := &Client{controllerTag: "runner-controller-test"}
+			client.client = godo.NewClient(&http.Client{Transport: doRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+				if request.URL.Path == "/v2/droplets" {
+					// The deleted primary remains in the tag index with its tags gone.
+					tags := "runner-controller-test"
+					if foreign {
+						tags = "runner-controller-other"
+					}
+					return jsonResponse(http.StatusOK, fmt.Sprintf(`{"droplets":[{"id":1,"tags":[]},{"id":2,"tags":[%q]}]}`, tags)), nil
+				}
+				if request.URL.Path != "/v2/droplets/2" {
+					t.Fatalf("revisited confirmed absent primary: %s", request.URL.Path)
+				}
+				if request.Method == http.MethodDelete {
+					deleted++
+					return jsonResponse(http.StatusNoContent, ""), nil
+				}
+				return jsonResponse(http.StatusOK, fmt.Sprintf(`{"droplet":{"id":2,"tags":["runner-controller-test",%q]}}`, runnerJobTag("org/repo:1"))), nil
+			})})
+			err := client.CleanupRunnerExcept(context.Background(), "org/repo:1", "1")
+			if foreign {
+				if !errors.Is(err, compute.ErrOwnershipMismatch) || deleted != 0 {
+					t.Fatalf("foreign duplicate: deleted=%d err=%v", deleted, err)
+				}
+			} else if err != nil || deleted != 1 {
+				t.Fatalf("owned duplicate: deleted=%d err=%v", deleted, err)
+			}
+		})
+	}
 }
