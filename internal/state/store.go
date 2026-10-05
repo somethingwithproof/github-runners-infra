@@ -102,6 +102,7 @@ type Store interface {
 	ListExpired(context.Context, time.Time) ([]Record, error)
 	ListProvisioned(context.Context) ([]Record, error)
 	ListOrphaned(context.Context) ([]Record, error)
+	ReleaseAbsentOrphan(context.Context, string, string) error
 	KnownInstanceIDs(context.Context) (map[string]struct{}, error)
 	ReleaseSweptOrphans(context.Context, string, time.Time) (int, error)
 	ObserveRunnerMissing(context.Context, string, time.Time, time.Duration, int) (bool, error)
@@ -1134,6 +1135,18 @@ func (s *FileStore) ListOrphaned(_ context.Context) ([]Record, error) {
 		}
 	}
 	return result, nil
+}
+
+// ReleaseAbsentOrphan releases a reservation after the provider confirms the
+// exact recorded instance is absent. Keep GitHub identity and audit history.
+func (s *FileStore) ReleaseAbsentOrphan(_ context.Context, key, instanceID string) error {
+	return s.update(key, func(record *Record) {
+		if instanceID == "" || record.Status != StatusOrphaned || record.InstanceID != instanceID {
+			return
+		}
+		record.InstanceID = ""
+		record.ClaimedWork = ""
+	})
 }
 
 // KnownInstanceIDs returns every provider resource still represented by a

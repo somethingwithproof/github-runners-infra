@@ -47,3 +47,28 @@ func TestDeleteRunnerConfirmsAbsenceAfterMissingOwnership(t *testing.T) {
 		})
 	}
 }
+
+func TestRunnerAbsentRequiresAuthoritative404(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusOK, http.StatusForbidden, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			client := &Client{client: godo.NewClient(&http.Client{Transport: doRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+				if request.Method != http.MethodGet || request.URL.Path != "/v2/droplets/123" {
+					t.Fatalf("unexpected request: %s %s", request.Method, request.URL.Path)
+				}
+				return jsonResponse(status, `{"droplet":{"id":123,"tags":[]},"message":"unavailable"}`), nil
+			})})}
+			absent, err := client.RunnerAbsent(context.Background(), "123")
+			if absent != (status == http.StatusNotFound) || (err != nil) != (status != http.StatusOK && status != http.StatusNotFound) {
+				t.Fatalf("status %d: absent=%v err=%v", status, absent, err)
+			}
+		})
+	}
+	t.Run("transport failure", func(t *testing.T) {
+		client := &Client{client: godo.NewClient(&http.Client{Transport: doRoundTripFunc(func(_ *http.Request) (*http.Response, error) {
+			return nil, context.DeadlineExceeded
+		})})}
+		if absent, err := client.RunnerAbsent(context.Background(), "123"); absent || err == nil {
+			t.Fatalf("transport failure: absent=%v err=%v", absent, err)
+		}
+	})
+}
