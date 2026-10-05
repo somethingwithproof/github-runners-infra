@@ -77,6 +77,11 @@ type ComputeClient interface {
 	SweepOrphanedRunners(context.Context, map[string]struct{}, time.Time) (int, error)
 }
 
+// instanceAbsenceChecker checks exact IDs independently of mutable tags.
+type instanceAbsenceChecker interface {
+	RunnerAbsent(context.Context, string) (bool, error)
+}
+
 // Handler authenticates webhooks and drives durable runner lifecycle workers.
 type Handler struct {
 	webhookSecret             []byte
@@ -585,9 +590,7 @@ func (h *Handler) expireAged(ctx context.Context, cutoff time.Time) []error {
 // Providers may support checking an exact instance ID without mutating it.
 // A tag-based lookup cannot prove an orphan absent after ownership tags change.
 func (h *Handler) reconcileOrphanedInstances(ctx context.Context) []error {
-	checker, ok := h.computeClient.(interface {
-		RunnerAbsent(context.Context, string) (bool, error)
-	})
+	checker, ok := h.computeClient.(instanceAbsenceChecker)
 	if !ok {
 		return nil
 	}
@@ -1074,7 +1077,15 @@ func (h *Handler) provisionFailed(ctx context.Context, record state.Record, err 
 
 func (h *Handler) delete(ctx context.Context, record state.Record) {
 	persistCtx := context.WithoutCancel(ctx)
-	if err := h.computeClient.DeleteRunner(ctx, record.InstanceID, record.Key); err != nil {
+	checker, confirmsAbsence := h.computeClient.(instanceAbsenceChecker)
+	var deleteErr error
+	if !confirmsAbsence || record.DeletionAcceptedID != record.InstanceID {
+		deleteErr = h.computeClient.DeleteRunner(ctx, record.InstanceID, record.Key)
+		if deleteErr == nil && confirmsAbsence {
+			deleteErr = h.store.MarkDeletionAccepted(persistCtx, record.Key, record.InstanceID)
+		}
+	}
+	if err := deleteErr; err != nil {
 		if h.releaseCanceledDelete(ctx, persistCtx, record, err) {
 			return
 		}
@@ -1093,7 +1104,38 @@ func (h *Handler) delete(ctx context.Context, record state.Record) {
 		h.signal()
 		return
 	}
-	if err := h.computeClient.CleanupRunner(ctx, record.Key); err != nil {
+	if confirmsAbsence {
+		// A successful DELETE is asynchronous. Until GET returns 404, tag
+		// indexes may still list this ID while GET exposes no ownership tags.
+		// Never re-delete it or run duplicate cleanup during that transition.
+		absent, err := checker.RunnerAbsent(ctx, record.InstanceID)
+		if err != nil || !absent {
+			if h.releaseCanceledDelete(ctx, persistCtx, record, err) {
+				return
+			}
+			message := "provider deletion accepted; awaiting confirmed absence"
+			if err != nil {
+				message = fmt.Sprintf("confirm accepted provider deletion: %v", err)
+				log.Printf("WARN: %s for %s", message, record.Key)
+			}
+			if stateErr := h.store.DeferDeletionConfirmation(persistCtx, record.Key, message, time.Now().Add(retryDelay(1))); stateErr != nil {
+				log.Printf("ERROR: defer deletion confirmation for %s: %v", record.Key, stateErr)
+				if releaseErr := h.store.ReleaseClaim(persistCtx, record.Key, state.WorkDelete); releaseErr != nil {
+					log.Printf("ERROR: release deletion confirmation claim for %s: %v", record.Key, releaseErr)
+				}
+			}
+			return
+		}
+	}
+	var cleanupErr error
+	if cleaner, ok := h.computeClient.(interface {
+		CleanupRunnerExcept(context.Context, string, string) error
+	}); ok && confirmsAbsence {
+		cleanupErr = cleaner.CleanupRunnerExcept(ctx, record.Key, record.InstanceID)
+	} else {
+		cleanupErr = h.computeClient.CleanupRunner(ctx, record.Key)
+	}
+	if err := cleanupErr; err != nil {
 		if h.releaseCanceledDelete(ctx, persistCtx, record, err) {
 			return
 		}

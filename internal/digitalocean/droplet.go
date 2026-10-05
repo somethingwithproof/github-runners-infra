@@ -343,7 +343,13 @@ func (c *Client) DeleteRunner(ctx context.Context, id, jobKey string) error {
 }
 
 func (c *Client) CleanupRunner(ctx context.Context, jobKey string) error {
-	droplets, err := c.listJobDroplets(ctx, jobKey)
+	return c.CleanupRunnerExcept(ctx, jobKey, "")
+}
+
+// CleanupRunnerExcept excludes the tracked ID already confirmed absent by the
+// controller. A stale tag index must not send it through ownership checks again.
+func (c *Client) CleanupRunnerExcept(ctx context.Context, jobKey, excludedID string) error {
+	droplets, err := c.listJobDropletsExcept(ctx, jobKey, excludedID)
 	if err != nil {
 		return err
 	}
@@ -356,12 +362,20 @@ func (c *Client) CleanupRunner(ctx context.Context, jobKey string) error {
 }
 
 func (c *Client) listJobDroplets(ctx context.Context, jobKey string) ([]godo.Droplet, error) {
+	return c.listJobDropletsExcept(ctx, jobKey, "")
+}
+
+func (c *Client) listJobDropletsExcept(ctx context.Context, jobKey, excludedID string) ([]godo.Droplet, error) {
 	jobTag := runnerJobTag(jobKey)
 	existing, err := c.listDropletsByTag(ctx, jobTag)
 	if err != nil {
 		return nil, fmt.Errorf("look up existing runner droplet: %w", err)
 	}
+	verified := make([]godo.Droplet, 0, len(existing))
 	for _, droplet := range existing {
+		if excludedID != "" && fmt.Sprint(droplet.ID) == excludedID {
+			continue
+		}
 		owned := false
 		for _, tag := range droplet.Tags {
 			if tag == c.controllerTag {
@@ -372,8 +386,9 @@ func (c *Client) listJobDroplets(ctx context.Context, jobKey string) ([]godo.Dro
 		if !owned {
 			return nil, fmt.Errorf("%w: job-tagged droplet %d belongs to another controller", compute.ErrOwnershipMismatch, droplet.ID)
 		}
+		verified = append(verified, droplet)
 	}
-	return existing, nil
+	return verified, nil
 }
 
 func (c *Client) listDropletsByTag(ctx context.Context, tag string) ([]godo.Droplet, error) {
