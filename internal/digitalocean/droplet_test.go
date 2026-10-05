@@ -18,41 +18,45 @@ import (
 )
 
 func TestCloudInitContainsOnlyJITBootstrapMaterial(t *testing.T) {
-	data, err := os.ReadFile("../../cloud-init/runner.yaml.tmpl")
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(data)
-	for _, forbidden := range []string{"DOToken", "DIGITALOCEAN_TOKEN", "aws ssm", "CallbackSecret", "/callback/destroy"} {
-		if strings.Contains(text, forbidden) {
-			t.Fatalf("cloud-init contains forbidden control-plane material %q", forbidden)
-		}
-	}
-	for _, required := range []string{"ssh_pwauth: false", "disable_root: true", "set -eu"} {
-		if !strings.Contains(text, required) {
-			t.Fatalf("cloud-init is missing hardening directive %q", required)
-		}
-	}
-	if strings.Contains(text, "pipefail") {
-		t.Fatal("cloud-init uses non-POSIX pipefail under cloud-init's /bin/sh")
-	}
+	for _, name := range []string{"runner.yaml.tmpl", "runner-kadupul.yaml.tmpl", "runner-mantl.yaml.tmpl"} {
+		t.Run(name, func(t *testing.T) {
+			data, err := os.ReadFile("../../cloud-init/" + name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := string(data)
+			for _, forbidden := range []string{"DOToken", "DIGITALOCEAN_TOKEN", "aws ssm", "CallbackSecret", "/callback/destroy"} {
+				if strings.Contains(text, forbidden) {
+					t.Fatalf("cloud-init contains forbidden control-plane material %q", forbidden)
+				}
+			}
+			for _, required := range []string{"ssh_pwauth: false", "disable_root: true", "set -eu"} {
+				if !strings.Contains(text, required) {
+					t.Fatalf("cloud-init is missing hardening directive %q", required)
+				}
+			}
+			if strings.Contains(text, "pipefail") {
+				t.Fatal("cloud-init uses non-POSIX pipefail under cloud-init's /bin/sh")
+			}
 
-	tmpl, err := template.New("runner").Parse(text)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var rendered bytes.Buffer
-	err = tmpl.Execute(&rendered, compute.RunnerParams{
-		RunnerJITConfig:     "encoded-jit-config",
-		RunnerVersion:       "2.331.0",
-		RunnerSHA256:        strings.Repeat("a", 64),
-		ChefInstallerSHA256: strings.Repeat("b", 64),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(rendered.String(), "./run.sh --jitconfig") {
-		t.Fatal("rendered cloud-init does not start a JIT runner")
+			tmpl, err := template.New("runner").Parse(text)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var rendered bytes.Buffer
+			err = tmpl.Execute(&rendered, compute.RunnerParams{
+				RunnerJITConfig:     "encoded-jit-config",
+				RunnerVersion:       "2.331.0",
+				RunnerSHA256:        strings.Repeat("a", 64),
+				ChefInstallerSHA256: strings.Repeat("b", 64),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(rendered.String(), "./run.sh --jitconfig") {
+				t.Fatal("rendered cloud-init does not start a JIT runner")
+			}
+		})
 	}
 }
 
