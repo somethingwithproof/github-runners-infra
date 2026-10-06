@@ -6,12 +6,19 @@ deliveries are persisted before acknowledgement, provisioning is retried after
 transient failures or controller restarts, and only controller-owned resources
 can be deleted.
 
+A JIT registration is scoped to a repository, not bound to its triggering job.
+Before registering a runner and again before allocating a VM, the controller
+checks that the original job is still queued. API failures defer provisioning.
+Reconciliation also retires runners whose original job has completed, but first
+deregisters through GitHub, which rejects removal while another job is running.
+
 ## Security architecture
 
 ```text
 GitHub workflow_job webhook
   -> verify HMAC, installation ID, delivery ID, private-repository allowlist
   -> durably record the job
+  -> verify the exact job is still queued through GitHub's Actions API
   -> generate a repository-scoped, single-use GitHub JIT configuration
   -> create an ownership-tagged instance with the selected cloud provider
   -> runner executes at most one job and powers off
@@ -70,6 +77,7 @@ review.
 - Go 1.25.13 or newer
 - A Linux controller host with Caddy or another TLS reverse proxy
 - A GitHub App subscribed to `workflow_job` with repository Administration: write
+  and Actions: read, scoped to the configured repository allowlist
 - Least-privilege credentials for exactly one supported cloud provider
 - A reviewed Chef installer SHA-256 and GitHub runner archive SHA-256
 - Outbound HTTPS from runner subnets, directly or through NAT

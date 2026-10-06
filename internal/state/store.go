@@ -91,6 +91,7 @@ type Store interface {
 	ClaimNext(context.Context, time.Time, int) (*Record, WorkKind, error)
 	SetMaxLiveRunners(int) error
 	ReleaseClaim(context.Context, string, WorkKind) error
+	DeferProvisioningDemand(context.Context, string, string, time.Time) error
 	DeferRateLimitedWork(context.Context, string, WorkKind, string, time.Time, int) error
 	MarkJITCreated(context.Context, string, int64, string) error
 	ClearJIT(context.Context, string) error
@@ -698,6 +699,23 @@ func (s *FileStore) DeferRateLimitedWork(_ context.Context, key string, kind Wor
 			return
 		}
 		record.NextAttemptAt = retryAt.UTC()
+	})
+}
+
+// DeferProvisioningDemand refunds a provision claim while GitHub demand or
+// safe deregistration cannot be confirmed. It never deletes provider resources.
+func (s *FileStore) DeferProvisioningDemand(_ context.Context, key, message string, retryAt time.Time) error {
+	return s.update(key, func(record *Record) {
+		if record.Status == StatusDeleted || record.Status == StatusOrphaned || record.ClaimedWork != WorkProvision {
+			return
+		}
+		record.ClaimedWork = ""
+		releaseProvisionClaim(record)
+		if record.Status != StatusCompleted {
+			record.NextAttemptAt = retryAt.UTC()
+			record.DeferDeletion = true
+		}
+		record.LastError = message
 	})
 }
 
