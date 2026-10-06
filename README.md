@@ -80,7 +80,7 @@ review.
 
 ## Prerequisites
 
-- Go 1.25.13 or newer
+- Go 1.26.8 or newer from a maintained Go release line
 - A Linux controller host with Caddy or another TLS reverse proxy
 - A GitHub App subscribed to `workflow_job` with repository Administration: write
   and Actions: read, scoped to the configured repository allowlist

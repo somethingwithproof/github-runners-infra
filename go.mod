@@ -1,8 +1,8 @@
 module github.com/thomasvincent/github-runners-infra
 
-go 1.25.0
+go 1.26.0
 
-toolchain go1.25.13
+toolchain go1.26.8
 
 require (
 	cloud.google.com/go/compute v1.66.0
