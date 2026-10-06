@@ -142,6 +142,14 @@ func (s *failMarkDeletedStore) MarkDeleted(ctx context.Context, key string) erro
 	return s.Store.MarkDeleted(ctx, key)
 }
 
+func (s *failMarkDeletedStore) FinishDeletedRunner(ctx context.Context, key string, queued bool) (bool, error) {
+	if s.failures > 0 {
+		s.failures--
+		return false, errors.New("injected deleted-state persistence failure")
+	}
+	return s.Store.FinishDeletedRunner(ctx, key, queued)
+}
+
 func (s *failMarkProvisionedStore) MarkProvisioned(ctx context.Context, key, instanceID string, runnerID int64, runnerName string) error {
 	if s.failures > 0 {
 		s.failures--
