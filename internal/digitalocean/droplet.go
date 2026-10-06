@@ -78,7 +78,7 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 	size := cfg.Size
 	if size == "" {
-		size = "s-4vcpu-8gb"
+		size = "s-4vcpu-8gb-amd"
 	}
 	image := cfg.Image
 	if image == "" {

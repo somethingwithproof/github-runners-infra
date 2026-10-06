@@ -177,11 +177,18 @@ Chef installer digest during an intentional upgrade.
 COMPUTE_PROVIDER=digitalocean
 DIGITALOCEAN_TOKEN=read-from-your-secret-manager-at-deploy-time
 DO_REGION=nyc3
-DO_SIZE=s-4vcpu-8gb
+DO_SIZE=s-4vcpu-8gb-amd
 DO_IMAGE=ubuntu-24-04-x64
 DO_VPC_UUID=private-vpc-uuid
 DO_FIREWALL_ID=deny-all-inbound-firewall-id
 ```
+
+Check the selected region's available sizes before deployment. Regional capacity
+can change even when a size remains in the global catalogue. The AMD default
+keeps 4 vCPUs, 8 GB RAM and 160 GB disk; the older `s-4vcpu-8gb` shape was rejected
+in NYC3 with HTTP 422 on 2026-10-06. Set `DO_SIZE` explicitly for a different
+available shape. After correcting an exhausted provisioning attempt, rerun its
+queued workflow to issue fresh job demand rather than editing controller state.
 
 Place runners in a dedicated VPC and configure the required Cloud Firewall with
 no inbound rules. It must target the `runner-controller-${CONTROLLER_ID}` tag so
