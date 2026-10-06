@@ -252,7 +252,7 @@ func newComputeClient(startupCtx, lifetimeCtx context.Context) (webhook.ComputeC
 		}
 		client, err := digitalocean.NewClient(digitalocean.Config{
 			Token: required["DIGITALOCEAN_TOKEN"], Region: envOrDefault("DO_REGION", "nyc3"),
-			Size: envOrDefault("DO_SIZE", "s-4vcpu-8gb"), Image: envOrDefault("DO_IMAGE", "ubuntu-24-04-x64"),
+			Size: envOrDefault("DO_SIZE", "s-4vcpu-8gb-amd"), Image: envOrDefault("DO_IMAGE", "ubuntu-24-04-x64"),
 			SSHFingerprints: splitCSV(os.Getenv("DO_SSH_FINGERPRINTS")), CloudInitPath: cloudInitPath, ControllerID: controllerID,
 			VPCUUID: required["DO_VPC_UUID"], FirewallID: required["DO_FIREWALL_ID"],
 		})
