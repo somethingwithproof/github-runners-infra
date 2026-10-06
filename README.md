@@ -12,6 +12,12 @@ checks that the original job is still queued. API failures defer provisioning.
 Reconciliation also retires runners whose original job has completed, but first
 deregisters through GitHub, which rejects removal while another job is running.
 
+When a JIT runner completes a different job, its VM and registration are cleaned
+up first. The controller then checks the original job: only demand still queued
+gets replacement capacity. Original-job completion is persisted independently and
+wins over stale API observations. An unavailable API defers the demand decision;
+it does not discard the queued job or allocate an unverified replacement.
+
 ## Security architecture
 
 ```text

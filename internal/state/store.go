@@ -56,6 +56,11 @@ type Record struct {
 	// GitHubRunnerOwned proves the ID came from this controller's JIT request.
 	GitHubRunnerOwned bool   `json:"github_runner_owned,omitempty"`
 	InstanceID        string `json:"instance_id,omitempty"`
+	// JobCompleted is authoritative completion of the original demand, distinct
+	// from completion of a different job assigned to this record's JIT runner.
+	JobCompleted bool `json:"job_completed,omitempty"`
+	// RecheckDemand survives owned runner cleanup after cross-job assignment.
+	RecheckDemand bool `json:"recheck_demand,omitempty"`
 	// DeletionAcceptedID records a successful, ownership-verified provider delete.
 	// Bind it to an exact ID so it can never authorize deletion of a replacement.
 	DeletionAcceptedID string `json:"deletion_accepted_id,omitempty"`
@@ -100,6 +105,8 @@ type Store interface {
 	MarkCompleted(context.Context, string) error
 	ScheduleDeletion(context.Context, string) error
 	MarkDeleted(context.Context, string) error
+	FinishDeletedRunner(context.Context, string, bool) (bool, error)
+	DeferReassignmentDemand(context.Context, string, string, time.Time) error
 	MarkDeletionAccepted(context.Context, string, string) error
 	DeferDeletionConfirmation(context.Context, string, string, time.Time) error
 	BeginCleanupAttempt(context.Context, string, int) (int, bool, error)
@@ -442,6 +449,10 @@ func (s *FileStore) reconcileRunnerCompletion(completion Record, now time.Time, 
 	if key, found := s.runnerKeys[runnerIdentity]; found {
 		if record, valid := s.records[key]; valid && completionMatches(record, completion) {
 			s.remember(before, key)
+			if record.JobID == completion.JobID {
+				record.JobCompleted = true
+			}
+			record.RecheckDemand = record.JobID != completion.JobID && !record.JobCompleted
 			if record.ClaimedWork != WorkDelete {
 				record.Status = StatusCompleted
 				record.NextAttemptAt = time.Time{}
@@ -494,6 +505,7 @@ func (s *FileStore) reconcileEventCompletion(completion Record, matchedKey strin
 		s.remember(before, completion.Key)
 		completion.GitHubRunnerID = 0
 		completion.Status = StatusCompleted
+		completion.JobCompleted = true
 		completion.DeferDeletion = true
 		completion.ClaimedWork = ""
 		completion.InstanceID = ""
@@ -505,10 +517,15 @@ func (s *FileStore) reconcileEventCompletion(completion Record, matchedKey strin
 		s.keysDirty = true
 		return
 	}
+	s.remember(before, completion.Key)
+	existing.JobCompleted = true
+	existing.RecheckDemand = false
+	existing.UpdatedAt = now
+	s.records[completion.Key] = existing
+	s.markDirty(completion.Key)
 	if completion.GitHubRunnerID != 0 || existing.Status == StatusDeleted || existing.Status == StatusOrphaned {
 		return
 	}
-	s.remember(before, completion.Key)
 	existing.Status = StatusCompleted
 	existing.DeferDeletion = true
 	existing.NextAttemptAt = completion.NextAttemptAt
@@ -760,6 +777,10 @@ func (s *FileStore) MarkJITCreated(_ context.Context, key string, runnerID int64
 		copy := clone(marker)
 		markerBefore = &copy
 		record.Status = StatusCompleted
+		if record.JobID == marker.JobID {
+			record.JobCompleted = true
+		}
+		record.RecheckDemand = record.JobID != marker.JobID && !record.JobCompleted
 		record.DeferDeletion = false
 		record.NextAttemptAt = time.Time{}
 		marker.Status = StatusDeleted
@@ -1099,6 +1120,65 @@ func (s *FileStore) MarkDeleted(_ context.Context, key string) error {
 		record.DeferDeletion = false
 		record.LastError = ""
 		record.NextAttemptAt = time.Time{}
+	})
+}
+
+// FinishDeletedRunner runs only after owned provider resources and JIT
+// registration are removed. A queued original job may receive a replacement;
+// concurrent authoritative completion always wins over the API observation.
+func (s *FileStore) FinishDeletedRunner(_ context.Context, key string, queued bool) (bool, error) {
+	restored := false
+	err := s.update(key, func(record *Record) {
+		if record.Status == StatusDeleted || record.Status == StatusOrphaned {
+			return
+		}
+		restore := queued && record.RecheckDemand && !record.JobCompleted
+		record.Status = StatusDeleted
+		record.ClaimedWork = ""
+		record.DeferDeletion = false
+		record.LastError = ""
+		record.NextAttemptAt = time.Time{}
+		record.RecheckDemand = false
+		if !restore {
+			return
+		}
+		record.Status = StatusPending
+		record.InstanceID = ""
+		record.DeletionAcceptedID = ""
+		record.GitHubRunnerID = 0
+		record.GitHubRunnerOwned = false
+		record.RunnerName = ""
+		record.ProvisionedAt = time.Time{}
+		record.RegisteredAt = time.Time{}
+		record.ReconciledAt = time.Time{}
+		record.MissingSince = time.Time{}
+		record.GitHubMissingSince = time.Time{}
+		record.MissingChecks = 0
+		record.GitHubMissingChecks = 0
+		record.Attempts = 0
+		record.DeleteAttempts = 0
+		record.ReconcileFailures = 0
+		record.ThrottleFailures = 0
+		record.ProvisionEpoch++
+		restored = true
+	})
+	if err != nil {
+		return false, err
+	}
+	return restored, nil
+}
+
+// DeferReassignmentDemand retains original demand after resource cleanup while
+// a GitHub job-status observation is unavailable, without burning delete retries.
+func (s *FileStore) DeferReassignmentDemand(_ context.Context, key, message string, retryAt time.Time) error {
+	return s.update(key, func(record *Record) {
+		if record.ClaimedWork != WorkDelete {
+			return
+		}
+		record.ClaimedWork = ""
+		releaseDeleteClaim(record)
+		record.LastError = message
+		record.NextAttemptAt = retryAt.UTC()
 	})
 }
 

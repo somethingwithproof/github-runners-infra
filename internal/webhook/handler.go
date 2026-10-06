@@ -698,9 +698,13 @@ func (h *Handler) reconcileProvisionedRunner(ctx context.Context, record state.R
 }
 
 func (h *Handler) reconcileProviderFoundRunner(ctx context.Context, record state.Record) (bool, error) {
-	jobStatus, err := h.githubClient.WorkflowJobStatus(ctx, record.Owner, record.Repository, record.JobID)
-	if err != nil {
-		return false, h.deferReconciliation(ctx, record, fmt.Errorf("check original workflow job: %w", err))
+	jobStatus := gh.JobCompleted
+	if !record.JobCompleted {
+		var err error
+		jobStatus, err = h.githubClient.WorkflowJobStatus(ctx, record.Owner, record.Repository, record.JobID)
+		if err != nil {
+			return false, h.deferReconciliation(ctx, record, fmt.Errorf("check original workflow job: %w", err))
+		}
 	}
 	if jobStatus == gh.JobCompleted {
 		// GitHub may have assigned the original job to another JIT runner.
@@ -1041,6 +1045,24 @@ func (h *Handler) provision(ctx context.Context, record state.Record) {
 }
 
 func (h *Handler) requireQueuedJob(ctx context.Context, record state.Record) bool {
+	current, found, err := h.store.Get(ctx, record.Key)
+	if err == nil && !found {
+		err = fmt.Errorf("job demand record is unavailable")
+	}
+	if err != nil || !found {
+		h.deferDemandCheck(ctx, record, fmt.Errorf("read current job demand: %w", err))
+		return false
+	}
+	if current.JobCompleted {
+		if err := h.removeIdleJIT(ctx, record); err != nil {
+			h.deferDemandCheck(ctx, record, err)
+			return false
+		}
+		if err := h.retireProvisioning(context.WithoutCancel(ctx), record.Key); err != nil {
+			h.provisionFailed(ctx, record, err)
+		}
+		return false
+	}
 	status, err := h.githubClient.WorkflowJobStatus(ctx, record.Owner, record.Repository, record.JobID)
 	if err != nil {
 		h.deferDemandCheck(ctx, record, fmt.Errorf("verify current workflow job demand: %w", err))
@@ -1264,7 +1286,22 @@ func (h *Handler) delete(ctx context.Context, record state.Record) {
 			return
 		}
 	}
-	if err := h.store.MarkDeleted(persistCtx, record.Key); err != nil {
+	queued, err := h.recheckCleanedRunnerDemand(ctx, record)
+	if err != nil {
+		if h.releaseCanceledDelete(ctx, persistCtx, record, err) {
+			return
+		}
+		retryAt := time.Now().Add(time.Minute)
+		if resetAt, limited := gh.RateLimitReset(err); limited {
+			retryAt = clampThrottleRetryAt(resetAt)
+		}
+		if stateErr := h.store.DeferReassignmentDemand(persistCtx, record.Key, err.Error(), retryAt); stateErr != nil {
+			log.Printf("ERROR: defer reassigned runner demand for %s: %v", record.Key, stateErr)
+		}
+		return
+	}
+	restored, err := h.store.FinishDeletedRunner(persistCtx, record.Key, queued)
+	if err != nil {
 		log.Printf("ERROR: persist deleted runner %s: %v", record.Key, err)
 		retryAt := time.Now().Add(retryDelay(record.DeleteAttempts))
 		if stateErr := h.store.MarkDeleteFailed(persistCtx, record.Key, err.Error(), retryAt, h.maxAttempts); stateErr != nil {
@@ -1277,6 +1314,31 @@ func (h *Handler) delete(ctx context.Context, record state.Record) {
 		return
 	}
 	log.Printf("Deleted owned runner instance %s for %s", record.InstanceID, record.Key)
+	if restored {
+		log.Printf("Restored queued original job demand for %s after reassigned runner completion", record.Key)
+		h.signal()
+	}
+}
+
+func (h *Handler) recheckCleanedRunnerDemand(ctx context.Context, record state.Record) (bool, error) {
+	if !record.RecheckDemand || record.JobCompleted {
+		return false, nil
+	}
+	current, found, err := h.store.Get(ctx, record.Key)
+	if err != nil {
+		return false, fmt.Errorf("read reassigned demand: %w", err)
+	}
+	if !found {
+		return false, fmt.Errorf("reassigned demand record is unavailable")
+	}
+	if current.JobCompleted {
+		return false, nil
+	}
+	status, err := h.githubClient.WorkflowJobStatus(ctx, record.Owner, record.Repository, record.JobID)
+	if err != nil {
+		return false, fmt.Errorf("confirm original job demand after reassignment: %w", err)
+	}
+	return status == gh.JobQueued, nil
 }
 
 func (h *Handler) releaseCanceledDelete(ctx, persistCtx context.Context, record state.Record, err error) bool {
