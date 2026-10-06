@@ -61,6 +61,7 @@ type RepoInfo struct {
 // GitHubClient is the narrow control-plane contract required by the worker.
 type GitHubClient interface {
 	TrustedWorkflowRun(context.Context, string, string, int64) (bool, error)
+	WorkflowJobStatus(context.Context, string, string, int64) (gh.JobStatus, error)
 	GenerateRepoJITConfig(context.Context, string, string, string, int64, []string) (gh.JITConfig, error)
 	RepoRunnerStatus(context.Context, string, string, int64) (gh.RunnerStatus, error)
 	RemoveRepoRunner(context.Context, string, string, int64) error
@@ -697,6 +698,19 @@ func (h *Handler) reconcileProvisionedRunner(ctx context.Context, record state.R
 }
 
 func (h *Handler) reconcileProviderFoundRunner(ctx context.Context, record state.Record) (bool, error) {
+	jobStatus, err := h.githubClient.WorkflowJobStatus(ctx, record.Owner, record.Repository, record.JobID)
+	if err != nil {
+		return false, h.deferReconciliation(ctx, record, fmt.Errorf("check original workflow job: %w", err))
+	}
+	if jobStatus == gh.JobCompleted {
+		// GitHub may have assigned the original job to another JIT runner.
+		// Deregister before scheduling deletion: GitHub rejects a busy runner,
+		// protecting any different job subsequently assigned to this instance.
+		if err := h.removeIdleJIT(ctx, record); err != nil {
+			return false, h.deferReconciliation(ctx, record, err)
+		}
+		return false, h.store.ScheduleDeletion(ctx, record.Key)
+	}
 	if record.MissingChecks != 0 {
 		if err := h.store.ClearProviderMissing(ctx, record.Key); err != nil {
 			return false, fmt.Errorf("clear provider-missing observations for %s: %w", record.Key, err)
@@ -965,6 +979,9 @@ func (h *Handler) provision(ctx context.Context, record state.Record) {
 		h.signal()
 		return
 	}
+	if !h.requireQueuedJob(ctx, record) {
+		return
+	}
 	if record.GitHubRunnerID != 0 && record.GitHubRunnerOwned {
 		if err := h.githubClient.RemoveRepoRunner(ctx, record.Owner, record.Repository, record.GitHubRunnerID); err != nil {
 			h.provisionFailed(ctx, record, fmt.Errorf("remove stale JIT runner %d: %w", record.GitHubRunnerID, err))
@@ -996,6 +1013,10 @@ func (h *Handler) provision(ctx context.Context, record state.Record) {
 	record.GitHubRunnerID = jit.RunnerID
 	record.GitHubRunnerOwned = true
 	record.RunnerName = runnerName
+	// A different online runner may have taken this job during JIT creation.
+	if !h.requireQueuedJob(ctx, record) {
+		return
+	}
 
 	instance, err := h.computeClient.CreateRunner(ctx, compute.RunnerParams{
 		JobKey:              record.Key,
@@ -1017,6 +1038,81 @@ func (h *Handler) provision(ctx context.Context, record state.Record) {
 	}
 	log.Printf("Provisioned runner %s (instance %s) for %s/%s job %d", runnerName, instance.ID, record.Owner, record.Repository, record.JobID)
 	h.signal()
+}
+
+func (h *Handler) requireQueuedJob(ctx context.Context, record state.Record) bool {
+	status, err := h.githubClient.WorkflowJobStatus(ctx, record.Owner, record.Repository, record.JobID)
+	if err != nil {
+		h.deferDemandCheck(ctx, record, fmt.Errorf("verify current workflow job demand: %w", err))
+		return false
+	}
+	if status == gh.JobQueued {
+		return true
+	}
+	if err := h.removeIdleJIT(ctx, record); err != nil {
+		h.deferDemandCheck(ctx, record, err)
+		return false
+	}
+	if err := h.retireProvisioning(context.WithoutCancel(ctx), record.Key); err != nil {
+		h.provisionFailed(ctx, record, fmt.Errorf("retire job without queued demand: %w", err))
+		return false
+	}
+	log.Printf("Retired stale runner demand for %s: job is %s", record.Key, status)
+	h.signal()
+	return false
+}
+
+func (h *Handler) removeIdleJIT(ctx context.Context, record state.Record) error {
+	if record.GitHubRunnerID == 0 || !record.GitHubRunnerOwned {
+		return nil
+	}
+	// GitHub atomically rejects deregistration while another job is running.
+	if err := h.githubClient.RemoveRepoRunner(ctx, record.Owner, record.Repository, record.GitHubRunnerID); err != nil {
+		return fmt.Errorf("deregister runner without original job demand: %w", err)
+	}
+	if err := h.store.ClearJIT(context.WithoutCancel(ctx), record.Key); err != nil {
+		return fmt.Errorf("clear retired runner registration: %w", err)
+	}
+	return nil
+}
+
+func (h *Handler) deferDemandCheck(ctx context.Context, record state.Record, cause error) {
+	if ctx.Err() != nil {
+		h.provisionFailed(ctx, record, cause)
+		return
+	}
+	retryAt := time.Now().Add(time.Minute)
+	if resetAt, limited := gh.RateLimitReset(cause); limited {
+		retryAt = clampThrottleRetryAt(resetAt)
+	}
+	if err := h.store.DeferProvisioningDemand(context.WithoutCancel(ctx), record.Key, cause.Error(), retryAt); err != nil {
+		log.Printf("ERROR: defer job demand check for %s: %v", record.Key, err)
+	}
+	log.Printf("WARN: retained runner demand for %s pending GitHub confirmation: %v", record.Key, cause)
+	h.signal()
+}
+
+func (h *Handler) retireProvisioning(ctx context.Context, key string) error {
+	record, found, err := h.store.Get(ctx, key)
+	if err != nil {
+		return fmt.Errorf("read obsolete provision: %w", err)
+	}
+	if !found {
+		return fmt.Errorf("obsolete provision record not found")
+	}
+	if record.InstanceID == "" {
+		// Both gates run before CreateRunner, and the JIT registration has
+		// already been safely removed. No provider identity needs cleanup.
+		return h.store.MarkDeleted(ctx, key)
+	}
+	// Completion must become authoritative before releasing this worker's claim.
+	if err := h.store.MarkCompleted(ctx, key); err != nil {
+		return fmt.Errorf("mark obsolete provision completed: %w", err)
+	}
+	if err := h.store.ReleaseClaim(ctx, key, state.WorkProvision); err != nil {
+		return fmt.Errorf("release obsolete provision claim: %w", err)
+	}
+	return h.store.ScheduleDeletion(ctx, key)
 }
 
 func (h *Handler) provisionFailed(ctx context.Context, record state.Record, err error) {

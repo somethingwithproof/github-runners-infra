@@ -67,7 +67,7 @@ func run() error {
 		InstallationID:      cfg.installationID,
 		PrivateKey:          privateKey,
 		AllowedRepositories: cfg.allowedRepositories,
-		ReadWorkflowRuns:    len(cfg.allowedPublicRepositories) != 0,
+		ReadWorkflowRuns:    true, // Current job demand always requires Actions read.
 	}
 	if err := validateGitHubTokenScope(processCtx, githubClient.ValidateTokenScope); err != nil {
 		return fmt.Errorf("validate GitHub token scope: %w", err)

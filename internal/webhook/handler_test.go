@@ -24,16 +24,36 @@ import (
 const testWebhookSecret = "unit-test-webhook-secret-not-a-credential"
 
 type fakeGitHub struct {
-	workflowTrusted bool
-	workflowErr     error
-	mu              sync.Mutex
-	generated       int
-	generateErr     error
-	removed         []int64
-	removeErr       map[int64]error
-	runnerStatus    map[int64]gh.RunnerStatus
-	runnerStateErr  error
-	statusChecks    int
+	jobStates        map[int64]gh.JobStatus
+	jobStateErr      error
+	jobStateSequence []gh.JobStatus
+	workflowTrusted  bool
+	workflowErr      error
+	mu               sync.Mutex
+	generated        int
+	generateErr      error
+	removed          []int64
+	removeErr        map[int64]error
+	runnerStatus     map[int64]gh.RunnerStatus
+	runnerStateErr   error
+	statusChecks     int
+}
+
+func (f *fakeGitHub) WorkflowJobStatus(_ context.Context, _, _ string, id int64) (gh.JobStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.jobStateErr != nil {
+		return "", f.jobStateErr
+	}
+	if len(f.jobStateSequence) > 0 {
+		status := f.jobStateSequence[0]
+		f.jobStateSequence = f.jobStateSequence[1:]
+		return status, nil
+	}
+	if status, found := f.jobStates[id]; found {
+		return status, nil
+	}
+	return gh.JobQueued, nil
 }
 
 func (f *fakeGitHub) TrustedWorkflowRun(_ context.Context, _, _ string, runID int64) (bool, error) {
