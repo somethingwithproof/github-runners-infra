@@ -1,8 +1,10 @@
 # Multi-cloud GitHub Actions JIT Runners
 
 [![CI](https://github.com/somethingwithproof/github-runners-infra/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/somethingwithproof/github-runners-infra/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
+[![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=somethingwithproof_github-runners-infra&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=somethingwithproof_github-runners-infra)
 [![Go minimum](https://img.shields.io/badge/Go_minimum-1.26.8-blue)](./go.mod)
+[![License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/somethingwithproof/github-runners-infra/badge)](https://scorecard.dev/viewer/?uri=github.com/somethingwithproof/github-runners-infra)
 
 A Go controller that creates one-job, repository-scoped GitHub Actions runners
 on DigitalOcean, AWS EC2, Google Compute Engine, or Azure VMs. GitHub webhook
