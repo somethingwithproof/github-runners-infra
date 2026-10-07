@@ -1,5 +1,9 @@
 # Multi-cloud GitHub Actions JIT Runners
 
+[![CI](https://github.com/somethingwithproof/github-runners-infra/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/somethingwithproof/github-runners-infra/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
+[![Go minimum](https://img.shields.io/badge/Go_minimum-1.26.8-blue)](./go.mod)
+
 A Go controller that creates one-job, repository-scoped GitHub Actions runners
 on DigitalOcean, AWS EC2, Google Compute Engine, or Azure VMs. GitHub webhook
 deliveries are persisted before acknowledgement, provisioning is retried after
