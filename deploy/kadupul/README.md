@@ -41,7 +41,7 @@ The pool uses a dedicated sfo3 VPC and a firewall targeting
 access. Container builds need HTTP for their signed Debian package repositories;
 the VM's own APT mirrors use HTTPS.
 APT mirrors use HTTPS. The size is `c-8` (CPU-Optimized, dedicated vCPUs),
-capped at 16 live runners with 8 controller workers. Jobs beyond that limit remain in durable
+capped at 32 live runners with 8 controller workers. Jobs beyond that limit remain in durable
 pending state. Idle runner capacity is zero; the existing controller host stays
 on. The VM must be deleted to end billing; power-off alone is insufficient.
 
@@ -53,6 +53,11 @@ fresh sfo3 droplets (sysbench and fio, 2026-11-12), `c-8` did 7.6 times as many
 reads, and 1.8 times the single-thread CPU rate. Eight-thread CPU throughput was
 about the same. The hourly price is $0.25 against $0.167, about 1.5 times as
 much. `c-8` has a 100 GB disk against 320 GB.
+
+The cap was 16. With a dozen open pull requests, each starting about 40
+jobs, jobs waited about 50 minutes for a runner. Runners exist only while
+a job runs, so 32 `c-8` runners cost at most about $8 an hour while CI is
+busy and nothing when it is idle. The account limit is 100 droplets.
 
 Deployment configuration lives in `/etc/github-runners/kadupul-env` with mode
 0600, state in `/var/lib/github-runners-kadupul`, and the private key remains on
