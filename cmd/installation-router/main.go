@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Thomas Vincent <thomasvincent@gmail.com>
+// SPDX-License-Identifier: MIT
+
 // The router selects a local controller by installation identity. Each
 // controller independently verifies the original body signature and identity.
 package main
