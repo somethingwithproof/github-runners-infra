@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Thomas Vincent <thomasvincent@gmail.com>
+// SPDX-License-Identifier: MIT
+
 // Package gcp provisions ephemeral GitHub Actions runners on Compute Engine.
 package gcp
 

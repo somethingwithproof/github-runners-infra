@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Thomas Vincent <thomasvincent@gmail.com>
+// SPDX-License-Identifier: MIT
+
 // Package aws provisions ephemeral GitHub Actions runners on Amazon EC2.
 package aws
 
