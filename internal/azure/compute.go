@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Thomas Vincent <thomasvincent@gmail.com>
+// SPDX-License-Identifier: MIT
+
 // Package azure provisions ephemeral GitHub Actions runners on Azure VMs.
 package azure
 
