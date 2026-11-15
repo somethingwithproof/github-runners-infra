@@ -39,8 +39,8 @@ and launches the runner with node/npm/npx on PATH for CodeQL TypeScript extracti
 The pool uses a dedicated sfo3 VPC and a firewall targeting
 `runner-controller-kadupul`, with no inbound rules and HTTP/HTTPS/DNS outbound
 access. Container builds need HTTP for their signed Debian package repositories;
-the VM's own APT mirrors use HTTPS.
-APT mirrors use HTTPS. The size is `c-8` (CPU-Optimized, dedicated vCPUs),
+the VM's own APT mirrors use HTTPS. The configured size is `c-8`
+(CPU-Optimized, dedicated vCPUs),
 capped at 32 live runners with 8 controller workers. Jobs beyond that limit remain in durable
 pending state. Idle runner capacity is zero; the existing controller host stays
 on. The VM must be deleted to end billing; power-off alone is insufficient.
@@ -62,7 +62,10 @@ busy and nothing when it is idle. The account limit is 100 droplets.
 Deployment configuration lives in `/etc/github-runners/kadupul-env` with mode
 0600, state in `/var/lib/github-runners-kadupul`, and the private key remains on
 the controller. See `env.example`; populate credentials from protected runtime
-configuration, never from repository files. The separate systemd units are
+configuration, never from repository files. `env.example` does not change a
+running controller: to change the runner size, set `DO_SIZE` in
+`/etc/github-runners/kadupul-env` and restart `kadupul-webhook`. Runners created
+after the restart use the new size. The separate systemd units are
 `kadupul-webhook` and `installation-router`; Caddy forwards `/webhook` to
 127.0.0.1:8082. The router sends approved installation identities to the legacy
 controller on 8080 or Kadupul on 8081. Legacy callbacks retain their existing
