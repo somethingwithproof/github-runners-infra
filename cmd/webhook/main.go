@@ -258,6 +258,7 @@ func newComputeClient(startupCtx, lifetimeCtx context.Context) (webhook.ComputeC
 			Size: envOrDefault("DO_SIZE", "s-4vcpu-8gb-amd"), Image: envOrDefault("DO_IMAGE", "ubuntu-24-04-x64"),
 			SSHFingerprints: splitCSV(os.Getenv("DO_SSH_FINGERPRINTS")), CloudInitPath: cloudInitPath, ControllerID: controllerID,
 			VPCUUID: required["DO_VPC_UUID"], FirewallID: required["DO_FIREWALL_ID"],
+			ProjectID: os.Getenv("DO_PROJECT_ID"),
 		})
 		if err != nil {
 			return nil, noClose, err

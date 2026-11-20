@@ -368,3 +368,69 @@ func TestSweepOrphanedRunnersPreservesKnownAndDeletesOldUnknown(t *testing.T) {
 		t.Fatalf("sweep = %d, %v, deleted=%v", deleted, err, deletedIDs)
 	}
 }
+
+func TestCreateRunnerAssignsConfiguredProject(t *testing.T) {
+	params := compute.RunnerParams{JobKey: "org/repo:9", ProvisionEpoch: 1, RunnerName: "display-name"}
+	var assigned []string
+	httpClient := &http.Client{Transport: doRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/v2/droplets":
+			return jsonResponse(http.StatusOK, `{"droplets":[]}`), nil
+		case request.Method == http.MethodGet && request.URL.Path == "/v2/firewalls":
+			return jsonResponse(http.StatusOK, `{"firewalls":[{"id":"firewall-id","tags":["runner-controller-test"],"inbound_rules":[]}]}`), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/v2/droplets":
+			return jsonResponse(http.StatusAccepted, `{"droplet":{"id":91,"name":"runner"}}`), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/v2/projects/project-uuid/resources":
+			var body struct {
+				Resources []string `json:"resources"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			assigned = body.Resources
+			return jsonResponse(http.StatusOK, `{"resources":[]}`), nil
+		default:
+			t.Fatalf("unexpected request %s %s", request.Method, request.URL.Path)
+			return nil, nil
+		}
+	})}
+	client := &Client{
+		client: godo.NewClient(httpClient), cloudInitTmpl: template.Must(template.New("cloud-init").Parse("bootstrap")),
+		region: "nyc3", size: "s-1vcpu-1gb", image: "ubuntu", controllerTag: "runner-controller-test",
+		vpcUUID: "vpc-id", firewallID: "firewall-id", projectID: "project-uuid",
+	}
+	if _, err := client.CreateRunner(context.Background(), params); err != nil {
+		t.Fatalf("CreateRunner() error = %v", err)
+	}
+	if len(assigned) != 1 || assigned[0] != "do:droplet:91" {
+		t.Fatalf("assigned resources = %v, want [do:droplet:91]", assigned)
+	}
+}
+
+func TestCreateRunnerSucceedsWhenProjectAssignmentFails(t *testing.T) {
+	params := compute.RunnerParams{JobKey: "org/repo:10", ProvisionEpoch: 1, RunnerName: "display-name"}
+	httpClient := &http.Client{Transport: doRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/v2/droplets":
+			return jsonResponse(http.StatusOK, `{"droplets":[]}`), nil
+		case request.Method == http.MethodGet && request.URL.Path == "/v2/firewalls":
+			return jsonResponse(http.StatusOK, `{"firewalls":[{"id":"firewall-id","tags":["runner-controller-test"],"inbound_rules":[]}]}`), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/v2/droplets":
+			return jsonResponse(http.StatusAccepted, `{"droplet":{"id":92,"name":"runner"}}`), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/v2/projects/project-uuid/resources":
+			return jsonResponse(http.StatusForbidden, `{"id":"forbidden","message":"no access"}`), nil
+		default:
+			t.Fatalf("unexpected request %s %s", request.Method, request.URL.Path)
+			return nil, nil
+		}
+	})}
+	client := &Client{
+		client: godo.NewClient(httpClient), cloudInitTmpl: template.Must(template.New("cloud-init").Parse("bootstrap")),
+		region: "nyc3", size: "s-1vcpu-1gb", image: "ubuntu", controllerTag: "runner-controller-test",
+		vpcUUID: "vpc-id", firewallID: "firewall-id", projectID: "project-uuid",
+	}
+	instance, err := client.CreateRunner(context.Background(), params)
+	if err != nil || instance.ID != "92" {
+		t.Fatalf("CreateRunner() = %#v, %v; want droplet 92 despite assignment failure", instance, err)
+	}
+}
