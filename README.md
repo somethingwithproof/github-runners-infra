@@ -187,6 +187,8 @@ DO_SIZE=s-4vcpu-8gb-amd
 DO_IMAGE=ubuntu-24-04-x64
 DO_VPC_UUID=private-vpc-uuid
 DO_FIREWALL_ID=deny-all-inbound-firewall-id
+# Optional: project UUID that runner droplets are assigned to for billing.
+DO_PROJECT_ID=
 ```
 
 Check the selected region's available sizes before deployment. Regional capacity
@@ -196,6 +198,10 @@ in NYC3 with HTTP 422 on 2026-10-06. Set `DO_SIZE` explicitly for a different
 available shape. After correcting an exhausted provisioning attempt, rerun its
 queued workflow to issue fresh job demand rather than editing controller state.
 
+Without `DO_PROJECT_ID`, runner droplets land in the account's default project.
+When it is set, each new droplet is assigned to that project after creation; an
+assignment failure is logged and does not fail the job.
+
 Place runners in a dedicated VPC and configure the required Cloud Firewall with
 no inbound rules. It must target the `runner-controller-${CONTROLLER_ID}` tag so
 it applies as each tagged Droplet is created; the controller verifies both the
@@ -204,7 +210,9 @@ password SSH access. For a custom-scope token, grant `droplet:create`,
 `droplet:read`, `droplet:delete`, `tag:create`, `tag:read`, `vpc:read`, and
 `firewall:read`. DigitalOcean also requires `regions:read`, `sizes:read`,
 `actions:read`, and `image:read` with `droplet:create`. The controller only
-reads the preconfigured Firewall; it does not need Firewall write scopes. Do
+reads the preconfigured Firewall; it does not need Firewall write scopes. When
+`DO_PROJECT_ID` is set, also grant `project:assign_resource`; without it the
+assignment is logged as failed and the droplet stays in the default project. Do
 not grant unrelated account or project permissions.
 
 ### AWS EC2

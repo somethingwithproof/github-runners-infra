@@ -34,6 +34,7 @@ type Client struct {
 	controllerTag   string
 	vpcUUID         string
 	firewallID      string
+	projectID       string
 	recoveryTimeout time.Duration
 	recoveryPoll    time.Duration
 }
@@ -49,6 +50,9 @@ type Config struct {
 	ControllerID    string
 	VPCUUID         string
 	FirewallID      string
+	// ProjectID optionally assigns runner droplets to a DigitalOcean project
+	// so billing is attributed correctly; unset leaves the account default.
+	ProjectID string
 }
 
 func (c *Client) Provider() string { return "digitalocean" }
@@ -104,6 +108,7 @@ func NewClient(cfg Config) (*Client, error) {
 		controllerTag:   "runner-controller-" + cfg.ControllerID,
 		vpcUUID:         cfg.VPCUUID,
 		firewallID:      cfg.FirewallID,
+		projectID:       strings.TrimSpace(cfg.ProjectID),
 		recoveryTimeout: 15 * time.Second,
 		recoveryPoll:    2 * time.Second,
 	}, nil
@@ -160,6 +165,7 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 			return nil, errors.Join(fmt.Errorf("create droplet: %w", err), fmt.Errorf("reconcile ambiguous create: %w", recoveryErr))
 		}
 		if recovered != nil {
+			c.assignProject(ctx, recovered)
 			return &compute.RunnerInstance{ID: fmt.Sprint(recovered.ID), Name: recovered.Name}, nil
 		}
 		if confirmedAbsent {
@@ -169,7 +175,32 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 	}
 
 	log.Printf("Created runner droplet %s (ID: %d)", desiredName, droplet.ID)
+	c.assignProject(ctx, droplet)
 	return &compute.RunnerInstance{ID: fmt.Sprint(droplet.ID), Name: droplet.Name}, nil
+}
+
+// assignProject moves a runner droplet into the configured project. Project
+// membership only affects billing attribution, so a failure is logged rather
+// than failing the job.
+func (c *Client) assignProject(ctx context.Context, droplet *godo.Droplet) {
+	if c.projectID == "" || droplet == nil {
+		return
+	}
+	resources, _, err := c.client.Projects.AssignResources(context.WithoutCancel(ctx), c.projectID, droplet)
+	if err != nil {
+		log.Printf("Assign runner droplet %d to project %s: %v", droplet.ID, c.projectID, err)
+		return
+	}
+	// The API answers 200 even when a resource was not assigned; the
+	// per-resource status (for example not_found or service_down) says so.
+	for _, resource := range resources {
+		switch resource.Status {
+		case "", "ok", "assigned", "already_assigned":
+		default:
+			log.Printf("Assign runner droplet %d to project %s: resource %s status %s",
+				droplet.ID, c.projectID, resource.URN, resource.Status)
+		}
+	}
 }
 
 func (c *Client) reconcileAmbiguousCreate(ctx context.Context, jobKey, name string) (*godo.Droplet, bool, error) {
