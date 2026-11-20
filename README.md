@@ -210,7 +210,9 @@ password SSH access. For a custom-scope token, grant `droplet:create`,
 `droplet:read`, `droplet:delete`, `tag:create`, `tag:read`, `vpc:read`, and
 `firewall:read`. DigitalOcean also requires `regions:read`, `sizes:read`,
 `actions:read`, and `image:read` with `droplet:create`. The controller only
-reads the preconfigured Firewall; it does not need Firewall write scopes. Do
+reads the preconfigured Firewall; it does not need Firewall write scopes. When
+`DO_PROJECT_ID` is set, also grant `project:assign_resource`; without it the
+assignment is logged as failed and the droplet stays in the default project. Do
 not grant unrelated account or project permissions.
 
 ### AWS EC2

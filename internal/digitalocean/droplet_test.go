@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -432,5 +433,40 @@ func TestCreateRunnerSucceedsWhenProjectAssignmentFails(t *testing.T) {
 	instance, err := client.CreateRunner(context.Background(), params)
 	if err != nil || instance.ID != "92" {
 		t.Fatalf("CreateRunner() = %#v, %v; want droplet 92 despite assignment failure", instance, err)
+	}
+}
+
+func TestCreateRunnerLogsRejectedProjectAssignment(t *testing.T) {
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	params := compute.RunnerParams{JobKey: "org/repo:11", ProvisionEpoch: 1, RunnerName: "display-name"}
+	httpClient := &http.Client{Transport: doRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/v2/droplets":
+			return jsonResponse(http.StatusOK, `{"droplets":[]}`), nil
+		case request.Method == http.MethodGet && request.URL.Path == "/v2/firewalls":
+			return jsonResponse(http.StatusOK, `{"firewalls":[{"id":"firewall-id","tags":["runner-controller-test"],"inbound_rules":[]}]}`), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/v2/droplets":
+			return jsonResponse(http.StatusAccepted, `{"droplet":{"id":93,"name":"runner"}}`), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/v2/projects/project-uuid/resources":
+			return jsonResponse(http.StatusOK, `{"resources":[{"urn":"do:droplet:93","status":"service_down"}]}`), nil
+		default:
+			t.Fatalf("unexpected request %s %s", request.Method, request.URL.Path)
+			return nil, nil
+		}
+	})}
+	client := &Client{
+		client: godo.NewClient(httpClient), cloudInitTmpl: template.Must(template.New("cloud-init").Parse("bootstrap")),
+		region: "nyc3", size: "s-1vcpu-1gb", image: "ubuntu", controllerTag: "runner-controller-test",
+		vpcUUID: "vpc-id", firewallID: "firewall-id", projectID: "project-uuid",
+	}
+	instance, err := client.CreateRunner(context.Background(), params)
+	if err != nil || instance.ID != "93" {
+		t.Fatalf("CreateRunner() = %#v, %v; want droplet 93 despite rejected assignment", instance, err)
+	}
+	if !strings.Contains(logs.String(), "do:droplet:93 status service_down") {
+		t.Fatalf("log = %q, want the rejected resource status", logs.String())
 	}
 }

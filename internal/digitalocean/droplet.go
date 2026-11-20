@@ -186,8 +186,20 @@ func (c *Client) assignProject(ctx context.Context, droplet *godo.Droplet) {
 	if c.projectID == "" || droplet == nil {
 		return
 	}
-	if _, _, err := c.client.Projects.AssignResources(context.WithoutCancel(ctx), c.projectID, droplet); err != nil {
+	resources, _, err := c.client.Projects.AssignResources(context.WithoutCancel(ctx), c.projectID, droplet)
+	if err != nil {
 		log.Printf("Assign runner droplet %d to project %s: %v", droplet.ID, c.projectID, err)
+		return
+	}
+	// The API answers 200 even when a resource was not assigned; the
+	// per-resource status (for example not_found or service_down) says so.
+	for _, resource := range resources {
+		switch resource.Status {
+		case "", "ok", "assigned", "already_assigned":
+		default:
+			log.Printf("Assign runner droplet %d to project %s: resource %s status %s",
+				droplet.ID, c.projectID, resource.URN, resource.Status)
+		}
 	}
 }
 
