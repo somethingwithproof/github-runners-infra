@@ -39,8 +39,8 @@ and launches the runner with node/npm/npx on PATH for CodeQL TypeScript extracti
 The pool uses a dedicated sfo3 VPC and a firewall targeting
 `runner-controller-kadupul`, with no inbound rules and HTTP/HTTPS/DNS outbound
 access. Container builds need HTTP for their signed Debian package repositories;
-the VM's own APT mirrors use HTTPS. The configured size is `c-8`
-(CPU-Optimized, dedicated vCPUs),
+the VM's own APT mirrors use HTTPS. The configured size is `c-4`
+(CPU-Optimized, 4 dedicated vCPUs, 8 GB, 50 GB disk),
 capped at 32 live runners with 8 controller workers. Jobs beyond that limit remain in durable
 pending state. Idle runner capacity is zero; the existing controller host stays
 on. The VM must be deleted to end billing; power-off alone is insufficient.
@@ -56,8 +56,13 @@ much. `c-8` has a 100 GB disk against 320 GB.
 
 The cap was 16. With a dozen open pull requests, each starting about 40
 jobs, jobs waited about 50 minutes for a runner. Runners exist only while
-a job runs, so 32 `c-8` runners cost at most about $8 an hour while CI is
-busy and nothing when it is idle. The account limit is 100 droplets.
+a job runs, so 32 runners cost at most about $4 an hour on `c-4` while CI
+is busy and nothing when it is idle. The account limit is 100 droplets.
+
+On 2026-11-19 the size went from `c-8` to `c-4` to halve the hourly cost
+($0.125 against $0.25). It keeps the CPU-Optimized class that the benchmark above
+favored, but halves the vCPUs, memory and disk. If shards start hitting the
+60-minute limit again, or disk runs out, go back to `c-8`.
 
 Deployment configuration lives in `/etc/github-runners/kadupul-env` with mode
 0600, state in `/var/lib/github-runners-kadupul`, and the private key remains on
