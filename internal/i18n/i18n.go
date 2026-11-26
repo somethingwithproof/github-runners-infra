@@ -19,6 +19,27 @@ var localeFS embed.FS
 var supported = []string{
 	"en", "de", "es", "fr", "it", "pt-BR", "nl", "ru", "uk",
 	"ja", "ko", "zh-CN", "zh-TW", "ar", "hi", "pl", "tr", "sv", "vi", "id",
+	"af-ZA", "am-ET", "ar-EG", "ar-MA", "fr-MA", "fr-SN", "ha-NG", "ig-NG",
+	"mg-MG", "rw-RW", "so-SO", "sw-KE", "xh-ZA", "yo-NG", "zu-ZA",
+	"bn", "fa", "he", "mr", "ta", "te", "th", "ur", "ms", "fil",
+}
+
+var baseAliases = map[string]string{
+	"af": "af-ZA",
+	"am": "am-ET",
+	"ha": "ha-NG",
+	"ig": "ig-NG",
+	"in": "id",
+	"iw": "he",
+	"mg": "mg-MG",
+	"pt": "pt-BR",
+	"rw": "rw-RW",
+	"so": "so-SO",
+	"sw": "sw-KE",
+	"tl": "fil",
+	"xh": "xh-ZA",
+	"yo": "yo-NG",
+	"zu": "zu-ZA",
 }
 
 // Catalog holds resolved message strings for a single locale with English fallback.
@@ -36,7 +57,7 @@ var (
 	defaultCatalog *Catalog
 )
 
-// SupportedLocales returns a copy of the 20 supported canonical locale identifiers.
+// SupportedLocales returns a copy of the 45 supported canonical locale identifiers.
 func SupportedLocales() []string {
 	out := make([]string, len(supported))
 	copy(out, supported)
@@ -45,7 +66,12 @@ func SupportedLocales() []string {
 
 // IsRTL reports whether locale uses right-to-left script direction.
 func IsRTL(locale string) bool {
-	return ResolveLocale(locale) == "ar"
+	switch ResolveLocale(locale) {
+	case "ar", "ar-EG", "ar-MA", "fa", "he", "ur":
+		return true
+	default:
+		return false
+	}
 }
 
 // ResolveLocale maps a POSIX or BCP-47 locale tag to a supported canonical locale.
@@ -70,8 +96,6 @@ func ResolveLocale(tag string) string {
 		return "zh-TW"
 	case "zh", "zh-cn", "zh-sg", "zh-hans", "zh-hans-cn", "zh-hans-sg":
 		return "zh-CN"
-	case "pt", "pt-br":
-		return "pt-BR"
 	}
 
 	for _, loc := range supported {
@@ -93,8 +117,8 @@ func ResolveLocale(tag string) string {
 		}
 		return "zh-CN"
 	}
-	if base == "pt" {
-		return "pt-BR"
+	if mapped, ok := baseAliases[base]; ok {
+		return mapped
 	}
 	for _, loc := range supported {
 		if strings.EqualFold(loc, base) {
@@ -162,7 +186,7 @@ func (c *Catalog) Locale() string {
 
 // IsRTL reports whether this catalog uses right-to-left script direction.
 func (c *Catalog) IsRTL() bool {
-	return c.locale == "ar"
+	return IsRTL(c.locale)
 }
 
 // T looks up key and formats it with args when args are provided.
