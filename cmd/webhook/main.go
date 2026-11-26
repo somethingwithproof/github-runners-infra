@@ -6,7 +6,7 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
+	"flag"
 	"log"
 	"math/rand/v2"
 	"net/http"
@@ -22,11 +22,19 @@ import (
 	"github.com/thomasvincent/github-runners-infra/internal/digitalocean"
 	"github.com/thomasvincent/github-runners-infra/internal/gcp"
 	gh "github.com/thomasvincent/github-runners-infra/internal/github"
+	"github.com/thomasvincent/github-runners-infra/internal/i18n"
 	"github.com/thomasvincent/github-runners-infra/internal/state"
 	"github.com/thomasvincent/github-runners-infra/internal/webhook"
 )
 
 func main() {
+	fs := flag.NewFlagSet("webhook", flag.ContinueOnError)
+	lang := fs.String("lang", "", i18n.T("flag.lang"))
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		os.Exit(2)
+	}
+	i18n.Init(*lang)
+
 	if err := run(); err != nil {
 		log.Printf("ERROR: %v", err)
 		os.Exit(1)
@@ -38,22 +46,22 @@ func run() error {
 	defer stopProcess()
 	cfg, err := loadRuntimeConfig()
 	if err != nil {
-		return fmt.Errorf("invalid configuration: %w", err)
+		return i18n.Wrap(err, "webhook.err.invalid_config", err)
 	}
 	privateKey, err := os.ReadFile(cfg.privateKeyPath)
 	if err != nil {
-		return fmt.Errorf("read GitHub App private key file: %w", err)
+		return i18n.Wrap(err, "webhook.err.read_private_key", err)
 	}
 	stateStore, err := state.OpenFileStore(
 		cfg.stateFile,
 		state.WithDeletedRetention(cfg.deletedRetention),
 	)
 	if err != nil {
-		return fmt.Errorf("open lifecycle state: %w", err)
+		return i18n.Wrap(err, "webhook.err.open_state", err)
 	}
 	defer func() {
 		if err := stateStore.Close(); err != nil {
-			log.Printf("WARN: close lifecycle state: %v", err)
+			log.Print(i18n.T("webhook.warn.close_state", err))
 		}
 	}()
 
@@ -61,7 +69,7 @@ func run() error {
 	computeClient, closeCompute, err := newComputeClient(startupCtx, processCtx)
 	cancelStartup()
 	if err != nil {
-		return fmt.Errorf("create compute client: %w", err)
+		return i18n.Wrap(err, "webhook.err.create_compute", err)
 	}
 	defer closeCompute()
 
@@ -73,7 +81,7 @@ func run() error {
 		ReadWorkflowRuns:    true, // Current job demand always requires Actions read.
 	}
 	if err := validateGitHubTokenScope(processCtx, githubClient.ValidateTokenScope); err != nil {
-		return fmt.Errorf("validate GitHub token scope: %w", err)
+		return i18n.Wrap(err, "webhook.err.validate_token", err)
 	}
 	handler, err := webhook.NewHandler(webhook.Config{
 		WebhookSecret:             []byte(cfg.webhookSecret),
@@ -99,14 +107,14 @@ func run() error {
 		InstallationID:            cfg.installationID,
 	})
 	if err != nil {
-		return fmt.Errorf("create webhook handler: %w", err)
+		return i18n.Wrap(err, "webhook.err.create_handler", err)
 	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/webhook", handler)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			http.Error(w, i18n.T("webhook.http.method_not_allowed"), http.StatusMethodNotAllowed)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -137,14 +145,14 @@ func serveUntilShutdown(
 
 	serverErr := make(chan error, 1)
 	go func() {
-		log.Printf("Webhook listener starting on %s", srv.Addr)
+		log.Print(i18n.T("webhook.log.starting", srv.Addr))
 		serverErr <- listen()
 	}()
 
 	var listenerErr error
 	select {
 	case <-processCtx.Done():
-		log.Printf("Received shutdown signal; stopping ingress and workers")
+		log.Print(i18n.T("webhook.log.shutdown"))
 	case err := <-serverErr:
 		listenerErr = unexpectedListenerError(err)
 	}
@@ -152,7 +160,7 @@ func serveUntilShutdown(
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancelShutdown()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("HTTP shutdown: %v", err)
+		log.Print(i18n.T("webhook.log.http_shutdown", err))
 	}
 	cancelWorkers()
 	waitWorkers()
@@ -192,7 +200,7 @@ func validateGitHubTokenScopeWithPolicy(
 			return err
 		}
 		if attempt == policy.maxAttempts {
-			return fmt.Errorf("GitHub token-scope validation remained rate limited after %d attempts: %w", attempt, err)
+			return i18n.Wrap(err, "webhook.err.rate_limited_attempts", attempt, err)
 		}
 		delay := resetAt.Sub(policy.now())
 		if delay < policy.minDelay {
@@ -202,15 +210,15 @@ func validateGitHubTokenScopeWithPolicy(
 			delay += time.Duration(rand.Int64N(int64(policy.jitter)))
 		}
 		if policy.now().Add(delay).After(started.Add(policy.maxElapsed)) {
-			return fmt.Errorf("GitHub token-scope validation throttle exceeds %s startup budget: %w", policy.maxElapsed, err)
+			return i18n.Wrap(err, "webhook.err.rate_limited_budget", policy.maxElapsed, err)
 		}
 		retryAt := policy.now().Add(delay)
-		log.Printf("WARN: GitHub token-scope validation rate limited; retrying at %s", retryAt.Format(time.RFC3339))
+		log.Print(i18n.T("webhook.warn.rate_limited_retry", retryAt.Format(time.RFC3339)))
 		if err := policy.wait(ctx, delay); err != nil {
 			return err
 		}
 	}
-	return errors.New("GitHub token-scope validation retry policy is invalid")
+	return errors.New(i18n.T("webhook.err.invalid_retry_policy"))
 }
 
 func waitForTokenRetry(ctx context.Context, delay time.Duration) error {
@@ -228,7 +236,7 @@ func unexpectedListenerError(err error) error {
 	if err == nil || errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
-	return fmt.Errorf("HTTP server failed: %w", err)
+	return i18n.Wrap(err, "webhook.err.http_server_failed", err)
 }
 
 func newComputeClient(startupCtx, lifetimeCtx context.Context) (webhook.ComputeClient, func(), error) {
@@ -247,7 +255,7 @@ func newComputeClient(startupCtx, lifetimeCtx context.Context) (webhook.ComputeC
 	switch provider {
 	case "digitalocean":
 		if spot {
-			return nil, noClose, fmt.Errorf("DigitalOcean does not expose a Spot VM equivalent; unset RUNNER_SPOT")
+			return nil, noClose, errors.New(i18n.T("webhook.err.do_no_spot"))
 		}
 		required, err := requiredValues("DIGITALOCEAN_TOKEN", "DO_VPC_UUID", "DO_FIREWALL_ID")
 		if err != nil {
@@ -318,7 +326,7 @@ func newComputeClient(startupCtx, lifetimeCtx context.Context) (webhook.ComputeC
 		}
 		sshPublicKey, err := os.ReadFile(required["AZURE_SSH_PUBLIC_KEY_FILE"])
 		if err != nil {
-			return nil, noClose, fmt.Errorf("read Azure SSH public key: %w", err)
+			return nil, noClose, i18n.Wrap(err, "webhook.err.read_azure_key", err)
 		}
 		client, err := azure.NewClient(azure.Config{
 			SubscriptionID: required["AZURE_SUBSCRIPTION_ID"], ResourceGroup: required["AZURE_RESOURCE_GROUP"],
@@ -332,7 +340,7 @@ func newComputeClient(startupCtx, lifetimeCtx context.Context) (webhook.ComputeC
 		}
 		return client, noClose, nil
 	default:
-		return nil, noClose, fmt.Errorf("unsupported COMPUTE_PROVIDER %q (expected digitalocean, aws, gcp, or azure)", provider)
+		return nil, noClose, errors.New(i18n.T("webhook.err.unsupported_provider", provider))
 	}
 }
 
@@ -342,7 +350,7 @@ func noopClose() {
 
 func closeGCPClient(client interface{ Close() error }) {
 	if err := client.Close(); err != nil {
-		log.Printf("ERROR: close GCP Compute client: %v", err)
+		log.Print(i18n.T("webhook.err.close_gcp", err))
 	}
 }
 
@@ -383,7 +391,7 @@ func loadRuntimeConfig() (runtimeConfig, error) {
 	cfg.allowedRepositories = splitCSV(allowedRepositories)
 	cfg.allowedPublicRepositories = splitCSV(os.Getenv("ALLOWED_PUBLIC_REPOSITORIES"))
 	if len(cfg.allowedRepositories) == 0 {
-		return cfg, fmt.Errorf("ALLOWED_REPOSITORIES must contain at least one non-empty value")
+		return cfg, errors.New(i18n.T("webhook.err.env_non_empty", "ALLOWED_REPOSITORIES"))
 	}
 	allowedLabels, err := requiredEnv("ALLOWED_LABELS")
 	if err != nil {
@@ -391,7 +399,7 @@ func loadRuntimeConfig() (runtimeConfig, error) {
 	}
 	cfg.allowedLabels = splitCSV(allowedLabels)
 	if len(cfg.allowedLabels) == 0 {
-		return cfg, fmt.Errorf("ALLOWED_LABELS must contain at least one non-empty value")
+		return cfg, errors.New(i18n.T("webhook.err.env_non_empty", "ALLOWED_LABELS"))
 	}
 	if cfg.webhookSecret, err = requiredRawEnv("WEBHOOK_SECRET"); err != nil {
 		return cfg, err
@@ -444,7 +452,7 @@ func loadRuntimeConfig() (runtimeConfig, error) {
 func requiredEnv(key string) (string, error) {
 	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {
-		return "", fmt.Errorf("required environment variable %s is not set", key)
+		return "", errors.New(i18n.T("webhook.err.env_missing", key))
 	}
 	return value, nil
 }
@@ -452,7 +460,7 @@ func requiredEnv(key string) (string, error) {
 func requiredRawEnv(key string) (string, error) {
 	value := os.Getenv(key)
 	if value == "" {
-		return "", fmt.Errorf("required environment variable %s is not set", key)
+		return "", errors.New(i18n.T("webhook.err.env_missing", key))
 	}
 	return value, nil
 }
@@ -483,7 +491,7 @@ func requiredPositiveInt64(key string) (int64, error) {
 	}
 	parsed, err := strconv.ParseInt(value, 10, 64)
 	if err != nil || parsed <= 0 {
-		return 0, fmt.Errorf("%s must be a positive integer", key)
+		return 0, errors.New(i18n.T("webhook.err.env_positive_int", key))
 	}
 	return parsed, nil
 }
@@ -492,7 +500,7 @@ func envPositiveInt64(key string, fallback int64) (int64, error) {
 	value := envOrDefault(key, strconv.FormatInt(fallback, 10))
 	parsed, err := strconv.ParseInt(value, 10, 64)
 	if err != nil || parsed <= 0 {
-		return 0, fmt.Errorf("%s must be a positive integer", key)
+		return 0, errors.New(i18n.T("webhook.err.env_positive_int", key))
 	}
 	return parsed, nil
 }
@@ -501,7 +509,7 @@ func envPositiveInt(key string, fallback int) (int, error) {
 	value := envOrDefault(key, strconv.Itoa(fallback))
 	parsed, err := strconv.Atoi(value)
 	if err != nil || parsed <= 0 {
-		return 0, fmt.Errorf("%s must be a positive integer", key)
+		return 0, errors.New(i18n.T("webhook.err.env_positive_int", key))
 	}
 	return parsed, nil
 }
@@ -510,7 +518,7 @@ func envBoolValue(key string, fallback bool) (bool, error) {
 	value := envOrDefault(key, strconv.FormatBool(fallback))
 	parsed, err := strconv.ParseBool(value)
 	if err != nil {
-		return false, fmt.Errorf("%s must be true or false", key)
+		return false, errors.New(i18n.T("webhook.err.env_bool", key))
 	}
 	return parsed, nil
 }
@@ -529,7 +537,7 @@ func envDuration(key string, fallback time.Duration) (time.Duration, error) {
 	value := envOrDefault(key, fallback.String())
 	parsed, err := time.ParseDuration(value)
 	if err != nil || parsed <= 0 {
-		return 0, fmt.Errorf("%s must be a positive duration", key)
+		return 0, errors.New(i18n.T("webhook.err.env_duration", key))
 	}
 	return parsed, nil
 }

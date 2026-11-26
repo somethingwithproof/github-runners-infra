@@ -403,6 +403,19 @@ Keep ordinary lint and unit jobs on GitHub-hosted runners.
 - Deleted records are retained for webhook-redelivery deduplication and pruned
   after `DELETED_RECORD_RETENTION` (24 hours by default).
 
+## Localization
+
+The `webhook` and `installation-router` binaries embed translations for 20 Tier 1 locales (`en`, `de`, `es`, `fr`, `it`, `pt-BR`, `nl`, `ru`, `uk`, `ja`, `ko`, `zh-CN`, `zh-TW`, `ar`, `hi`, `pl`, `tr`, `sv`, `vi`, `id`) in `internal/i18n`.
+
+Locale selection honors POSIX environment variables (`LC_ALL`, `LC_MESSAGES`, `LANG`) and can be overridden with `--lang`:
+
+```bash
+./bin/webhook --lang de
+LANG=ja_JP.UTF-8 ./bin/installation-router
+```
+
+Unset, `C`, `POSIX`, and unrecognized locales default to English.
+
 ## Development
 
 ```bash
