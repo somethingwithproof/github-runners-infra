@@ -8,6 +8,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"io"
 	"log"
 	"net/http"
@@ -17,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/thomasvincent/github-runners-infra/internal/i18n"
 )
 
 type repositoryRoute struct {
@@ -27,13 +30,13 @@ type repositoryRoute struct {
 func installationRouter(routes map[int64]http.Handler, repositories map[repositoryRoute]http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/webhook" {
-			http.Error(w, "not found", http.StatusNotFound)
+			http.Error(w, i18n.T("router.http.not_found"), http.StatusNotFound)
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			http.Error(w, "invalid request", http.StatusBadRequest)
+			http.Error(w, i18n.T("router.http.invalid_request"), http.StatusBadRequest)
 			return
 		}
 		var event struct {
@@ -45,12 +48,12 @@ func installationRouter(routes map[int64]http.Handler, repositories map[reposito
 			} `json:"repository"`
 		}
 		if err := json.Unmarshal(body, &event); err != nil {
-			http.Error(w, "invalid request", http.StatusBadRequest)
+			http.Error(w, i18n.T("router.http.invalid_request"), http.StatusBadRequest)
 			return
 		}
 		upstream, found := routes[event.Installation.ID]
 		if !found {
-			http.Error(w, "installation not authorized", http.StatusForbidden)
+			http.Error(w, i18n.T("router.http.unauthorized"), http.StatusForbidden)
 			return
 		}
 		// Routing does not authorize provisioning: the selected controller must
@@ -64,14 +67,21 @@ func installationRouter(routes map[int64]http.Handler, repositories map[reposito
 }
 
 func main() {
+	fs := flag.NewFlagSet("installation-router", flag.ContinueOnError)
+	lang := fs.String("lang", "", i18n.T("flag.lang"))
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		os.Exit(2)
+	}
+	i18n.Init(*lang)
+
 	routes := make(map[int64]http.Handler)
 	for key, address := range map[string]string{"LEGACY_INSTALLATION_ID": "http://127.0.0.1:8080", "KADUPUL_INSTALLATION_ID": "http://127.0.0.1:8081"} {
 		id, err := strconv.ParseInt(os.Getenv(key), 10, 64)
 		if err != nil || id <= 0 {
-			log.Fatalf("invalid %s", key)
+			log.Fatal(i18n.T("router.err.invalid_key", key))
 		}
 		if _, exists := routes[id]; exists {
-			log.Fatal("installation identities must differ")
+			log.Fatal(i18n.T("router.err.duplicate_installations"))
 		}
 		target, err := url.Parse(address)
 		if err != nil {
@@ -87,7 +97,7 @@ func main() {
 	if os.Getenv("MANTL_RUNNERS_ENABLED") == "true" {
 		id, err := strconv.ParseInt(os.Getenv("LEGACY_INSTALLATION_ID"), 10, 64)
 		if err != nil || id <= 0 {
-			log.Fatal("invalid Mantl installation identity")
+			log.Fatal(i18n.T("router.err.invalid_mantl"))
 		}
 		target, err := url.Parse("http://127.0.0.1:8083")
 		if err != nil {
