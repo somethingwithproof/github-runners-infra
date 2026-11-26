@@ -20,8 +20,8 @@ func extractPlaceholders(s string) []string {
 
 func TestAllLocalesLoadWithParity(t *testing.T) {
 	locales := SupportedLocales()
-	if len(locales) != 20 {
-		t.Fatalf("expected 20 supported locales, got %d", len(locales))
+	if len(locales) != 45 {
+		t.Fatalf("expected 45 supported locales, got %d", len(locales))
 	}
 
 	enRaw, err := localeFS.ReadFile("locales/en.json")
@@ -95,6 +95,15 @@ func TestResolveLocaleAndRTL(t *testing.T) {
 		{"zh_TW.UTF-8", "zh-TW"},
 		{"zh-Hant", "zh-TW"},
 		{"ar_SA.UTF-8", "ar"},
+		{"ar_EG.UTF-8", "ar-EG"},
+		{"ar_MA.UTF-8", "ar-MA"},
+		{"fr_MA.UTF-8", "fr-MA"},
+		{"sw_KE.UTF-8", "sw-KE"},
+		{"zu", "zu-ZA"},
+		{"fa_IR.UTF-8", "fa"},
+		{"he_IL.UTF-8", "he"},
+		{"ur_PK.UTF-8", "ur"},
+		{"tl_PH.UTF-8", "fil"},
 		{"hi_IN.UTF-8", "hi"},
 		{"sv_SE.UTF-8", "sv"},
 		{"unknown", "en"},
@@ -105,8 +114,11 @@ func TestResolveLocaleAndRTL(t *testing.T) {
 		}
 	}
 
+	rtlSet := map[string]bool{
+		"ar": true, "ar-EG": true, "ar-MA": true, "fa": true, "he": true, "ur": true,
+	}
 	for _, loc := range SupportedLocales() {
-		wantRTL := loc == "ar"
+		wantRTL := rtlSet[loc]
 		if IsRTL(loc) != wantRTL {
 			t.Errorf("IsRTL(%q) = %v, want %v", loc, IsRTL(loc), wantRTL)
 		}
