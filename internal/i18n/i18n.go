@@ -85,7 +85,10 @@ func ResolveLocale(tag string) string {
 		base = lower[:idx]
 	}
 	if base == "zh" {
-		if strings.Contains(lower, "hant") || strings.Contains(lower, "-tw") || strings.Contains(lower, "-hk") || strings.Contains(lower, "-mo") {
+		if strings.Contains(lower, "-hans") {
+			return "zh-CN"
+		}
+		if strings.Contains(lower, "-hant") || strings.Contains(lower, "-tw") || strings.Contains(lower, "-hk") || strings.Contains(lower, "-mo") {
 			return "zh-TW"
 		}
 		return "zh-CN"
