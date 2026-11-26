@@ -20,7 +20,7 @@
   "webhook.err.invalid_retry_policy": "GitHub टोकन-व्याप्ती पडताळणीचे पुनर्प्रयत्न धोरण अवैध आहे",
   "webhook.err.open_state": "जीवनचक्र स्थिती उघडताना: %v",
   "webhook.err.rate_limited_attempts": "%d प्रयत्नांनंतरही GitHub टोकन-व्याप्ती पडताळणी दर मर्यादेत राहिली: %v",
-  "webhook.err.rate_limited_budget": "GitHub टोकन-व्याप्ती पडताळणीचा वेग %s स्टार्टअप मर्यादेपेक्षा जास्त आहे: %v",
+  "webhook.err.rate_limited_budget": "GitHub टोकन-व्याप्ती पडताळणीची दर मर्यादा %s स्टार्टअप वेळेच्या मर्यादेपेक्षा जास्त आहे: %v",
   "webhook.err.read_azure_key": "Azure SSH सार्वजनिक की वाचताना: %v",
   "webhook.err.read_private_key": "GitHub App खाजगी की फाइल वाचताना: %v",
   "webhook.err.unsupported_provider": "असमर्थित COMPUTE_PROVIDER %q (अपेक्षित: digitalocean, aws, gcp किंवा azure)",

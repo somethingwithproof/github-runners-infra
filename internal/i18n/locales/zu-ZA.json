@@ -13,7 +13,7 @@
   "webhook.err.env_bool": "%s kumele ibe ngu-true noma u-false",
   "webhook.err.env_duration": "%s kumele ibe ubude besikhathi obuhle",
   "webhook.err.env_missing": "okuguquguqukayo kwendawo okudingekayo %s akusethiwe",
-  "webhook.err.env_non_empty": "%s kumele iqukathe okungenani inani elilodwa elinganalutho",
+  "webhook.err.env_non_empty": "%s kumele iqukathe okungenani inani elilodwa elingelona elingenalutho",
   "webhook.err.env_positive_int": "%s kumele ibe yinani eliphelele elihle",
   "webhook.err.http_server_failed": "iseva ye-HTTP yehlulekile: %v",
   "webhook.err.invalid_config": "ukucushwa okungavumelekile: %v",
