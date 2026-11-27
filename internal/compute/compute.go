@@ -119,6 +119,7 @@ type RunnerParams struct {
 	RunnerJITConfig         string
 	RunnerRegistrationToken string
 	RunnerRepoURL           string
+	RegistrationLabels      []string
 	RunnerVersion           string
 	RunnerSHA256            string
 	ChefInstallerSHA256     string
@@ -129,9 +130,18 @@ type RunnerParams struct {
 	// Spot overrides provider-default spot provisioning: nil uses the provider
 	// default, true forces spot/preemptible, and false forces on-demand.
 	Spot *bool
+	// AuthorizeLaunch updates the spend reservation before a different backend or mode is used.
+	AuthorizeLaunch func(provider, size string, spot bool) error
 	// SpotActive is populated for cloud-init rendering when the instance is
 	// actually launched as a spot/preemptible VM.
 	SpotActive bool
+}
+
+func (p RunnerParams) CheckLaunchBudget(provider, size string, spot bool) error {
+	if p.AuthorizeLaunch == nil {
+		return nil
+	}
+	return p.AuthorizeLaunch(provider, size, spot)
 }
 
 // WithSpot returns a copy of params configured for the effective spot mode so
@@ -150,6 +160,9 @@ type RunnerInstance struct {
 
 var safeRepoURLRegex = regexp.MustCompile(`^https://github\.com/[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}/(\.github|[a-zA-Z0-9][a-zA-Z0-9._-]{0,99})$`)
 
+// LabelList returns the comma-separated labels expected by config.sh.
+func (p RunnerParams) LabelList() string { return strings.Join(p.RegistrationLabels, ",") }
+
 // RenderCloudInit renders the shared, provider-neutral cloud-init template.
 func RenderCloudInit(tmpl *template.Template, params RunnerParams) (string, error) {
 	if tmpl == nil {
@@ -160,6 +173,11 @@ func RenderCloudInit(tmpl *template.Template, params RunnerParams) (string, erro
 	}
 	if params.RunnerRepoURL != "" && !safeRepoURLRegex.MatchString(params.RunnerRepoURL) {
 		return "", fmt.Errorf("invalid runner repository URL %q", params.RunnerRepoURL)
+	}
+	for _, label := range params.RegistrationLabels {
+		if !ValidLabel(label) {
+			return "", fmt.Errorf("invalid registration label %q", label)
+		}
 	}
 	for _, entry := range params.EgressAllowlist {
 		if !ValidEgressEntry(entry) {

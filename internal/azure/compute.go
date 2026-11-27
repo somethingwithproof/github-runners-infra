@@ -285,6 +285,9 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 	}
 	err = c.createAndWaitVM(ctx, params.JobKey, name, nicID, vmSize, userData, useSpot)
 	if err != nil && useSpot && c.spotFallbackOnDemand && compute.IsCapacityError(err) {
+		if err := params.CheckLaunchBudget(c.Provider(), string(vmSize), false); err != nil {
+			return nil, c.cleanupNICAfterVMFailure(ctx, name, params.JobKey, err)
+		}
 		log.Printf("WARN: Azure spot capacity unavailable for %s (%v); falling back to on-demand", params.JobKey, err)
 		fallbackData, renderErr := compute.RenderCloudInit(c.tmpl, params.WithSpot(false))
 		if renderErr != nil {

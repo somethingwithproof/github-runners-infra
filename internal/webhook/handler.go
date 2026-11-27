@@ -1124,7 +1124,17 @@ func (h *Handler) provision(ctx context.Context, record state.Record) {
 		EgressAllowlist:         h.egressAllowlist,
 		Spot:                    spotPref,
 	}
+	if h.budgetTracker.Enabled() {
+		params.AuthorizeLaunch = func(provider, size string, spot bool) error {
+			return h.budgetTracker.Reserve(budget.Reservation{
+				Key: record.Key, Repository: record.Owner + "/" + record.Repository,
+				Provider: provider, Size: size, Spot: spot,
+				HourlyRateUSD: router.HourlyRateForMode(provider, size, spot, h.hourlyRateOverrides),
+			})
+		}
+	}
 	if regToken != "" {
+		params.RegistrationLabels = record.Labels
 		params.RunnerRepoURL = fmt.Sprintf("https://github.com/%s/%s", record.Owner, record.Repository)
 	}
 	instance, err := h.computeClient.CreateRunner(ctx, params)

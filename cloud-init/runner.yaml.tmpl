@@ -12,6 +12,14 @@ users:
     groups: docker
 
 {{- if not .PrebakedImage}}
+apt:
+  primary:
+    - arches: [default]
+      uri: https://archive.ubuntu.com/ubuntu
+  security:
+    - arches: [default]
+      uri: https://security.ubuntu.com/ubuntu
+
 package_update: true
 
 packages:
@@ -36,7 +44,15 @@ runcmd:
     # placed in user data; on providers that bill powered-off VMs (such as
     # DigitalOcean, Vultr, and Linode), the controller's age-gated sweep still
     # destroys the stopped instance after MAX_RUNNER_AGE.
-    systemd-run --unit=runner-deadman-shutdown --on-active={{.DeadmanShutdownMinutes}}m /sbin/shutdown --poweroff now
+    unit=/etc/systemd/system/runner-deadman-shutdown
+    if [ ! -f "$unit.timer" ]; then
+      deadline=$(date -u -d '+{{.DeadmanShutdownMinutes}} minutes' '+%Y-%m-%d %H:%M:%S UTC')
+      printf '%s\n' '[Service]' 'Type=oneshot' 'ExecStart=/sbin/shutdown --poweroff now' > "$unit.service"
+      printf '%s\n' '[Timer]' "OnCalendar=$deadline" 'Persistent=true' 'AccuracySec=1s' '[Install]' 'WantedBy=timers.target' > "$unit.timer.tmp"
+      mv "$unit.timer.tmp" "$unit.timer"
+    fi
+    systemctl daemon-reload
+    systemctl enable --now runner-deadman-shutdown.timer
     {{- end}}
     systemctl enable --now docker
     {{- if .EgressAllowlist}}
@@ -161,7 +177,7 @@ runcmd:
     runuser -u runner -- ./config.sh --ephemeral --unattended \
       --url '{{.RunnerRepoURL}}' \
       --name '{{.RunnerName}}' \
-      --token "$REG_TOKEN"
+      {{if .RegistrationLabels}}--labels '{{.LabelList}}' {{end}}--token "$REG_TOKEN"
     unset REG_TOKEN
     runuser -u runner -- ./run.sh || RUNNER_EXIT=$?
     {{- else}}

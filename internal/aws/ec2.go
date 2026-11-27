@@ -176,6 +176,9 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 		return inst, nil
 	}
 	if useSpot && c.spotFallbackOnDemand && compute.IsCapacityError(err) {
+		if err := params.CheckLaunchBudget(c.Provider(), string(instanceType), false); err != nil {
+			return nil, err
+		}
 		log.Printf("WARN: AWS spot capacity unavailable for %s (%v); falling back to on-demand", params.JobKey, err)
 		return c.runAcrossSubnets(ctx, params, instanceType, subnets, false, true)
 	}

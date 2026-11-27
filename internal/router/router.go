@@ -243,6 +243,13 @@ func (r *MultiCloudRouter) tryBackends(
 		if ctx.Err() != nil {
 			return nil, sawSpotOrCapacity, attemptErrs, ctx.Err()
 		}
+		size := params.InstanceSize
+		if size == "" {
+			size = b.DefaultSize
+		}
+		if err := params.CheckLaunchBudget(b.Name, size, useSpot); err != nil {
+			return nil, sawSpotOrCapacity, attemptErrs, err
+		}
 		created, err := b.Provider.CreateRunner(ctx, params)
 		if err == nil {
 			return &compute.RunnerInstance{

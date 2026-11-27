@@ -166,13 +166,16 @@ func (t *Tracker) Reserve(res Reservation) error {
 	nowUTC := t.now().UTC()
 	t.rolloverLocked(nowUTC)
 
-	if _, exists := t.state.InFlight[res.Key]; exists {
+	repo := strings.ToLower(strings.TrimSpace(res.Repository))
+	provider := strings.ToLower(strings.TrimSpace(res.Provider))
+	size := strings.TrimSpace(res.Size)
+	previous, exists := t.state.InFlight[res.Key]
+	if exists && previous.Provider == provider && previous.Size == size && previous.Spot == res.Spot &&
+		previous.HourlyRateUSD == res.HourlyRateUSD && previous.Repository == repo {
 		return nil
 	}
-
-	repo := strings.ToLower(strings.TrimSpace(res.Repository))
 	estCost := res.HourlyRateUSD * t.reservationDuration.Hours()
-	inFlightTotal, inFlightRepo := t.inFlightTotalsLocked(nowUTC, repo)
+	inFlightTotal, inFlightRepo := t.inFlightTotalsLocked(nowUTC, repo, res.Key)
 
 	projectedDaily := t.state.DailyAccruedUSD + inFlightTotal + estCost
 	projectedMonthly := t.state.MonthlyAccruedUSD + inFlightTotal + estCost
@@ -190,14 +193,22 @@ func (t *Tracker) Reserve(res Reservation) error {
 
 	t.state.InFlight[res.Key] = activeReservation{
 		Repository:      repo,
-		Provider:        strings.ToLower(strings.TrimSpace(res.Provider)),
-		Size:            strings.TrimSpace(res.Size),
+		Provider:        provider,
+		Size:            size,
 		Spot:            res.Spot,
 		HourlyRateUSD:   res.HourlyRateUSD,
 		EstimatedCapUSD: estCost,
 		StartedAt:       nowUTC,
 	}
-	return t.persistLocked()
+	if err := t.persistLocked(); err != nil {
+		if exists {
+			t.state.InFlight[res.Key] = previous
+		} else {
+			delete(t.state.InFlight, res.Key)
+		}
+		return err
+	}
+	return nil
 }
 
 // Release settles an in-flight runner into accrued daily/monthly spend based on
@@ -262,7 +273,7 @@ func (t *Tracker) Snapshot() Metrics {
 	nowUTC := t.now().UTC()
 	t.rolloverLocked(nowUTC)
 
-	inFlightTotal, _ := t.inFlightTotalsLocked(nowUTC, "")
+	inFlightTotal, _ := t.inFlightTotalsLocked(nowUTC, "", "")
 	repoSpend := make(map[string]float64, len(t.state.RepoDailyAccrued))
 	for repo, cost := range t.state.RepoDailyAccrued {
 		repoSpend[repo] = cost
@@ -308,8 +319,11 @@ func (t *Tracker) rolloverLocked(nowUTC time.Time) {
 	}
 }
 
-func (t *Tracker) inFlightTotalsLocked(nowUTC time.Time, repo string) (total, forRepo float64) {
-	for _, active := range t.state.InFlight {
+func (t *Tracker) inFlightTotalsLocked(nowUTC time.Time, repo, excludeKey string) (total, forRepo float64) {
+	for key, active := range t.state.InFlight {
+		if key == excludeKey {
+			continue
+		}
 		cost := activeEstimate(active, nowUTC)
 		total += cost
 		if repo != "" && active.Repository == repo {
