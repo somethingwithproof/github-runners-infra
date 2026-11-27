@@ -18,8 +18,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thomasvincent/github-runners-infra/internal/budget"
 	"github.com/thomasvincent/github-runners-infra/internal/compute"
 	gh "github.com/thomasvincent/github-runners-infra/internal/github"
+	"github.com/thomasvincent/github-runners-infra/internal/router"
 	"github.com/thomasvincent/github-runners-infra/internal/state"
 )
 
@@ -79,11 +81,25 @@ type instanceAbsenceChecker interface {
 	RunnerAbsent(context.Context, string) (bool, error)
 }
 
+// registrationTokenGenerator is optionally implemented by GitHubClient when
+// GITHUB_USE_JIT_CONFIG=false fallback mode is explicitly configured.
+type registrationTokenGenerator interface {
+	GenerateRepoRegistrationToken(context.Context, string, string) (gh.RegistrationToken, error)
+}
+
+// rateEstimator provides an estimated hourly USD rate for budget accounting.
+type rateEstimator interface {
+	EstimateHourlyRate(sizeOverride string) (providerName, size string, hourlyUSD float64)
+}
+
 // Handler authenticates webhooks and drives durable runner lifecycle workers.
 type Handler struct {
 	webhookSecret             []byte
 	githubClient              GitHubClient
 	computeClient             ComputeClient
+	budgetTracker             *budget.Tracker
+	hourlyRateOverrides       map[string]float64
+	defaultInstanceSize       string
 	store                     state.Store
 	requiredLabel             string
 	allowedLabels             map[string]string
@@ -103,6 +119,9 @@ type Handler struct {
 	livenessSettleWindow      time.Duration
 	livenessConfirmations     int
 	deadmanShutdownMinutes    int
+	disableJITConfig          bool
+	prebakedImage             bool
+	egressAllowlist           []string
 	reaperTimeout             time.Duration
 	livenessCheckInterval     time.Duration
 	installationID            int64
@@ -119,6 +138,9 @@ type Config struct {
 	WebhookSecret             []byte
 	GitHubClient              GitHubClient
 	ComputeClient             ComputeClient
+	BudgetTracker             *budget.Tracker
+	HourlyRateOverrides       map[string]float64
+	DefaultInstanceSize       string
 	Store                     state.Store
 	RequiredLabel             string
 	AllowedLabels             []string
@@ -140,6 +162,9 @@ type Config struct {
 	LivenessConfirmations     int
 	DeadmanShutdownMinutes    int
 	DisableDeadmanShutdown    bool
+	DisableJITConfig          bool
+	PrebakedImage             bool
+	EgressAllowlist           []string
 	InstallationID            int64
 }
 
@@ -171,6 +196,11 @@ func NewHandler(cfg Config) (*Handler, error) {
 	if err != nil {
 		return nil, err
 	}
+	for _, entry := range cfg.EgressAllowlist {
+		if !compute.ValidEgressEntry(entry) {
+			return nil, fmt.Errorf("invalid egress allowlist entry %q", entry)
+		}
+	}
 	if err := cfg.Store.SetMaxLiveRunners(limits.maxLiveRunners); err != nil {
 		return nil, err
 	}
@@ -179,6 +209,9 @@ func NewHandler(cfg Config) (*Handler, error) {
 		webhookSecret:             append([]byte(nil), cfg.WebhookSecret...),
 		githubClient:              cfg.GitHubClient,
 		computeClient:             cfg.ComputeClient,
+		budgetTracker:             cfg.BudgetTracker,
+		hourlyRateOverrides:       cfg.HourlyRateOverrides,
+		defaultInstanceSize:       strings.TrimSpace(cfg.DefaultInstanceSize),
 		store:                     cfg.Store,
 		requiredLabel:             requiredLabel,
 		allowedLabels:             allowedLabels,
@@ -198,6 +231,9 @@ func NewHandler(cfg Config) (*Handler, error) {
 		livenessSettleWindow:      limits.livenessSettleWindow,
 		livenessConfirmations:     limits.livenessConfirmations,
 		deadmanShutdownMinutes:    limits.deadmanShutdownMinutes,
+		disableJITConfig:          cfg.DisableJITConfig,
+		prebakedImage:             cfg.PrebakedImage,
+		egressAllowlist:           append([]string(nil), cfg.EgressAllowlist...),
 		reaperTimeout:             max(5*time.Minute, time.Duration(limits.maxLiveRunners+10)*30*time.Second),
 		livenessCheckInterval:     5 * time.Minute,
 		installationID:            cfg.InstallationID,
@@ -1050,44 +1086,43 @@ func (h *Handler) provision(ctx context.Context, record state.Record) {
 			return
 		}
 	}
-	jit, err := h.githubClient.GenerateRepoJITConfig(
-		ctx, record.Owner, record.Repository, runnerName, h.runnerGroupID, record.Labels,
-	)
-	if err != nil {
-		h.provisionFailed(ctx, record, fmt.Errorf("generate JIT config: %w", err))
-		return
-	}
 	persistCtx := context.WithoutCancel(ctx)
-	if err := h.store.MarkJITCreated(persistCtx, record.Key, jit.RunnerID, runnerName); err != nil {
-		cleanupCtx, cancel := context.WithTimeout(persistCtx, 30*time.Second)
-		cleanupErr := h.githubClient.RemoveRepoRunner(cleanupCtx, record.Owner, record.Repository, jit.RunnerID)
-		cancel()
-		if cleanupErr != nil {
-			log.Printf("WARN: remove unpersisted JIT runner %d: %v", jit.RunnerID, cleanupErr)
-		}
-		h.provisionFailed(ctx, record, fmt.Errorf("persist JIT runner identity: %w", err))
+	jit, regToken, ok := h.acquireRunnerBootstrapAuth(ctx, persistCtx, &record, runnerName)
+	if !ok {
 		return
 	}
-	record.GitHubRunnerID = jit.RunnerID
-	record.GitHubRunnerOwned = true
-	record.RunnerName = runnerName
 	// A different online runner may have taken this job during JIT creation.
 	if !h.requireQueuedJob(ctx, record) {
 		return
 	}
 
-	instance, err := h.computeClient.CreateRunner(ctx, compute.RunnerParams{
-		JobKey:                 record.Key,
-		ProvisionEpoch:         record.ProvisionEpoch,
-		RunnerName:             runnerName,
-		RunnerJITConfig:        jit.EncodedConfig,
-		RunnerVersion:          h.runnerVersion,
-		RunnerSHA256:           h.runnerSHA256,
-		ChefInstallerSHA256:    h.chefInstallerSHA256,
-		InstanceSize:           compute.ResolveInstanceSize(record.Labels, h.requiredLabel, h.labelSizeMap),
-		DeadmanShutdownMinutes: h.deadmanShutdownMinutes,
-	})
+	resolvedSize := compute.ResolveInstanceSize(record.Labels, h.requiredLabel, h.labelSizeMap)
+	if !h.reserveBudget(ctx, record, resolvedSize) {
+		return
+	}
+
+	params := compute.RunnerParams{
+		JobKey:                  record.Key,
+		ProvisionEpoch:          record.ProvisionEpoch,
+		RunnerName:              runnerName,
+		RunnerJITConfig:         jit.EncodedConfig,
+		RunnerRegistrationToken: regToken,
+		RunnerVersion:           h.runnerVersion,
+		RunnerSHA256:            h.runnerSHA256,
+		ChefInstallerSHA256:     h.chefInstallerSHA256,
+		InstanceSize:            resolvedSize,
+		DeadmanShutdownMinutes:  h.deadmanShutdownMinutes,
+		PrebakedImage:           h.prebakedImage,
+		EgressAllowlist:         h.egressAllowlist,
+	}
+	if regToken != "" {
+		params.RunnerRepoURL = fmt.Sprintf("https://github.com/%s/%s", record.Owner, record.Repository)
+	}
+	instance, err := h.computeClient.CreateRunner(ctx, params)
 	if err != nil {
+		if !errors.Is(err, compute.ErrCreateOutcomeUnknown) {
+			h.budgetTracker.Cancel(record.Key)
+		}
 		h.provisionFailed(ctx, record, fmt.Errorf("create runner instance: %w", err))
 		return
 	}
@@ -1098,6 +1133,75 @@ func (h *Handler) provision(ctx context.Context, record state.Record) {
 	}
 	log.Printf("Provisioned runner %s (instance %s) for %s/%s job %d", runnerName, instance.ID, record.Owner, record.Repository, record.JobID)
 	h.signal()
+}
+
+func (h *Handler) acquireRunnerBootstrapAuth(
+	ctx, persistCtx context.Context,
+	record *state.Record,
+	runnerName string,
+) (gh.JITConfig, string, bool) {
+	if h.disableJITConfig {
+		if gen, ok := h.githubClient.(registrationTokenGenerator); ok {
+			tok, err := gen.GenerateRepoRegistrationToken(ctx, record.Owner, record.Repository)
+			if err != nil {
+				h.provisionFailed(ctx, *record, fmt.Errorf("generate registration token: %w", err))
+				return gh.JITConfig{}, "", false
+			}
+			record.RunnerName = runnerName
+			return gh.JITConfig{}, tok.Token, true
+		}
+	}
+	jit, err := h.githubClient.GenerateRepoJITConfig(
+		ctx, record.Owner, record.Repository, runnerName, h.runnerGroupID, record.Labels,
+	)
+	if err != nil {
+		h.provisionFailed(ctx, *record, fmt.Errorf("generate JIT config: %w", err))
+		return gh.JITConfig{}, "", false
+	}
+	if err := h.store.MarkJITCreated(persistCtx, record.Key, jit.RunnerID, runnerName); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(persistCtx, 30*time.Second)
+		cleanupErr := h.githubClient.RemoveRepoRunner(cleanupCtx, record.Owner, record.Repository, jit.RunnerID)
+		cancel()
+		if cleanupErr != nil {
+			log.Printf("WARN: remove unpersisted JIT runner %d: %v", jit.RunnerID, cleanupErr)
+		}
+		h.provisionFailed(ctx, *record, fmt.Errorf("persist JIT runner identity: %w", err))
+		return gh.JITConfig{}, "", false
+	}
+	record.GitHubRunnerID = jit.RunnerID
+	record.GitHubRunnerOwned = true
+	record.RunnerName = runnerName
+	return jit, "", true
+}
+
+func (h *Handler) reserveBudget(ctx context.Context, record state.Record, resolvedSize string) bool {
+	if h.budgetTracker == nil || !h.budgetTracker.Enabled() {
+		return true
+	}
+	providerName := h.provider
+	size := resolvedSize
+	if size == "" {
+		size = h.defaultInstanceSize
+	}
+	hourlyUSD := router.HourlyRate(providerName, size, h.hourlyRateOverrides)
+	if est, ok := h.computeClient.(rateEstimator); ok {
+		providerName, size, hourlyUSD = est.EstimateHourlyRate(resolvedSize)
+	}
+	err := h.budgetTracker.Reserve(budget.Reservation{
+		Key:           record.Key,
+		Repository:    record.Owner + "/" + record.Repository,
+		Provider:      providerName,
+		Size:          size,
+		HourlyRateUSD: hourlyUSD,
+	})
+	if err == nil {
+		return true
+	}
+	if removeErr := h.removeIdleJIT(ctx, record); removeErr != nil {
+		log.Printf("WARN: remove JIT runner after budget block for %s: %v", record.Key, removeErr)
+	}
+	h.provisionFailed(ctx, record, err)
+	return false
 }
 
 func (h *Handler) requireQueuedJob(ctx context.Context, record state.Record) bool {
@@ -1369,6 +1473,7 @@ func (h *Handler) delete(ctx context.Context, record state.Record) {
 		h.signal()
 		return
 	}
+	h.budgetTracker.Release(record.Key)
 	log.Printf("Deleted owned runner instance %s for %s", record.InstanceID, record.Key)
 	if restored {
 		log.Printf("Restored queued original job demand for %s after reassigned runner completion", record.Key)

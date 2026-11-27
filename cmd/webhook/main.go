@@ -20,12 +20,14 @@ import (
 
 	"github.com/thomasvincent/github-runners-infra/internal/aws"
 	"github.com/thomasvincent/github-runners-infra/internal/azure"
+	"github.com/thomasvincent/github-runners-infra/internal/budget"
 	"github.com/thomasvincent/github-runners-infra/internal/compute"
 	"github.com/thomasvincent/github-runners-infra/internal/digitalocean"
 	"github.com/thomasvincent/github-runners-infra/internal/gcp"
 	gh "github.com/thomasvincent/github-runners-infra/internal/github"
 	"github.com/thomasvincent/github-runners-infra/internal/i18n"
 	"github.com/thomasvincent/github-runners-infra/internal/linode"
+	"github.com/thomasvincent/github-runners-infra/internal/router"
 	"github.com/thomasvincent/github-runners-infra/internal/state"
 	"github.com/thomasvincent/github-runners-infra/internal/vultr"
 	"github.com/thomasvincent/github-runners-infra/internal/webhook"
@@ -77,6 +79,16 @@ func run() error {
 	}
 	defer closeCompute()
 
+	budgetTracker, err := budget.NewTracker(budget.Config{
+		DailyCapUSD:     cfg.budgetDailyUSD,
+		MonthlyCapUSD:   cfg.budgetMonthlyUSD,
+		RepoDailyCapUSD: cfg.budgetRepoDailyUSD,
+		StatePath:       cfg.budgetStateFile,
+	})
+	if err != nil {
+		return i18n.Wrap(err, "webhook.err.invalid_config", err)
+	}
+
 	githubClient := &gh.App{
 		AppID:               cfg.appID,
 		InstallationID:      cfg.installationID,
@@ -91,6 +103,9 @@ func run() error {
 		WebhookSecret:             []byte(cfg.webhookSecret),
 		GitHubClient:              githubClient,
 		ComputeClient:             computeClient,
+		BudgetTracker:             budgetTracker,
+		HourlyRateOverrides:       cfg.hourlyRateOverrides,
+		DefaultInstanceSize:       defaultInstanceSizeForEnv(computeClient.Provider()),
 		Store:                     stateStore,
 		RequiredLabel:             cfg.requiredLabel,
 		AllowedLabels:             cfg.allowedLabels,
@@ -111,6 +126,9 @@ func run() error {
 		LivenessConfirmations:     cfg.livenessConfirmations,
 		DeadmanShutdownMinutes:    cfg.deadmanShutdownMinutes,
 		DisableDeadmanShutdown:    cfg.disableDeadmanShutdown,
+		DisableJITConfig:          !cfg.useJITConfig,
+		PrebakedImage:             cfg.prebakedImage,
+		EgressAllowlist:           cfg.egressAllowlist,
 		InstallationID:            cfg.installationID,
 	})
 	if err != nil {
@@ -126,6 +144,13 @@ func run() error {
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, i18n.T("webhook.http.method_not_allowed"), http.StatusMethodNotAllowed)
+			return
+		}
+		writeBudgetMetrics(w, budgetTracker)
 	})
 
 	srv := &http.Server{
@@ -247,7 +272,6 @@ func unexpectedListenerError(err error) error {
 }
 
 func newComputeClient(startupCtx, lifetimeCtx context.Context) (webhook.ComputeClient, func(), error) {
-	provider := strings.ToLower(envOrDefault("COMPUTE_PROVIDER", "digitalocean"))
 	controllerID, err := requiredEnv("CONTROLLER_ID")
 	if err != nil {
 		return nil, noopClose, err
@@ -257,6 +281,66 @@ func newComputeClient(startupCtx, lifetimeCtx context.Context) (webhook.ComputeC
 	if err != nil {
 		return nil, noopClose, err
 	}
+
+	if providers := splitCSV(os.Getenv("CLOUD_PROVIDERS")); len(providers) > 0 {
+		return newMultiCloudRouter(startupCtx, lifetimeCtx, providers, controllerID, cloudInitPath, spot)
+	}
+	provider := strings.ToLower(envOrDefault("COMPUTE_PROVIDER", "digitalocean"))
+	return newSingleComputeClient(startupCtx, lifetimeCtx, provider, controllerID, cloudInitPath, spot)
+}
+
+func newMultiCloudRouter(
+	startupCtx, lifetimeCtx context.Context,
+	providers []string,
+	controllerID, cloudInitPath string,
+	spot bool,
+) (webhook.ComputeClient, func(), error) {
+	strategy := router.Strategy(strings.ToLower(envOrDefault("ROUTER_STRATEGY", string(router.StrategyPriority))))
+	overrides, err := router.ParseHourlyRateOverrides(os.Getenv("ROUTER_HOURLY_RATES"))
+	if err != nil {
+		return nil, noopClose, err
+	}
+
+	backends := make([]router.Backend, 0, len(providers))
+	closers := make([]func(), 0, len(providers))
+	closeAll := func() {
+		for _, fn := range closers {
+			fn()
+		}
+	}
+
+	for _, rawProvider := range providers {
+		name := strings.ToLower(strings.TrimSpace(rawProvider))
+		client, closeFn, err := newSingleComputeClient(startupCtx, lifetimeCtx, name, controllerID, cloudInitPath, spot)
+		if err != nil {
+			closeAll()
+			return nil, noopClose, fmt.Errorf("initialize provider %q for CLOUD_PROVIDERS: %w", name, err)
+		}
+		closers = append(closers, closeFn)
+		backends = append(backends, router.Backend{
+			Name:        name,
+			DefaultSize: defaultInstanceSizeForEnv(name),
+			Provider:    client,
+		})
+	}
+
+	multi, err := router.New(router.Config{
+		Strategy:    strategy,
+		Backends:    backends,
+		HourlyRates: overrides,
+	})
+	if err != nil {
+		closeAll()
+		return nil, noopClose, err
+	}
+	return multi, closeAll, nil
+}
+
+func newSingleComputeClient(
+	startupCtx, lifetimeCtx context.Context,
+	provider, controllerID, cloudInitPath string,
+	spot bool,
+) (webhook.ComputeClient, func(), error) {
 	noClose := noopClose
 
 	switch provider {
@@ -441,6 +525,14 @@ type runtimeConfig struct {
 	allowedLabels, allowedRepositories []string
 	allowedPublicRepositories          []string
 	labelSizeMap                       map[string]string
+	hourlyRateOverrides                map[string]float64
+	budgetDailyUSD                     float64
+	budgetMonthlyUSD                   float64
+	budgetRepoDailyUSD                 float64
+	budgetStateFile                    string
+	useJITConfig                       bool
+	prebakedImage                      bool
+	egressAllowlist                    []string
 	runnerGroupID                      int64
 	workerCount, maxLiveRunners        int
 	maxAttempts                        int
@@ -530,10 +622,81 @@ func loadRuntimeConfig() (runtimeConfig, error) {
 	if cfg.deadmanShutdownMinutes, cfg.disableDeadmanShutdown, err = envDeadmanMinutes("RUNNER_DEADMAN_MINUTES", compute.DefaultDeadmanShutdownMinutes); err != nil {
 		return cfg, err
 	}
+	if err = loadRoutingBudgetAndBootstrapConfig(&cfg); err != nil {
+		return cfg, err
+	}
 	cfg.stateFile = envOrDefault("STATE_FILE", "/var/lib/github-runners/state.json")
 	cfg.requiredLabel = envOrDefault("REQUIRED_LABEL", "self-hosted")
 	cfg.listenAddr = envOrDefault("LISTEN_ADDR", ":8080")
 	return cfg, nil
+}
+
+func loadRoutingBudgetAndBootstrapConfig(cfg *runtimeConfig) error {
+	var err error
+	if cfg.hourlyRateOverrides, err = router.ParseHourlyRateOverrides(os.Getenv("ROUTER_HOURLY_RATES")); err != nil {
+		return err
+	}
+	if cfg.budgetDailyUSD, err = envNonNegativeFloat("BUDGET_DAILY_USD"); err != nil {
+		return err
+	}
+	if cfg.budgetMonthlyUSD, err = envNonNegativeFloat("BUDGET_MONTHLY_USD"); err != nil {
+		return err
+	}
+	if cfg.budgetRepoDailyUSD, err = envNonNegativeFloat("BUDGET_REPO_DAILY_USD"); err != nil {
+		return err
+	}
+	cfg.budgetStateFile = strings.TrimSpace(os.Getenv("BUDGET_STATE_FILE"))
+	if cfg.useJITConfig, err = envBoolValue("GITHUB_USE_JIT_CONFIG", true); err != nil {
+		return err
+	}
+	if cfg.prebakedImage, err = envBoolValue("RUNNER_PREBAKED", false); err != nil {
+		return err
+	}
+	if cfg.egressAllowlist, err = compute.ParseEgressAllowlist(os.Getenv("RUNNER_EGRESS_ALLOWLIST")); err != nil {
+		return err
+	}
+	return nil
+}
+
+func envNonNegativeFloat(key string) (float64, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return 0, nil
+	}
+	parsed, err := strconv.ParseFloat(raw, 64)
+	if err != nil || parsed < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative number", key)
+	}
+	return parsed, nil
+}
+
+func defaultInstanceSizeForEnv(provider string) string {
+	switch provider {
+	case "digitalocean":
+		return envOrDefault("DO_SIZE", "s-4vcpu-8gb-amd")
+	case "aws":
+		return strings.TrimSpace(os.Getenv("AWS_INSTANCE_TYPE"))
+	case "gcp":
+		return strings.TrimSpace(os.Getenv("GCP_MACHINE_TYPE"))
+	case "azure":
+		return strings.TrimSpace(os.Getenv("AZURE_VM_SIZE"))
+	case "vultr":
+		return envOrDefault("VULTR_PLAN", "vc2-4c-8gb")
+	case "linode":
+		return envOrDefault("LINODE_INSTANCE_TYPE", "g6-standard-4")
+	default:
+		return ""
+	}
+}
+
+func writeBudgetMetrics(w http.ResponseWriter, tracker *budget.Tracker) {
+	snap := tracker.Snapshot()
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = fmt.Fprintf(w,
+		"# TYPE budget_blocked_total counter\nbudget_blocked_total %d\n# TYPE estimated_spend_usd gauge\nestimated_spend_usd{window=\"daily\"} %.6f\nestimated_spend_usd{window=\"monthly\"} %.6f\nestimated_spend_usd{window=\"in_flight\"} %.6f\n",
+		snap.BudgetBlockedTotal, snap.DailySpendUSD, snap.MonthlySpendUSD, snap.InFlightSpendUSD,
+	)
 }
 
 func loadLabelSizeMap() (map[string]string, error) {
