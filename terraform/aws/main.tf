@@ -38,7 +38,14 @@ variable "tags" {
   default     = {}
 }
 
+data "aws_partition" "current" {}
+data "aws_region" "current" {}
+data "aws_caller_identity" "current" {}
+
 locals {
+  ec2_arn         = "arn:${data.aws_partition.current.partition}:ec2:${data.aws_region.current.name}"
+  account_ec2_arn = "${local.ec2_arn}:${data.aws_caller_identity.current.account_id}"
+  role_name       = "github-runners-controller-${var.controller_id}"
   common_tags = merge(var.tags, {
     "github-runners/controller" = var.controller_id
     "ManagedBy"                 = "terraform"
@@ -96,17 +103,39 @@ data "aws_iam_policy_document" "controller" {
   }
 
   statement {
-    sid = "RunTaggedInstances"
-    actions = [
-      "ec2:RunInstances",
-      "ec2:CreateTags",
-    ]
-    resources = ["*"]
+    sid       = "RunTaggedInstances"
+    actions   = ["ec2:RunInstances"]
+    resources = ["${local.account_ec2_arn}:instance/*"]
 
     condition {
       test     = "StringEquals"
       variable = "aws:RequestTag/github-runners/controller"
       values   = [var.controller_id]
+    }
+  }
+
+  statement {
+    sid     = "UseLaunchResources"
+    actions = ["ec2:RunInstances"]
+    resources = [
+      "${local.ec2_arn}::image/*",
+      "${local.account_ec2_arn}:volume/*",
+      "${local.account_ec2_arn}:subnet/*",
+      "${local.account_ec2_arn}:network-interface/*",
+      "${local.account_ec2_arn}:key-pair/*",
+      aws_security_group.runners.arn,
+    ]
+  }
+
+  statement {
+    sid       = "TagNewInstances"
+    actions   = ["ec2:CreateTags"]
+    resources = ["${local.account_ec2_arn}:instance/*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:CreateAction"
+      values   = ["RunInstances"]
     }
   }
 
@@ -124,7 +153,7 @@ data "aws_iam_policy_document" "controller" {
 }
 
 resource "aws_iam_role" "controller" {
-  name               = "github-runners-controller-${var.controller_id}"
+  name               = length(local.role_name) <= 64 ? local.role_name : "${substr(local.role_name, 0, 51)}-${substr(sha256(var.controller_id), 0, 12)}"
   assume_role_policy = data.aws_iam_policy_document.controller_assume.json
   tags               = local.common_tags
 }

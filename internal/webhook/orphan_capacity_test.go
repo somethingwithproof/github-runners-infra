@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thomasvincent/github-runners-infra/internal/budget"
 	"github.com/thomasvincent/github-runners-infra/internal/state"
 )
 
@@ -63,11 +64,28 @@ func TestOrphanCapacityReleasedOnlyAfterExactProviderAbsence(t *testing.T) {
 			if next, _, err := store.ClaimNext(ctx, time.Now(), 5); next != nil || err != nil {
 				t.Fatalf("orphan must reserve capacity: %#v %v", next, err)
 			}
+			tracker, err := budget.NewTracker(budget.Config{DailyCapUSD: 10})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := tracker.Reserve(budget.Reservation{Key: record.Key, HourlyRateUSD: 1}); err != nil {
+				t.Fatal(err)
+			}
+			handler.budgetTracker = tracker
 			errs := handler.reconcileOrphanedInstances(ctx)
 			if (len(errs) != 0) != (tc.err != nil) {
 				t.Fatalf("errors: %v", errs)
 			}
 			released := tc.absent && tc.err == nil && tc.provider == "test"
+			spend := tracker.Snapshot()
+			if (spend.InFlightSpendUSD == 0) != released || spend.DailySpendUSD <= 0 {
+				t.Fatalf("unexpected orphan budget: %+v", spend)
+			}
+			if released {
+				if errs := handler.reconcileOrphanedInstances(ctx); len(errs) != 0 || tracker.Snapshot().DailySpendUSD != spend.DailySpendUSD {
+					t.Fatalf("repeated settlement: %v", errs)
+				}
+			}
 			persisted, _, err := store.Get(ctx, record.Key)
 			if err != nil || (persisted.InstanceID == "") != released || persisted.Status != state.StatusOrphaned || persisted.GitHubRunnerID != 101 || persisted.LastError != "ownership mismatch" {
 				t.Fatalf("orphan audit identity: %#v %v", persisted, err)

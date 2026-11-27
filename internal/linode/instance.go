@@ -86,9 +86,14 @@ type linodeMetadata struct {
 	UserData string `json:"user_data"`
 }
 
+type linodeInterfaceIPv4 struct {
+	NAT string `json:"nat_1_1"`
+}
+
 type linodeInterface struct {
-	Purpose  string `json:"purpose"`
-	SubnetID int    `json:"subnet_id,omitempty"`
+	IPv4     *linodeInterfaceIPv4 `json:"ipv4,omitempty"`
+	Purpose  string               `json:"purpose"`
+	SubnetID int                  `json:"subnet_id,omitempty"`
 }
 
 type createInstanceRequest struct {
@@ -236,7 +241,7 @@ func (c *Client) buildCreateRequest(name, instanceType, jobKey, rootPass, userDa
 		PrivateIP:      false,
 	}
 	if c.vpcSubnetID > 0 {
-		req.Interfaces = []linodeInterface{{Purpose: "vpc", SubnetID: c.vpcSubnetID}}
+		req.Interfaces = []linodeInterface{{Purpose: "vpc", SubnetID: c.vpcSubnetID, IPv4: &linodeInterfaceIPv4{NAT: "any"}}}
 	}
 	return req
 }

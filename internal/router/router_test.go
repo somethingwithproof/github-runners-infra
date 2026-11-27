@@ -383,6 +383,28 @@ func TestRouterSpotPricingFailoverAndOnDemandFallback(t *testing.T) {
 		}
 	})
 
+	t.Run("denied budget prevents on-demand launch", func(t *testing.T) {
+		aws := newStubProvider("aws")
+		aws.createErr = compute.ErrCapacityUnavailable
+		r, err := New(Config{DefaultSpot: true, SpotFallbackOnDemand: true, Backends: []Backend{{Name: "aws", DefaultSize: "m7i.xlarge", Provider: aws}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		denied := errors.New("budget exhausted")
+		_, err = r.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:cap", AuthorizeLaunch: func(provider, size string, spot bool) error {
+			if provider != "aws" || size != "m7i.xlarge" {
+				t.Fatalf("unexpected quote %s/%s", provider, size)
+			}
+			if !spot {
+				return denied
+			}
+			return nil
+		}})
+		if !errors.Is(err, denied) || aws.createCalls != 1 {
+			t.Fatalf("create calls = %d, error = %v", aws.createCalls, err)
+		}
+	})
+
 	t.Run("no on-demand fallback when SpotFallbackOnDemand is false", func(t *testing.T) {
 		awsProv := newStubProvider("aws")
 		awsProv.createErr = fmt.Errorf("%w: aws spot full", compute.ErrCapacityUnavailable)

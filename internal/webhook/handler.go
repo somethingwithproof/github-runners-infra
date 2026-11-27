@@ -746,6 +746,10 @@ func (h *Handler) reconcileOrphanedInstances(ctx context.Context) []error {
 		if !absent {
 			continue
 		}
+		if err := h.budgetTracker.Settle(record.Key); err != nil {
+			reconciliationErrors = append(reconciliationErrors, fmt.Errorf("settle absent orphan %s: %w", record.Key, err))
+			continue
+		}
 		if err := h.store.ReleaseAbsentOrphan(context.WithoutCancel(ctx), record.Key, record.InstanceID); err != nil {
 			reconciliationErrors = append(reconciliationErrors, fmt.Errorf("release absent orphan %s: %w", record.Key, err))
 			continue
@@ -793,11 +797,12 @@ func (h *Handler) reconcileProvisionedRunners(ctx context.Context) []error {
 	if err != nil {
 		return []error{fmt.Errorf("list provisioned runners: %w", err)}
 	}
+	lookup := compute.ReconciliationLookup(h.computeClient)
 	for _, record := range provisioned {
 		if record.Provider != h.provider {
 			continue
 		}
-		requeued, err := h.reconcileProvisionedRunner(ctx, record)
+		requeued, err := h.reconcileProvisionedRunner(ctx, record, lookup)
 		if err != nil {
 			reconciliationErrors = append(reconciliationErrors, err)
 			continue
@@ -810,14 +815,14 @@ func (h *Handler) reconcileProvisionedRunners(ctx context.Context) []error {
 	return reconciliationErrors
 }
 
-func (h *Handler) reconcileProvisionedRunner(ctx context.Context, record state.Record) (bool, error) {
+func (h *Handler) reconcileProvisionedRunner(ctx context.Context, record state.Record, lookup compute.RunnerLookup) (bool, error) {
 	if !record.NextAttemptAt.IsZero() && record.NextAttemptAt.After(time.Now()) {
 		return false, nil
 	}
 	if !record.RegisteredAt.IsZero() && time.Since(record.ReconciledAt) < h.livenessCheckInterval {
 		return false, nil
 	}
-	_, found, err := h.computeClient.FindRunner(ctx, record.Key)
+	_, found, err := lookup(ctx, record.Key)
 	if err != nil {
 		if errors.Is(err, compute.ErrDuplicateInstances) {
 			return h.reconcileDuplicateRunners(ctx, record)
@@ -1171,7 +1176,17 @@ func (h *Handler) provision(ctx context.Context, record state.Record) {
 		EgressAllowlist:         h.egressAllowlist,
 		Spot:                    spotPref,
 	}
+	if h.budgetTracker.Enabled() {
+		params.AuthorizeLaunch = func(provider, size string, spot bool) error {
+			return h.budgetTracker.Reserve(budget.Reservation{
+				Key: record.Key, Repository: record.Owner + "/" + record.Repository,
+				Provider: provider, Size: size, Spot: spot,
+				HourlyRateUSD: router.HourlyRateForMode(provider, size, spot, h.hourlyRateOverrides),
+			})
+		}
+	}
 	if regToken != "" {
+		params.RegistrationLabels = record.Labels
 		params.RunnerRepoURL = fmt.Sprintf("https://github.com/%s/%s", record.Owner, record.Repository)
 	}
 	instance, err := h.computeClient.CreateRunner(ctx, params)

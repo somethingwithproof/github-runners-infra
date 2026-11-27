@@ -204,6 +204,9 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 		return inst, nil
 	}
 	if useSpot && c.spotFallbackOnDemand && compute.IsCapacityError(err) {
+		if err := params.CheckLaunchBudget(c.Provider(), machineType, false); err != nil {
+			return nil, err
+		}
 		log.Printf("WARN: GCP spot capacity unavailable for %s (%v); falling back to on-demand", params.JobKey, err)
 		return c.insertInstance(ctx, params, machineType, false, requestIDForFallback(params.JobKey, params.ProvisionEpoch))
 	}

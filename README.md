@@ -67,7 +67,7 @@ labels.
   exceeded without ever blocking deletion or orphan cleanup, and exports
   Prometheus metrics on `GET /metrics`.
 - **Secret-free runner VMs with runaway and egress controls:** Cloud credentials
-  never enter user data. Every VM arms a transient `systemd-run` dead-man
+  never enter user data. Every VM arms a persistent systemd dead-man
   poweroff timer (`RUNNER_DEADMAN_MINUTES`, default 180), supports an optional
   `iptables` HTTPS egress allowlist (`RUNNER_EGRESS_ALLOWLIST`), and is bounded
   by controller-side `MAX_RUNNER_AGE` sweeps.
@@ -276,8 +276,8 @@ on AWS, `large=n2-standard-8` on GCP, `large=Standard_D8s_v5` on Azure,
 allowlist. Set only one of `LABEL_SIZE_MAP`, `DO_LABEL_SIZE_MAP`, or
 `OCI_LABEL_SIZE_MAP`.
 
-`RUNNER_DEADMAN_MINUTES` arms a secret-free transient `systemd-run` poweroff
-timer inside each runner VM (default `180` minutes, `0` disables). No cloud API
+`RUNNER_DEADMAN_MINUTES` arms a secret-free persistent systemd poweroff
+timer inside each runner VM (default `180` minutes, `0` disables). The original deadline survives a reboot. No cloud API
 credentials enter cloud-init user data. Because providers such as DigitalOcean,
 Vultr, and Linode continue billing powered-off VMs until the instance is
 destroyed, the dead-man fuse halts runaway execution while the controller's
@@ -477,7 +477,7 @@ Powered-off Vultr instances continue billing until destroyed by the controller.
 ```dotenv
 COMPUTE_PROVIDER=linode
 LINODE_TOKEN=read-from-your-secret-manager-at-deploy-time
-LINODE_REGION=us-east
+LINODE_REGION=us-ord
 LINODE_INSTANCE_TYPE=g6-standard-4
 LINODE_IMAGE=linode/ubuntu24.04
 LINODE_FIREWALL_ID=12345
@@ -491,7 +491,7 @@ cryptographically random throwaway root passwords (with root and password SSH
 disabled by cloud-init), controller and job ownership tags, `X-Filter` tag
 queries, ambiguous-create recovery polling, authoritative 404 absence checks,
 and paginated orphan sweeps. Provision the VPC, subnet, and default-DROP Cloud
-Firewall with [`terraform/linode`](terraform/linode). Powered-off Linode
+Firewall with [`terraform/linode`](terraform/linode). Set `LINODE_REGION` to the module’s `region` output. With a VPC subnet configured, the runner uses 1:1 IPv4 NAT to reach GitHub through the cloud firewall. Powered-off Linode
 instances continue billing until destroyed by the controller.
 
 ### Oracle Cloud Infrastructure (OCI)

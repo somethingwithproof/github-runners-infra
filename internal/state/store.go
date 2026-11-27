@@ -69,7 +69,8 @@ type Record struct {
 	ReassignedRunID int64 `json:"reassigned_run_id,omitempty"`
 	// DeletionAcceptedID records a successful, ownership-verified provider delete.
 	// Bind it to an exact ID so it can never authorize deletion of a replacement.
-	DeletionAcceptedID string `json:"deletion_accepted_id,omitempty"`
+	DeletionAcceptedID string    `json:"deletion_accepted_id,omitempty"`
+	DeletionAcceptedAt time.Time `json:"deletion_accepted_at,omitzero"`
 	// DropletID is read only to migrate state written before provider-neutral IDs.
 	DropletID           int       `json:"droplet_id,omitempty"`
 	Status              Status    `json:"status"`
@@ -891,6 +892,7 @@ func (s *FileStore) MarkProvisioned(_ context.Context, key, instanceID string, r
 	record.InstanceID = instanceID
 	if record.DeletionAcceptedID != instanceID {
 		record.DeletionAcceptedID = ""
+		record.DeletionAcceptedAt = time.Time{}
 	}
 	record.DropletID = 0
 	record.GitHubRunnerID = runnerID
@@ -1172,9 +1174,13 @@ func (s *FileStore) MarkDeletionAccepted(_ context.Context, key, instanceID stri
 		return fmt.Errorf("cannot record deletion acceptance for unclaimed instance %q", instanceID)
 	}
 	before := clone(record)
-	record.DeletionAcceptedID = instanceID
-	record.ConfirmAttempts = 0
-	record.UpdatedAt = time.Now().UTC()
+	now := time.Now().UTC()
+	if record.DeletionAcceptedID != instanceID || record.DeletionAcceptedAt.IsZero() {
+		record.DeletionAcceptedID = instanceID
+		record.DeletionAcceptedAt = now
+		record.ConfirmAttempts = 0
+	}
+	record.UpdatedAt = now
 	s.records[key] = record
 	s.markDirty(key)
 	if err := s.saveLocked(); err != nil {
@@ -1196,11 +1202,12 @@ func (s *FileStore) DeferDeletionConfirmation(_ context.Context, key, message st
 		record.ClaimedWork = ""
 		record.LastError = message
 		record.ConfirmAttempts++
-		baseTime := record.ProvisionedAt
-		if baseTime.IsZero() {
-			baseTime = record.CreatedAt
+		now := time.Now().UTC()
+		if record.DeletionAcceptedAt.IsZero() {
+			// Older records stored the accepted ID without a timestamp.
+			record.DeletionAcceptedAt = now
 		}
-		ageExpired := policy.MaxAge > 0 && !baseTime.IsZero() && time.Now().UTC().Sub(baseTime) >= policy.MaxAge
+		ageExpired := policy.MaxAge > 0 && now.Sub(record.DeletionAcceptedAt) >= policy.MaxAge
 		budgetExhausted := policy.MaxAttempts > 0 && record.ConfirmAttempts >= policy.MaxAttempts
 		if budgetExhausted || ageExpired {
 			record.Status = StatusOrphaned
@@ -1245,6 +1252,7 @@ func (s *FileStore) FinishDeletedRunner(_ context.Context, key string, queued bo
 		record.Status = StatusPending
 		record.InstanceID = ""
 		record.DeletionAcceptedID = ""
+		record.DeletionAcceptedAt = time.Time{}
 		record.GitHubRunnerID = 0
 		record.GitHubRunnerOwned = false
 		record.RunnerName = ""
@@ -1493,6 +1501,7 @@ func (s *FileStore) RequeueMissingRunner(_ context.Context, key string, guard Ru
 		}
 		record.InstanceID = ""
 		record.DeletionAcceptedID = ""
+		record.DeletionAcceptedAt = time.Time{}
 		record.ProvisionedAt = time.Time{}
 		record.RegisteredAt = time.Time{}
 		record.ReconciledAt = time.Time{}

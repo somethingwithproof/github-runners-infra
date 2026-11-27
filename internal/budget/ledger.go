@@ -166,13 +166,16 @@ func (t *Tracker) Reserve(res Reservation) error {
 	nowUTC := t.now().UTC()
 	t.rolloverLocked(nowUTC)
 
-	if _, exists := t.state.InFlight[res.Key]; exists {
+	repo := strings.ToLower(strings.TrimSpace(res.Repository))
+	provider := strings.ToLower(strings.TrimSpace(res.Provider))
+	size := strings.TrimSpace(res.Size)
+	previous, exists := t.state.InFlight[res.Key]
+	if exists && previous.Provider == provider && previous.Size == size && previous.Spot == res.Spot &&
+		previous.HourlyRateUSD == res.HourlyRateUSD && previous.Repository == repo {
 		return nil
 	}
-
-	repo := strings.ToLower(strings.TrimSpace(res.Repository))
 	estCost := res.HourlyRateUSD * t.reservationDuration.Hours()
-	inFlightTotal, inFlightRepo := t.inFlightTotalsLocked(nowUTC, repo)
+	inFlightTotal, inFlightRepo := t.inFlightTotalsLocked(nowUTC, repo, res.Key)
 
 	projectedDaily := t.state.DailyAccruedUSD + inFlightTotal + estCost
 	projectedMonthly := t.state.MonthlyAccruedUSD + inFlightTotal + estCost
@@ -190,21 +193,36 @@ func (t *Tracker) Reserve(res Reservation) error {
 
 	t.state.InFlight[res.Key] = activeReservation{
 		Repository:      repo,
-		Provider:        strings.ToLower(strings.TrimSpace(res.Provider)),
-		Size:            strings.TrimSpace(res.Size),
+		Provider:        provider,
+		Size:            size,
 		Spot:            res.Spot,
 		HourlyRateUSD:   res.HourlyRateUSD,
 		EstimatedCapUSD: estCost,
 		StartedAt:       nowUTC,
 	}
-	return t.persistLocked()
+	if err := t.persistLocked(); err != nil {
+		if exists {
+			t.state.InFlight[res.Key] = previous
+		} else {
+			delete(t.state.InFlight, res.Key)
+		}
+		return err
+	}
+	return nil
 }
 
 // Release settles an in-flight runner into accrued daily/monthly spend based on
 // elapsed runtime. Release is never blocked by budget caps.
 func (t *Tracker) Release(key string) {
+	if err := t.Settle(key); err != nil {
+		log.Printf("WARN: persist budget ledger after release for %s: %v", key, err)
+	}
+}
+
+// Settle records the elapsed cost once. On a write failure the reservation remains retriable.
+func (t *Tracker) Settle(key string) error {
 	if t == nil || key == "" {
-		return
+		return nil
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -214,7 +232,7 @@ func (t *Tracker) Release(key string) {
 
 	active, ok := t.state.InFlight[key]
 	if !ok {
-		return
+		return nil
 	}
 	delete(t.state.InFlight, key)
 
@@ -223,14 +241,24 @@ func (t *Tracker) Release(key string) {
 		elapsed = minAccruedDuration
 	}
 	actualCost := active.HourlyRateUSD * elapsed.Hours()
+	priorDaily, priorMonthly := t.state.DailyAccruedUSD, t.state.MonthlyAccruedUSD
+	priorRepo, wasAccrued := t.state.RepoDailyAccrued[active.Repository]
 	t.state.DailyAccruedUSD += actualCost
 	t.state.MonthlyAccruedUSD += actualCost
 	if active.Repository != "" {
 		t.state.RepoDailyAccrued[active.Repository] += actualCost
 	}
 	if err := t.persistLocked(); err != nil {
-		log.Printf("WARN: persist budget ledger after release for %s: %v", key, err)
+		t.state.InFlight[key] = active
+		t.state.DailyAccruedUSD, t.state.MonthlyAccruedUSD = priorDaily, priorMonthly
+		if wasAccrued {
+			t.state.RepoDailyAccrued[active.Repository] = priorRepo
+		} else {
+			delete(t.state.RepoDailyAccrued, active.Repository)
+		}
+		return err
 	}
+	return nil
 }
 
 // Cancel drops an in-flight reservation without accruing spend (used when
@@ -262,7 +290,7 @@ func (t *Tracker) Snapshot() Metrics {
 	nowUTC := t.now().UTC()
 	t.rolloverLocked(nowUTC)
 
-	inFlightTotal, _ := t.inFlightTotalsLocked(nowUTC, "")
+	inFlightTotal, _ := t.inFlightTotalsLocked(nowUTC, "", "")
 	repoSpend := make(map[string]float64, len(t.state.RepoDailyAccrued))
 	for repo, cost := range t.state.RepoDailyAccrued {
 		repoSpend[repo] = cost
@@ -308,8 +336,11 @@ func (t *Tracker) rolloverLocked(nowUTC time.Time) {
 	}
 }
 
-func (t *Tracker) inFlightTotalsLocked(nowUTC time.Time, repo string) (total, forRepo float64) {
-	for _, active := range t.state.InFlight {
+func (t *Tracker) inFlightTotalsLocked(nowUTC time.Time, repo, excludeKey string) (total, forRepo float64) {
+	for key, active := range t.state.InFlight {
+		if key == excludeKey {
+			continue
+		}
 		cost := activeEstimate(active, nowUTC)
 		total += cost
 		if repo != "" && active.Repository == repo {

@@ -70,3 +70,20 @@ func TestReconcileAmbiguousCreateConfirmedAbsentAndRecovered(t *testing.T) {
 		}
 	})
 }
+
+func TestSweepContinuesAfterResourceError(t *testing.T) {
+	failure := errors.New("delete rejected")
+	var attempted []string
+	deleted, err := SweepOrphans(context.Background(), "test", "owned", nil, time.Now(), []string{"first", "second"},
+		func(id string) string { return id }, func(string) []string { return []string{"owned"} },
+		func(string) (time.Time, error) { return time.Time{}, nil }, func(_ context.Context, id string) error {
+			attempted = append(attempted, id)
+			if id == "first" {
+				return failure
+			}
+			return nil
+		})
+	if !errors.Is(err, failure) || deleted != 1 || len(attempted) != 2 || attempted[1] != "second" {
+		t.Fatalf("deleted=%d, attempts=%v, err=%v", deleted, attempted, err)
+	}
+}

@@ -158,3 +158,54 @@ func TestDeletionConfirmationEscalatesWhenBudgetExhausted(t *testing.T) {
 		t.Fatalf("exhausted confirmation state = %#v, %v", current, err)
 	}
 }
+
+func TestConfirmationAgeStartsAtDeletionAcceptance(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		ctx := context.Background()
+		store := openTestStore(t)
+		key := "org/repo:long-running"
+		provisionTestRunner(t, store, Record{Key: key, DeliveryID: "delivery"}, "123", 101, "runner")
+		if err := store.MarkCompleted(ctx, key); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := store.ClaimNext(ctx, time.Now(), 3); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.MarkDeletionAccepted(ctx, key, "123"); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.update(key, func(rec *Record) {
+			rec.ProvisionedAt = time.Now().Add(-24 * time.Hour)
+			if legacy {
+				rec.DeletionAcceptedAt = time.Time{}
+			}
+		}); err != nil {
+			t.Fatal(err)
+		}
+		deferCheck := func() {
+			t.Helper()
+			if err := store.DeferDeletionConfirmation(ctx, key, "pending", time.Now(), DeferPolicy{MaxAge: time.Hour}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		deferCheck()
+		rec, _, err := store.Get(ctx, key)
+		if err != nil || rec.Status == StatusOrphaned || rec.DeletionAcceptedAt.IsZero() {
+			t.Fatalf("first confirmation (legacy=%v): %+v, %v", legacy, rec, err)
+		}
+		if _, _, err := store.ClaimNext(ctx, time.Now(), 3); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.update(key, func(rec *Record) { rec.DeletionAcceptedAt = time.Now().Add(-2 * time.Hour) }); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.MarkDeletionAccepted(ctx, key, "123"); err != nil {
+			t.Fatal(err)
+		}
+		deferCheck()
+		rec, _, err = store.Get(ctx, key)
+		if err != nil || rec.Status != StatusOrphaned {
+			t.Fatalf("expired confirmation (legacy=%v): %+v, %v", legacy, rec, err)
+		}
+	}
+}
