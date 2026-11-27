@@ -30,9 +30,11 @@ predictable: no idle runner fleet, no cluster to maintain, and a fresh isolated
 VM for every job.
 
 Cloud API credentials and the GitHub App private key stay on the controller
-host. Each runner VM receives only a single-use, repository-scoped GitHub JIT
-configuration and public artifact metadata, runs at most one job, and powers
-off while the controller deletes only instances carrying its ownership tags or
+host. By default (`GITHUB_USE_JIT_CONFIG=true`), each runner VM receives only a
+single-use, repository-scoped GitHub JIT configuration and public artifact
+metadata (setting `GITHUB_USE_JIT_CONFIG=false` falls back to a registration
+token in user data without JIT isolation), runs at most one job, and powers off
+while the controller deletes only instances carrying its ownership tags or
 labels.
 
 ## Key capabilities
@@ -108,9 +110,10 @@ wins over stale API observations. An unavailable API defers the demand decision;
 it does not discard the queued job or allocate an unverified replacement.
 
 Cloud credentials and the GitHub App private key remain on the controller.
-Runner user data contains only GitHub's single-use JIT configuration and public
-artifact metadata. Before deletion, every provider adapter verifies the
-controller ownership tag or label. Existing DigitalOcean state files are
+In the default JIT mode, runner user data contains only GitHub's single-use
+JIT configuration and public artifact metadata (setting
+`GITHUB_USE_JIT_CONFIG=false` passes a registration token instead). Before
+deletion, every provider adapter verifies the controller ownership tag or label. Existing DigitalOcean state files are
 automatically migrated from numeric `droplet_id` to provider-neutral string
 `instance_id` values.
 
@@ -502,8 +505,8 @@ OCI_IMAGE_OCID=ocid1.image.oc1.iad.example
 OCI_SHAPE=VM.Standard.E4.Flex
 OCI_OCPUS=4
 OCI_MEMORY_GB=16
-# Optional: per-label Flex/fixed overrides (or use LABEL_SIZE_MAP; set only one).
-OCI_LABEL_SIZE_MAP=arm=VM.Standard.A1.Flex:4:24,large=VM.Standard.E4.Flex:8:32
+# Optional: per-label x86_64 Flex/fixed overrides (or use LABEL_SIZE_MAP; set only one).
+OCI_LABEL_SIZE_MAP=large=VM.Standard.E4.Flex:8:32,xlarge=VM.Standard.E5.Flex:8:32
 OCI_ASSIGN_PUBLIC_IP=false
 # Optional: path to an SSH public key file injected into instance metadata.
 OCI_SSH_PUBLIC_KEY_FILE=
