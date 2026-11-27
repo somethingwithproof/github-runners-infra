@@ -114,10 +114,7 @@ func HourlyRateForMode(provider, size string, spot bool, overrides map[string]fl
 	p := strings.ToLower(strings.TrimSpace(provider))
 	s := strings.TrimSpace(size)
 	if overrides != nil {
-		if rate, ok := overrides[p+":"+s+":spot"]; ok {
-			return rate
-		}
-		if rate, ok := overrides[p+":"+strings.ToLower(s)+":spot"]; ok {
+		if rate, ok := lookupRateOverride(overrides, p, s, ":spot"); ok {
 			return rate
 		}
 		if rate, ok := overrides[p+":spot"]; ok {
@@ -136,10 +133,7 @@ func HourlyRate(provider, size string, overrides map[string]float64) float64 {
 	lowerKey := p + ":" + strings.ToLower(s)
 
 	if overrides != nil {
-		if rate, ok := overrides[exactKey]; ok {
-			return rate
-		}
-		if rate, ok := overrides[lowerKey]; ok {
+		if rate, ok := lookupRateOverride(overrides, p, s, ""); ok {
 			return rate
 		}
 		if rate, ok := overrides[p]; ok {
@@ -161,6 +155,26 @@ func HourlyRate(provider, size string, overrides map[string]float64) float64 {
 		return rate
 	}
 	return unknownProviderFallbackRate
+}
+
+func lookupRateOverride(overrides map[string]float64, provider, size, suffix string) (float64, bool) {
+	if rate, ok := overrides[provider+":"+size+suffix]; ok {
+		return rate, true
+	}
+	if rate, ok := overrides[provider+":"+strings.ToLower(size)+suffix]; ok {
+		return rate, true
+	}
+	if provider == "oci" {
+		if bare, _, hasDims := strings.Cut(size, ":"); hasDims && bare != "" {
+			if rate, ok := overrides[provider+":"+bare+suffix]; ok {
+				return rate, true
+			}
+			if rate, ok := overrides[provider+":"+strings.ToLower(bare)+suffix]; ok {
+				return rate, true
+			}
+		}
+	}
+	return 0, false
 }
 
 func ociFlexHourlyRate(size string) (float64, bool) {

@@ -17,6 +17,12 @@ build tools, and a SHA-256-verified `actions/runner` archive pre-installed in
 | Linode / Akamai | [`linode.pkr.hcl`](./linode.pkr.hcl) | `LINODE_TOKEN` |
 | Oracle Cloud (OCI) | [`oci.pkr.hcl`](./oci.pkr.hcl) | `~/.oci/config` |
 
+> **OCI private-subnet builds:** When targeting a private VCN subnet with no
+> public IPs, pass `-var "use_private_ip=true"` from a build host with private
+> VCN reachability and use a dedicated Packer build subnet (or temporary
+> build-host-only SSH ingress rule). Keep the production `terraform/oci` runner
+> subnet deny-inbound.
+
 ## Build example
 
 ```bash

@@ -29,12 +29,18 @@ variable "memory_in_gbs" {
   type    = number
   default = 16
 }
+variable "use_private_ip" {
+  type        = bool
+  default     = false
+  description = "Connect to the temporary build VM over its private IP when building in a private VCN subnet."
+}
 
 source "oracle-oci" "runner" {
   availability_domain = var.availability_domain
   base_image_ocid     = var.base_image_ocid
   compartment_ocid    = var.compartment_ocid
   subnet_ocid         = var.subnet_ocid
+  use_private_ip      = var.use_private_ip
   shape               = var.shape
   ssh_username        = "ubuntu"
   image_name          = "github-runner-${var.runner_version}-{{timestamp}}"

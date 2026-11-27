@@ -421,5 +421,22 @@ func TestRouterSpotPricingFailoverAndOnDemandFallback(t *testing.T) {
 		if got := HourlyRateForMode("oci", "VM.Standard.E4.Flex:4:16", true, nil); got != 0.062 {
 			t.Fatalf("oci default E4.Flex preemptible rate = %v, want 0.062", got)
 		}
+		bareOverrides, err := ParseHourlyRateOverrides("oci:VM.Standard.E4.Flex=0.50, oci:VM.Standard.E4.Flex:spot=0.20")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := HourlyRate("oci", "VM.Standard.E4.Flex:4:16", bareOverrides); got != 0.50 {
+			t.Fatalf("oci bare-shape fallback rate = %v, want 0.50", got)
+		}
+		if got := HourlyRateForMode("oci", "VM.Standard.E4.Flex:4:16", true, bareOverrides); got != 0.20 {
+			t.Fatalf("oci bare-shape spot fallback rate = %v, want 0.20", got)
+		}
+		bothOverrides, err := ParseHourlyRateOverrides("oci:VM.Standard.E4.Flex=0.50, oci:VM.Standard.E4.Flex:4:16=0.40")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := HourlyRate("oci", "VM.Standard.E4.Flex:4:16", bothOverrides); got != 0.40 {
+			t.Fatalf("oci exact-dimension precedence = %v, want 0.40", got)
+		}
 	})
 }

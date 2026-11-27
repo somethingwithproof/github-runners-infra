@@ -394,7 +394,7 @@ func (c *Client) launchInstance(
 	}
 
 	headers := map[string]string{
-		"opc-retry-token": retryToken(params.JobKey, params.ProvisionEpoch, isFallback),
+		"opc-retry-token": retryToken(params.JobKey, params.ProvisionEpoch, isFallback, useSpot),
 	}
 	var created ociInstance
 	if err := c.doJSON(ctx, http.MethodPost, instancesPath, headers, reqBody, &created, nil); err != nil {
@@ -642,8 +642,8 @@ func instanceTags(inst ociInstance) []string {
 	return tags
 }
 
-func retryToken(jobKey string, epoch int, isFallback bool) string {
-	seed := fmt.Sprintf("oci:%s:%d:fb:%t", jobKey, epoch, isFallback)
+func retryToken(jobKey string, epoch int, isFallback, spot bool) string {
+	seed := fmt.Sprintf("oci:%s:%d:fb:%t:spot:%t", jobKey, epoch, isFallback, spot)
 	sum := sha256.Sum256([]byte(seed))
 	return "ghr-" + hex.EncodeToString(sum[:16])
 }

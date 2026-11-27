@@ -370,6 +370,14 @@ func TestOCICapacityClassificationAndOnDemandFallback(t *testing.T) {
 		if retryTokens[0] == retryTokens[1] {
 			t.Fatal("fallback attempt reused spot opc-retry-token")
 		}
+		spotTok := retryToken("org/repo:router-fb", 0, false, true)
+		onDemandTok := retryToken("org/repo:router-fb", 0, false, false)
+		if spotTok == onDemandTok {
+			t.Fatal("spot and router-level on-demand attempts shared opc-retry-token")
+		}
+		if spotTok != retryToken("org/repo:router-fb", 0, false, true) {
+			t.Fatal("same-mode retry token was not deterministic")
+		}
 	})
 }
 
