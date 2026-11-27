@@ -1,5 +1,7 @@
 # Multi-cloud GitHub Actions JIT Runners
 
+<img src="docs/images/runners-infra.jpg" alt="Runners Infra" width="420">
+
 [![CI](https://github.com/somethingwithproof/github-runners-infra/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/somethingwithproof/github-runners-infra/actions/workflows/ci.yml)
 [![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=somethingwithproof_github-runners-infra&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=somethingwithproof_github-runners-infra)
 [![Go minimum](https://img.shields.io/badge/Go_minimum-1.26.9-blue)](./go.mod)
