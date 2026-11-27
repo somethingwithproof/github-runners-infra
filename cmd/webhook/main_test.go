@@ -258,30 +258,16 @@ func TestNewComputeClientRejectsInvalidProviderConfiguration(t *testing.T) {
 			t.Fatalf("invalid GCP_EXTERNAL_IP error = %v", err)
 		}
 	})
-	t.Run("DigitalOcean spot", func(t *testing.T) {
-		t.Setenv("CONTROLLER_ID", "controller-1")
-		t.Setenv("COMPUTE_PROVIDER", "digitalocean")
-		t.Setenv("RUNNER_SPOT", "true")
-		if _, _, err := newComputeClient(context.Background(), context.Background()); err == nil {
-			t.Fatal("newComputeClient accepted DigitalOcean spot")
-		}
-	})
-	t.Run("Vultr spot", func(t *testing.T) {
-		t.Setenv("CONTROLLER_ID", "controller-1")
-		t.Setenv("COMPUTE_PROVIDER", "vultr")
-		t.Setenv("RUNNER_SPOT", "true")
-		if _, _, err := newComputeClient(context.Background(), context.Background()); err == nil {
-			t.Fatal("newComputeClient accepted Vultr spot")
-		}
-	})
-	t.Run("Linode spot", func(t *testing.T) {
-		t.Setenv("CONTROLLER_ID", "controller-1")
-		t.Setenv("COMPUTE_PROVIDER", "linode")
-		t.Setenv("RUNNER_SPOT", "true")
-		if _, _, err := newComputeClient(context.Background(), context.Background()); err == nil {
-			t.Fatal("newComputeClient accepted Linode spot")
-		}
-	})
+	for _, provider := range []string{"digitalocean", "vultr", "linode"} {
+		t.Run(provider+" spot", func(t *testing.T) {
+			t.Setenv("CONTROLLER_ID", "controller-1")
+			t.Setenv("COMPUTE_PROVIDER", provider)
+			t.Setenv("RUNNER_SPOT", "true")
+			if _, _, err := newComputeClient(context.Background(), context.Background()); err == nil {
+				t.Fatalf("newComputeClient accepted %s spot", provider)
+			}
+		})
+	}
 	t.Run("Azure unreadable SSH key", func(t *testing.T) {
 		t.Setenv("CONTROLLER_ID", "controller-1")
 		t.Setenv("COMPUTE_PROVIDER", "azure")

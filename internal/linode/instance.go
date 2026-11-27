@@ -5,19 +5,14 @@
 package linode
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"text/template"
@@ -27,12 +22,12 @@ import (
 )
 
 const (
-	defaultBaseURL               = "https://api.linode.com/v4"
-	defaultRegion                = "us-east"
-	defaultInstanceType          = "g6-standard-4"
-	defaultImage                 = "linode/ubuntu24.04"
-	maxResponseBytes             = 4 * 1024 * 1024
-	confirmedAbsenceObservations = 3
+	defaultBaseURL      = "https://api.linode.com/v4"
+	defaultRegion       = "us-east"
+	defaultInstanceType = "g6-standard-4"
+	defaultImage        = "linode/ubuntu24.04"
+	instancesPath       = "/linode/instances"
+	instancesBasePath   = "/linode/instances/"
 )
 
 var _ compute.Provider = (*Client)(nil)
@@ -67,18 +62,6 @@ type Client struct {
 	controllerTag   string
 	recoveryTimeout time.Duration
 	recoveryPoll    time.Duration
-}
-
-type apiError struct {
-	statusCode int
-	message    string
-}
-
-func (e *apiError) Error() string {
-	if e.message != "" {
-		return fmt.Sprintf("linode API status %d: %s", e.statusCode, e.message)
-	}
-	return fmt.Sprintf("linode API status %d", e.statusCode)
 }
 
 type linodeInstance struct {
@@ -165,20 +148,13 @@ func NewClient(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("linode VPC subnet ID must be positive when set")
 	}
 
-	baseURL, err := normalizeBaseURL(cfg.BaseURL)
+	baseURL, err := compute.NormalizeBaseURL(cfg.BaseURL, defaultBaseURL, "linode")
 	if err != nil {
 		return nil, err
 	}
-
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
-		transport := http.DefaultTransport.(*http.Transport).Clone()
-		transport.ResponseHeaderTimeout = 15 * time.Second
-		transport.TLSHandshakeTimeout = 10 * time.Second
-		httpClient = &http.Client{
-			Transport: transport,
-			Timeout:   30 * time.Second,
-		}
+		httpClient = compute.DefaultHTTPClient()
 	}
 
 	return &Client{
@@ -206,7 +182,7 @@ func (c *Client) Health(ctx context.Context) error {
 		return err
 	}
 	var resp listInstancesResponse
-	if err := c.doJSON(ctx, http.MethodGet, "/linode/instances?page=1&page_size=25", filterHeader, nil, &resp); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, instancesPath+"?page=1&page_size=25", filterHeader, nil, &resp); err != nil {
 		return fmt.Errorf("linode health check: %w", err)
 	}
 	return nil
@@ -230,13 +206,9 @@ func (c *Client) FindRunner(ctx context.Context, jobKey string) (*compute.Runner
 
 // CreateRunner provisions an ephemeral Linode instance with ownership tags and cloud-init metadata.
 func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) (*compute.RunnerInstance, error) {
-	desiredName := instanceName(params.JobKey, params.ProvisionEpoch)
-	existing, found, err := c.FindRunner(ctx, params.JobKey)
-	if err != nil {
-		return nil, err
-	}
-	if found {
-		return existing, nil
+	desiredName := compute.DeterministicName("linode", params.JobKey, params.ProvisionEpoch)
+	if existing, found, err := c.FindRunner(ctx, params.JobKey); err != nil || found {
+		return existing, err
 	}
 
 	instanceType := c.instanceType
@@ -256,52 +228,61 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 		return nil, fmt.Errorf("generate Linode root password: %w", err)
 	}
 
-	reqBody := createInstanceRequest{
-		Region:         c.region,
-		Type:           instanceType,
-		Image:          c.image,
-		Label:          desiredName,
-		RootPass:       rootPass,
-		AuthorizedKeys: c.authorizedKeys,
-		Tags:           []string{c.controllerTag, runnerJobTag(params.JobKey)},
-		FirewallID:     c.firewallID,
-		Metadata: &linodeMetadata{
-			UserData: base64.StdEncoding.EncodeToString([]byte(userData)),
-		},
-		Booted:         true,
-		BackupsEnabled: false,
-		PrivateIP:      false,
-	}
-	if c.vpcSubnetID > 0 {
-		reqBody.Interfaces = []linodeInterface{
-			{Purpose: "vpc", SubnetID: c.vpcSubnetID},
-		}
-	}
-
+	reqBody := c.buildCreateRequest(desiredName, instanceType, params.JobKey, rootPass, userData)
 	var created linodeInstance
-	if err := c.doJSON(ctx, http.MethodPost, "/linode/instances", "", reqBody, &created); err != nil {
-		if !isAmbiguousCreateError(err) {
-			return nil, fmt.Errorf("create Linode instance: %w", err)
-		}
-		recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.recoveryTimeout)
-		defer cancel()
-		recovered, confirmedAbsent, recoveryErr := c.reconcileAmbiguousCreate(recoveryCtx, params.JobKey, desiredName)
-		if recoveryErr != nil {
-			return nil, errors.Join(fmt.Errorf("create Linode instance: %w", err), fmt.Errorf("reconcile ambiguous create: %w", recoveryErr))
-		}
-		if recovered != nil {
-			return &compute.RunnerInstance{ID: strconv.Itoa(recovered.ID), Name: recovered.Label}, nil
-		}
-		if confirmedAbsent {
-			return nil, fmt.Errorf("create Linode instance after confirmed absence: %w", err)
-		}
-		return nil, fmt.Errorf("%w: create Linode instance: %v", compute.ErrCreateOutcomeUnknown, err)
+	if err := c.doJSON(ctx, http.MethodPost, instancesPath, "", reqBody, &created); err != nil {
+		return c.handleCreateError(ctx, params.JobKey, desiredName, err)
 	}
 	if created.ID <= 0 {
 		return nil, fmt.Errorf("%w: Linode API returned no instance ID", compute.ErrCreateOutcomeUnknown)
 	}
 	log.Printf("Created Linode runner instance %s (ID: %d, type: %s)", desiredName, created.ID, instanceType)
 	return &compute.RunnerInstance{ID: strconv.Itoa(created.ID), Name: created.Label}, nil
+}
+
+func (c *Client) buildCreateRequest(name, instanceType, jobKey, rootPass, userData string) createInstanceRequest {
+	req := createInstanceRequest{
+		Region:         c.region,
+		Type:           instanceType,
+		Image:          c.image,
+		Label:          name,
+		RootPass:       rootPass,
+		AuthorizedKeys: c.authorizedKeys,
+		Tags:           []string{c.controllerTag, compute.JobTag(jobKey)},
+		FirewallID:     c.firewallID,
+		Metadata:       &linodeMetadata{UserData: base64.StdEncoding.EncodeToString([]byte(userData))},
+		Booted:         true,
+		BackupsEnabled: false,
+		PrivateIP:      false,
+	}
+	if c.vpcSubnetID > 0 {
+		req.Interfaces = []linodeInterface{{Purpose: "vpc", SubnetID: c.vpcSubnetID}}
+	}
+	return req
+}
+
+func (c *Client) handleCreateError(ctx context.Context, jobKey, desiredName string, createErr error) (*compute.RunnerInstance, error) {
+	if !compute.IsAmbiguousCreateError(createErr) {
+		return nil, fmt.Errorf("create Linode instance: %w", createErr)
+	}
+	recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.recoveryTimeout)
+	defer cancel()
+	recovered, confirmedAbsent, recoveryErr := compute.ReconcileAmbiguousCreate(
+		recoveryCtx, "Linode", desiredName, c.recoveryPoll,
+		func(pollCtx context.Context) (*linodeInstance, error) {
+			return c.findJobInstanceByName(pollCtx, jobKey, desiredName)
+		},
+	)
+	if recoveryErr != nil {
+		return nil, errors.Join(fmt.Errorf("create Linode instance: %w", createErr), fmt.Errorf("reconcile ambiguous create: %w", recoveryErr))
+	}
+	if recovered != nil {
+		return &compute.RunnerInstance{ID: strconv.Itoa(recovered.ID), Name: recovered.Label}, nil
+	}
+	if confirmedAbsent {
+		return nil, fmt.Errorf("create Linode instance after confirmed absence: %w", createErr)
+	}
+	return nil, fmt.Errorf("%w: create Linode instance: %v", compute.ErrCreateOutcomeUnknown, createErr)
 }
 
 // RunnerAbsent checks authoritative absence by Linode numeric ID without mutating it.
@@ -311,9 +292,9 @@ func (c *Client) RunnerAbsent(ctx context.Context, id string) (bool, error) {
 		return false, err
 	}
 	var inst linodeInstance
-	err = c.doJSON(ctx, http.MethodGet, "/linode/instances/"+strconv.Itoa(numericID), "", nil, &inst)
+	err = c.doJSON(ctx, http.MethodGet, instancesBasePath+strconv.Itoa(numericID), "", nil, &inst)
 	if err != nil {
-		if isNotFound(err) {
+		if compute.IsHTTPNotFound(err) {
 			return true, nil
 		}
 		return false, fmt.Errorf("confirm Linode instance %s absence: %w", id, err)
@@ -327,28 +308,25 @@ func (c *Client) DeleteRunner(ctx context.Context, id, jobKey string) error {
 	if err != nil {
 		return err
 	}
-	path := "/linode/instances/" + strconv.Itoa(numericID)
+	path := instancesBasePath + strconv.Itoa(numericID)
 	var inst linodeInstance
 	if err := c.doJSON(ctx, http.MethodGet, path, "", nil, &inst); err != nil {
-		if isNotFound(err) {
+		if compute.IsHTTPNotFound(err) {
 			return nil
 		}
 		return fmt.Errorf("get Linode instance %s before delete: %w", id, err)
 	}
-	if !hasTag(inst.Tags, c.controllerTag) || !hasTag(inst.Tags, runnerJobTag(jobKey)) {
+	if !compute.HasTag(inst.Tags, c.controllerTag) || !compute.HasTag(inst.Tags, compute.JobTag(jobKey)) {
 		var confirm linodeInstance
 		if confirmErr := c.doJSON(ctx, http.MethodGet, path, "", nil, &confirm); confirmErr != nil {
-			if isNotFound(confirmErr) {
+			if compute.IsHTTPNotFound(confirmErr) {
 				return nil
 			}
 			return fmt.Errorf("confirm Linode instance %s after ownership mismatch: %w", id, confirmErr)
 		}
 		return fmt.Errorf("%w: refusing to delete Linode instance %s without controller and job ownership tags", compute.ErrOwnershipMismatch, id)
 	}
-	if err := c.doJSON(ctx, http.MethodDelete, path, "", nil, nil); err != nil {
-		if isNotFound(err) {
-			return nil
-		}
+	if err := c.doJSON(ctx, http.MethodDelete, path, "", nil, nil); err != nil && !compute.IsHTTPNotFound(err) {
 		return fmt.Errorf("delete owned Linode instance %s: %w", id, err)
 	}
 	return nil
@@ -382,7 +360,7 @@ func (c *Client) SweepOrphanedRunners(ctx context.Context, known map[string]stru
 	deleted := 0
 	var parseErrs []error
 	for _, inst := range instances {
-		if !hasTag(inst.Tags, c.controllerTag) {
+		if !compute.HasTag(inst.Tags, c.controllerTag) {
 			continue
 		}
 		id := strconv.Itoa(inst.ID)
@@ -397,46 +375,12 @@ func (c *Client) SweepOrphanedRunners(ctx context.Context, known map[string]stru
 		if !created.Before(cutoff) {
 			continue
 		}
-		if err := c.doJSON(ctx, http.MethodDelete, "/linode/instances/"+id, "", nil, nil); err != nil && !isNotFound(err) {
+		if err := c.doJSON(ctx, http.MethodDelete, instancesBasePath+id, "", nil, nil); err != nil && !compute.IsHTTPNotFound(err) {
 			return deleted, fmt.Errorf("delete orphaned controller Linode instance %s: %w", id, err)
 		}
 		deleted++
 	}
-	if len(parseErrs) > 0 {
-		return deleted, errors.Join(parseErrs...)
-	}
-	return deleted, nil
-}
-
-func (c *Client) reconcileAmbiguousCreate(ctx context.Context, jobKey, name string) (*linodeInstance, bool, error) {
-	observations := 0
-	consecutiveClean := 0
-	for {
-		recovered, err := c.findJobInstanceByName(ctx, jobKey, name)
-		observations++
-		if recovered != nil {
-			return recovered, false, nil
-		}
-		if err == nil {
-			consecutiveClean++
-			if consecutiveClean >= confirmedAbsenceObservations {
-				return nil, true, nil
-			}
-		} else if ctx.Err() == nil {
-			consecutiveClean = 0
-			log.Printf("WARN: Linode ambiguous-create recovery poll %d failed for %s: %v", observations, name, err)
-		}
-		if ctx.Err() != nil {
-			return nil, consecutiveClean >= confirmedAbsenceObservations, nil
-		}
-		timer := time.NewTimer(c.recoveryPoll)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return nil, consecutiveClean >= confirmedAbsenceObservations, nil
-		case <-timer.C:
-		}
-	}
+	return deleted, errors.Join(parseErrs...)
 }
 
 func (c *Client) findJobInstanceByName(ctx context.Context, jobKey, name string) (*linodeInstance, error) {
@@ -458,7 +402,7 @@ func (c *Client) findJobInstanceByName(ctx context.Context, jobKey, name string)
 }
 
 func (c *Client) listJobInstances(ctx context.Context, jobKey, excludedID string) ([]linodeInstance, error) {
-	existing, err := c.listInstancesByTag(ctx, runnerJobTag(jobKey))
+	existing, err := c.listInstancesByTag(ctx, compute.JobTag(jobKey))
 	if err != nil {
 		return nil, fmt.Errorf("look up existing Linode runner instance: %w", err)
 	}
@@ -467,7 +411,7 @@ func (c *Client) listJobInstances(ctx context.Context, jobKey, excludedID string
 		if excludedID != "" && strconv.Itoa(inst.ID) == excludedID {
 			continue
 		}
-		if !hasTag(inst.Tags, c.controllerTag) {
+		if !compute.HasTag(inst.Tags, c.controllerTag) {
 			return nil, fmt.Errorf("%w: job-tagged Linode instance %d belongs to another controller", compute.ErrOwnershipMismatch, inst.ID)
 		}
 		verified = append(verified, inst)
@@ -482,7 +426,7 @@ func (c *Client) listInstancesByTag(ctx context.Context, tag string) ([]linodeIn
 	}
 	var all []linodeInstance
 	for pageNum := 1; ; pageNum++ {
-		path := fmt.Sprintf("/linode/instances?page=%d&page_size=100", pageNum)
+		path := fmt.Sprintf("%s?page=%d&page_size=100", instancesPath, pageNum)
 		var page listInstancesResponse
 		if err := c.doJSON(ctx, http.MethodGet, path, filterHeader, nil, &page); err != nil {
 			return nil, err
@@ -496,67 +440,37 @@ func (c *Client) listInstancesByTag(ctx context.Context, tag string) ([]linodeIn
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path, filterHeader string, reqBody, respBody any) error {
-	var bodyReader io.Reader
-	if reqBody != nil {
-		encoded, err := json.Marshal(reqBody)
-		if err != nil {
-			return fmt.Errorf("marshal Linode request: %w", err)
-		}
-		bodyReader = bytes.NewReader(encoded)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
-	if err != nil {
-		return fmt.Errorf("build Linode request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Accept", "application/json")
+	var headers map[string]string
 	if filterHeader != "" {
-		req.Header.Set("X-Filter", filterHeader)
+		headers = map[string]string{"X-Filter": filterHeader}
 	}
-	if reqBody != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
+	return compute.DoJSON(ctx, compute.RESTRequest{
+		Provider:    "linode",
+		Client:      c.httpClient,
+		Method:      method,
+		URL:         c.baseURL + path,
+		BearerToken: c.token,
+		Headers:     headers,
+		Body:        reqBody,
+		Out:         respBody,
+		ParseError:  parseLinodeError,
+	})
+}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
+func parseLinodeError(raw []byte) string {
+	var payload struct {
+		Errors []struct {
+			Reason string `json:"reason"`
+		} `json:"errors"`
 	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		_ = resp.Body.Close()
-	}()
-
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
-	if err != nil {
-		return fmt.Errorf("read Linode response: %w", err)
-	}
-	if len(raw) > maxResponseBytes {
-		return fmt.Errorf("linode response exceeded %d bytes", maxResponseBytes)
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var errPayload struct {
-			Errors []struct {
-				Reason string `json:"reason"`
-			} `json:"errors"`
+	_ = json.Unmarshal(raw, &payload)
+	var reasons []string
+	for _, item := range payload.Errors {
+		if reason := strings.TrimSpace(item.Reason); reason != "" {
+			reasons = append(reasons, reason)
 		}
-		_ = json.Unmarshal(raw, &errPayload)
-		var reasons []string
-		for _, item := range errPayload.Errors {
-			if reason := strings.TrimSpace(item.Reason); reason != "" {
-				reasons = append(reasons, reason)
-			}
-		}
-		return &apiError{statusCode: resp.StatusCode, message: strings.Join(reasons, "; ")}
 	}
-
-	if respBody == nil || len(bytes.TrimSpace(raw)) == 0 {
-		return nil
-	}
-	if err := json.Unmarshal(raw, respBody); err != nil {
-		return fmt.Errorf("decode Linode response: %w", err)
-	}
-	return nil
+	return strings.Join(reasons, "; ")
 }
 
 func tagFilterHeader(tag string) (string, error) {
@@ -583,18 +497,6 @@ func parseLinodeTime(raw string) (time.Time, error) {
 	return time.ParseInLocation("2006-01-02T15:04:05", trimmed, time.UTC)
 }
 
-func normalizeBaseURL(raw string) (string, error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return defaultBaseURL, nil
-	}
-	parsed, err := url.Parse(trimmed)
-	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
-		return "", fmt.Errorf("invalid Linode API base URL %q", raw)
-	}
-	return strings.TrimRight(trimmed, "/"), nil
-}
-
 // randomRootPassword produces an ephemeral throwaway password meeting Linode's
 // complexity rules; cloud-init disables root and password SSH login.
 func randomRootPassword() (string, error) {
@@ -603,39 +505,4 @@ func randomRootPassword() (string, error) {
 		return "", err
 	}
 	return "Aa9!" + base64.RawURLEncoding.EncodeToString(buf), nil
-}
-
-func hasTag(tags []string, want string) bool {
-	for _, tag := range tags {
-		if tag == want {
-			return true
-		}
-	}
-	return false
-}
-
-func isNotFound(err error) bool {
-	var apiErr *apiError
-	return errors.As(err, &apiErr) && apiErr.statusCode == http.StatusNotFound
-}
-
-func isAmbiguousCreateError(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-	var apiErr *apiError
-	if !errors.As(err, &apiErr) {
-		return true
-	}
-	return apiErr.statusCode >= http.StatusInternalServerError || apiErr.statusCode == http.StatusRequestTimeout
-}
-
-func runnerJobTag(jobKey string) string {
-	jobHash := sha256.Sum256([]byte(jobKey))
-	return "runner-job-" + hex.EncodeToString(jobHash[:8])
-}
-
-func instanceName(jobKey string, provisionEpoch int) string {
-	resourceHash := sha256.Sum256([]byte("linode:" + jobKey + ":" + strconv.Itoa(provisionEpoch)))
-	return "ghr-" + hex.EncodeToString(resourceHash[:16])
 }

@@ -5,20 +5,15 @@
 package vultr
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"regexp"
-	"strconv"
 	"strings"
 	"text/template"
 	"time"
@@ -27,12 +22,12 @@ import (
 )
 
 const (
-	defaultBaseURL               = "https://api.vultr.com/v2"
-	defaultRegion                = "ewr"
-	defaultPlan                  = "vc2-4c-8gb"
-	defaultOSID                  = 2284 // Ubuntu 24.04 LTS x64
-	maxResponseBytes             = 4 * 1024 * 1024
-	confirmedAbsenceObservations = 3
+	defaultBaseURL    = "https://api.vultr.com/v2"
+	defaultRegion     = "ewr"
+	defaultPlan       = "vc2-4c-8gb"
+	defaultOSID       = 2284 // Ubuntu 24.04 LTS x64
+	instancesPath     = "/instances"
+	instancesBasePath = "/instances/"
 )
 
 var instanceIDRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9-]{0,63}$`)
@@ -71,18 +66,6 @@ type Client struct {
 	controllerTag   string
 	recoveryTimeout time.Duration
 	recoveryPoll    time.Duration
-}
-
-type apiError struct {
-	statusCode int
-	message    string
-}
-
-func (e *apiError) Error() string {
-	if e.message != "" {
-		return fmt.Sprintf("vultr API status %d: %s", e.statusCode, e.message)
-	}
-	return fmt.Sprintf("vultr API status %d", e.statusCode)
 }
 
 type vultrInstance struct {
@@ -167,20 +150,13 @@ func NewClient(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("vultr OS ID must be positive")
 	}
 
-	baseURL, err := normalizeBaseURL(cfg.BaseURL)
+	baseURL, err := compute.NormalizeBaseURL(cfg.BaseURL, defaultBaseURL, "vultr")
 	if err != nil {
 		return nil, err
 	}
-
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
-		transport := http.DefaultTransport.(*http.Transport).Clone()
-		transport.ResponseHeaderTimeout = 15 * time.Second
-		transport.TLSHandshakeTimeout = 10 * time.Second
-		httpClient = &http.Client{
-			Transport: transport,
-			Timeout:   30 * time.Second,
-		}
+		httpClient = compute.DefaultHTTPClient()
 	}
 
 	return &Client{
@@ -204,11 +180,9 @@ func NewClient(cfg Config) (*Client, error) {
 // Health verifies API connectivity and credentials using a bounded read-only
 // instance query scoped to this controller's tag.
 func (c *Client) Health(ctx context.Context) error {
-	query := url.Values{}
-	query.Set("tag", c.controllerTag)
-	query.Set("per_page", "1")
+	query := url.Values{"tag": {c.controllerTag}, "per_page": {"1"}}
 	var resp listInstancesResponse
-	if err := c.doJSON(ctx, http.MethodGet, "/instances?"+query.Encode(), nil, &resp); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, instancesPath+"?"+query.Encode(), nil, &resp); err != nil {
 		return fmt.Errorf("vultr health check: %w", err)
 	}
 	return nil
@@ -232,13 +206,9 @@ func (c *Client) FindRunner(ctx context.Context, jobKey string) (*compute.Runner
 
 // CreateRunner provisions an ephemeral Vultr instance with ownership tags.
 func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) (*compute.RunnerInstance, error) {
-	desiredName := instanceName(params.JobKey, params.ProvisionEpoch)
-	existing, found, err := c.FindRunner(ctx, params.JobKey)
-	if err != nil {
-		return nil, err
-	}
-	if found {
-		return existing, nil
+	desiredName := compute.DeterministicName("vultr", params.JobKey, params.ProvisionEpoch)
+	if existing, found, err := c.FindRunner(ctx, params.JobKey); err != nil || found {
+		return existing, err
 	}
 
 	plan := c.plan
@@ -254,45 +224,10 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 		return nil, err
 	}
 
-	reqBody := createInstanceRequest{
-		Region:          c.region,
-		Plan:            plan,
-		Label:           desiredName,
-		Hostname:        desiredName,
-		UserData:        base64.StdEncoding.EncodeToString([]byte(userData)),
-		Tags:            []string{c.controllerTag, runnerJobTag(params.JobKey)},
-		SSHKeyIDs:       c.sshKeyIDs,
-		FirewallGroupID: c.firewallGroupID,
-		Backups:         "disabled",
-		EnableIPv6:      false,
-	}
-	if c.snapshotID != "" {
-		reqBody.SnapshotID = c.snapshotID
-	} else {
-		reqBody.OSID = c.osID
-	}
-	if c.vpcID != "" {
-		reqBody.AttachVPC = []string{c.vpcID}
-	}
-
+	reqBody := c.buildCreateRequest(desiredName, plan, params.JobKey, userData)
 	var resp instanceResponse
-	if err := c.doJSON(ctx, http.MethodPost, "/instances", reqBody, &resp); err != nil {
-		if !isAmbiguousCreateError(err) {
-			return nil, fmt.Errorf("create Vultr instance: %w", err)
-		}
-		recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.recoveryTimeout)
-		defer cancel()
-		recovered, confirmedAbsent, recoveryErr := c.reconcileAmbiguousCreate(recoveryCtx, params.JobKey, desiredName)
-		if recoveryErr != nil {
-			return nil, errors.Join(fmt.Errorf("create Vultr instance: %w", err), fmt.Errorf("reconcile ambiguous create: %w", recoveryErr))
-		}
-		if recovered != nil {
-			return &compute.RunnerInstance{ID: recovered.ID, Name: recovered.Label}, nil
-		}
-		if confirmedAbsent {
-			return nil, fmt.Errorf("create Vultr instance after confirmed absence: %w", err)
-		}
-		return nil, fmt.Errorf("%w: create Vultr instance: %v", compute.ErrCreateOutcomeUnknown, err)
+	if err := c.doJSON(ctx, http.MethodPost, instancesPath, reqBody, &resp); err != nil {
+		return c.handleCreateError(ctx, params.JobKey, desiredName, err)
 	}
 	if resp.Instance.ID == "" {
 		return nil, fmt.Errorf("%w: Vultr API returned no instance ID", compute.ErrCreateOutcomeUnknown)
@@ -301,15 +236,63 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 	return &compute.RunnerInstance{ID: resp.Instance.ID, Name: resp.Instance.Label}, nil
 }
 
+func (c *Client) buildCreateRequest(name, plan, jobKey, userData string) createInstanceRequest {
+	req := createInstanceRequest{
+		Region:          c.region,
+		Plan:            plan,
+		Label:           name,
+		Hostname:        name,
+		UserData:        base64.StdEncoding.EncodeToString([]byte(userData)),
+		Tags:            []string{c.controllerTag, compute.JobTag(jobKey)},
+		SSHKeyIDs:       c.sshKeyIDs,
+		FirewallGroupID: c.firewallGroupID,
+		Backups:         "disabled",
+		EnableIPv6:      false,
+	}
+	if c.snapshotID != "" {
+		req.SnapshotID = c.snapshotID
+	} else {
+		req.OSID = c.osID
+	}
+	if c.vpcID != "" {
+		req.AttachVPC = []string{c.vpcID}
+	}
+	return req
+}
+
+func (c *Client) handleCreateError(ctx context.Context, jobKey, desiredName string, createErr error) (*compute.RunnerInstance, error) {
+	if !compute.IsAmbiguousCreateError(createErr) {
+		return nil, fmt.Errorf("create Vultr instance: %w", createErr)
+	}
+	recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.recoveryTimeout)
+	defer cancel()
+	recovered, confirmedAbsent, recoveryErr := compute.ReconcileAmbiguousCreate(
+		recoveryCtx, "Vultr", desiredName, c.recoveryPoll,
+		func(pollCtx context.Context) (*vultrInstance, error) {
+			return c.findJobInstanceByName(pollCtx, jobKey, desiredName)
+		},
+	)
+	if recoveryErr != nil {
+		return nil, errors.Join(fmt.Errorf("create Vultr instance: %w", createErr), fmt.Errorf("reconcile ambiguous create: %w", recoveryErr))
+	}
+	if recovered != nil {
+		return &compute.RunnerInstance{ID: recovered.ID, Name: recovered.Label}, nil
+	}
+	if confirmedAbsent {
+		return nil, fmt.Errorf("create Vultr instance after confirmed absence: %w", createErr)
+	}
+	return nil, fmt.Errorf("%w: create Vultr instance: %v", compute.ErrCreateOutcomeUnknown, createErr)
+}
+
 // RunnerAbsent checks authoritative absence by instance ID without mutating it.
 func (c *Client) RunnerAbsent(ctx context.Context, id string) (bool, error) {
-	if !validInstanceID(id) {
+	if !instanceIDRegex.MatchString(id) {
 		return false, fmt.Errorf("invalid Vultr instance ID %q", id)
 	}
 	var resp instanceResponse
-	err := c.doJSON(ctx, http.MethodGet, "/instances/"+url.PathEscape(id), nil, &resp)
+	err := c.doJSON(ctx, http.MethodGet, instancesBasePath+url.PathEscape(id), nil, &resp)
 	if err != nil {
-		if isNotFound(err) {
+		if compute.IsHTTPNotFound(err) {
 			return true, nil
 		}
 		return false, fmt.Errorf("confirm Vultr instance %s absence: %w", id, err)
@@ -319,31 +302,28 @@ func (c *Client) RunnerAbsent(ctx context.Context, id string) (bool, error) {
 
 // DeleteRunner deletes a Vultr instance only after verifying controller and job ownership tags.
 func (c *Client) DeleteRunner(ctx context.Context, id, jobKey string) error {
-	if !validInstanceID(id) {
+	if !instanceIDRegex.MatchString(id) {
 		return fmt.Errorf("invalid Vultr instance ID %q", id)
 	}
+	path := instancesBasePath + url.PathEscape(id)
 	var resp instanceResponse
-	if err := c.doJSON(ctx, http.MethodGet, "/instances/"+url.PathEscape(id), nil, &resp); err != nil {
-		if isNotFound(err) {
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &resp); err != nil {
+		if compute.IsHTTPNotFound(err) {
 			return nil
 		}
 		return fmt.Errorf("get Vultr instance %s before delete: %w", id, err)
 	}
-	if !hasTag(resp.Instance.Tags, c.controllerTag) || !hasTag(resp.Instance.Tags, runnerJobTag(jobKey)) {
-		// Re-check once in case a concurrent delete just completed.
+	if !compute.HasTag(resp.Instance.Tags, c.controllerTag) || !compute.HasTag(resp.Instance.Tags, compute.JobTag(jobKey)) {
 		var confirm instanceResponse
-		if confirmErr := c.doJSON(ctx, http.MethodGet, "/instances/"+url.PathEscape(id), nil, &confirm); confirmErr != nil {
-			if isNotFound(confirmErr) {
+		if confirmErr := c.doJSON(ctx, http.MethodGet, path, nil, &confirm); confirmErr != nil {
+			if compute.IsHTTPNotFound(confirmErr) {
 				return nil
 			}
 			return fmt.Errorf("confirm Vultr instance %s after ownership mismatch: %w", id, confirmErr)
 		}
 		return fmt.Errorf("%w: refusing to delete Vultr instance %s without controller and job ownership tags", compute.ErrOwnershipMismatch, id)
 	}
-	if err := c.doJSON(ctx, http.MethodDelete, "/instances/"+url.PathEscape(id), nil, nil); err != nil {
-		if isNotFound(err) {
-			return nil
-		}
+	if err := c.doJSON(ctx, http.MethodDelete, path, nil, nil); err != nil && !compute.IsHTTPNotFound(err) {
 		return fmt.Errorf("delete owned Vultr instance %s: %w", id, err)
 	}
 	return nil
@@ -377,7 +357,7 @@ func (c *Client) SweepOrphanedRunners(ctx context.Context, known map[string]stru
 	deleted := 0
 	var parseErrs []error
 	for _, inst := range instances {
-		if !hasTag(inst.Tags, c.controllerTag) {
+		if !compute.HasTag(inst.Tags, c.controllerTag) {
 			continue
 		}
 		if _, ok := known[inst.ID]; ok {
@@ -391,46 +371,12 @@ func (c *Client) SweepOrphanedRunners(ctx context.Context, known map[string]stru
 		if !created.Before(cutoff) {
 			continue
 		}
-		if err := c.doJSON(ctx, http.MethodDelete, "/instances/"+url.PathEscape(inst.ID), nil, nil); err != nil && !isNotFound(err) {
+		if err := c.doJSON(ctx, http.MethodDelete, instancesBasePath+url.PathEscape(inst.ID), nil, nil); err != nil && !compute.IsHTTPNotFound(err) {
 			return deleted, fmt.Errorf("delete orphaned controller Vultr instance %s: %w", inst.ID, err)
 		}
 		deleted++
 	}
-	if len(parseErrs) > 0 {
-		return deleted, errors.Join(parseErrs...)
-	}
-	return deleted, nil
-}
-
-func (c *Client) reconcileAmbiguousCreate(ctx context.Context, jobKey, name string) (*vultrInstance, bool, error) {
-	observations := 0
-	consecutiveClean := 0
-	for {
-		recovered, err := c.findJobInstanceByName(ctx, jobKey, name)
-		observations++
-		if recovered != nil {
-			return recovered, false, nil
-		}
-		if err == nil {
-			consecutiveClean++
-			if consecutiveClean >= confirmedAbsenceObservations {
-				return nil, true, nil
-			}
-		} else if ctx.Err() == nil {
-			consecutiveClean = 0
-			log.Printf("WARN: Vultr ambiguous-create recovery poll %d failed for %s: %v", observations, name, err)
-		}
-		if ctx.Err() != nil {
-			return nil, consecutiveClean >= confirmedAbsenceObservations, nil
-		}
-		timer := time.NewTimer(c.recoveryPoll)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return nil, consecutiveClean >= confirmedAbsenceObservations, nil
-		case <-timer.C:
-		}
-	}
+	return deleted, errors.Join(parseErrs...)
 }
 
 func (c *Client) findJobInstanceByName(ctx context.Context, jobKey, name string) (*vultrInstance, error) {
@@ -452,7 +398,7 @@ func (c *Client) findJobInstanceByName(ctx context.Context, jobKey, name string)
 }
 
 func (c *Client) listJobInstances(ctx context.Context, jobKey, excludedID string) ([]vultrInstance, error) {
-	existing, err := c.listInstancesByTag(ctx, runnerJobTag(jobKey))
+	existing, err := c.listInstancesByTag(ctx, compute.JobTag(jobKey))
 	if err != nil {
 		return nil, fmt.Errorf("look up existing Vultr runner instance: %w", err)
 	}
@@ -461,7 +407,7 @@ func (c *Client) listJobInstances(ctx context.Context, jobKey, excludedID string
 		if excludedID != "" && inst.ID == excludedID {
 			continue
 		}
-		if !hasTag(inst.Tags, c.controllerTag) {
+		if !compute.HasTag(inst.Tags, c.controllerTag) {
 			return nil, fmt.Errorf("%w: job-tagged Vultr instance %s belongs to another controller", compute.ErrOwnershipMismatch, inst.ID)
 		}
 		verified = append(verified, inst)
@@ -473,14 +419,12 @@ func (c *Client) listInstancesByTag(ctx context.Context, tag string) ([]vultrIns
 	cursor := ""
 	var all []vultrInstance
 	for {
-		query := url.Values{}
-		query.Set("tag", tag)
-		query.Set("per_page", "100")
+		query := url.Values{"tag": {tag}, "per_page": {"100"}}
 		if cursor != "" {
 			query.Set("cursor", cursor)
 		}
 		var page listInstancesResponse
-		if err := c.doJSON(ctx, http.MethodGet, "/instances?"+query.Encode(), nil, &page); err != nil {
+		if err := c.doJSON(ctx, http.MethodGet, instancesPath+"?"+query.Encode(), nil, &page); err != nil {
 			return nil, err
 		}
 		all = append(all, page.Instances...)
@@ -494,105 +438,22 @@ func (c *Client) listInstancesByTag(ctx context.Context, tag string) ([]vultrIns
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, reqBody, respBody any) error {
-	var bodyReader io.Reader
-	if reqBody != nil {
-		encoded, err := json.Marshal(reqBody)
-		if err != nil {
-			return fmt.Errorf("marshal Vultr request: %w", err)
-		}
-		bodyReader = bytes.NewReader(encoded)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
-	if err != nil {
-		return fmt.Errorf("build Vultr request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	req.Header.Set("Accept", "application/json")
-	if reqBody != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		_ = resp.Body.Close()
-	}()
-
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
-	if err != nil {
-		return fmt.Errorf("read Vultr response: %w", err)
-	}
-	if len(raw) > maxResponseBytes {
-		return fmt.Errorf("vultr response exceeded %d bytes", maxResponseBytes)
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var errPayload struct {
-			Error string `json:"error"`
-		}
-		_ = json.Unmarshal(raw, &errPayload)
-		return &apiError{statusCode: resp.StatusCode, message: strings.TrimSpace(errPayload.Error)}
-	}
-
-	if respBody == nil || len(bytes.TrimSpace(raw)) == 0 {
-		return nil
-	}
-	if err := json.Unmarshal(raw, respBody); err != nil {
-		return fmt.Errorf("decode Vultr response: %w", err)
-	}
-	return nil
+	return compute.DoJSON(ctx, compute.RESTRequest{
+		Provider:    "vultr",
+		Client:      c.httpClient,
+		Method:      method,
+		URL:         c.baseURL + path,
+		BearerToken: c.apiKey,
+		Body:        reqBody,
+		Out:         respBody,
+		ParseError:  parseVultrError,
+	})
 }
 
-func normalizeBaseURL(raw string) (string, error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return defaultBaseURL, nil
+func parseVultrError(raw []byte) string {
+	var payload struct {
+		Error string `json:"error"`
 	}
-	parsed, err := url.Parse(trimmed)
-	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
-		return "", fmt.Errorf("invalid Vultr API base URL %q", raw)
-	}
-	return strings.TrimRight(trimmed, "/"), nil
-}
-
-func validInstanceID(id string) bool {
-	return instanceIDRegex.MatchString(id)
-}
-
-func hasTag(tags []string, want string) bool {
-	for _, tag := range tags {
-		if tag == want {
-			return true
-		}
-	}
-	return false
-}
-
-func isNotFound(err error) bool {
-	var apiErr *apiError
-	return errors.As(err, &apiErr) && apiErr.statusCode == http.StatusNotFound
-}
-
-func isAmbiguousCreateError(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-	var apiErr *apiError
-	if !errors.As(err, &apiErr) {
-		return true
-	}
-	return apiErr.statusCode >= http.StatusInternalServerError || apiErr.statusCode == http.StatusRequestTimeout
-}
-
-func runnerJobTag(jobKey string) string {
-	jobHash := sha256.Sum256([]byte(jobKey))
-	return "runner-job-" + hex.EncodeToString(jobHash[:8])
-}
-
-func instanceName(jobKey string, provisionEpoch int) string {
-	resourceHash := sha256.Sum256([]byte("vultr:" + jobKey + ":" + strconv.Itoa(provisionEpoch)))
-	return "ghr-" + hex.EncodeToString(resourceHash[:16])
+	_ = json.Unmarshal(raw, &payload)
+	return payload.Error
 }

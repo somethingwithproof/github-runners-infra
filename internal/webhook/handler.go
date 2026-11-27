@@ -249,7 +249,7 @@ func normalizeAllowedLabels(required string, rawLabels []string) (string, map[st
 	return requiredLabel, allowedLabels, nil
 }
 
-func normalizeLabelSizeMap(raw map[string]string, allowedLabels map[string]string) (map[string]string, error) {
+func normalizeLabelSizeMap(raw, allowedLabels map[string]string) (map[string]string, error) {
 	if len(raw) == 0 {
 		return nil, nil
 	}
@@ -347,20 +347,29 @@ func resolveHandlerLimits(cfg Config) (handlerLimits, error) {
 	if limits.livenessConfirmations <= 0 {
 		limits.livenessConfirmations = 3
 	}
-	if cfg.DisableDeadmanShutdown {
-		limits.deadmanShutdownMinutes = 0
-	} else {
-		if limits.deadmanShutdownMinutes == 0 {
-			limits.deadmanShutdownMinutes = compute.DefaultDeadmanShutdownMinutes
-		}
-		if limits.deadmanShutdownMinutes < 0 || limits.deadmanShutdownMinutes > compute.MaxDeadmanShutdownMinutes {
-			return limits, fmt.Errorf("dead-man shutdown minutes must be between 0 and %d", compute.MaxDeadmanShutdownMinutes)
-		}
+	deadmanMinutes, err := resolveDeadmanMinutes(cfg)
+	if err != nil {
+		return limits, err
 	}
+	limits.deadmanShutdownMinutes = deadmanMinutes
 	if limits.runnerGroupID <= 0 {
 		limits.runnerGroupID = 1
 	}
 	return limits, nil
+}
+
+func resolveDeadmanMinutes(cfg Config) (int, error) {
+	if cfg.DisableDeadmanShutdown {
+		return 0, nil
+	}
+	minutes := cfg.DeadmanShutdownMinutes
+	if minutes == 0 {
+		return compute.DefaultDeadmanShutdownMinutes, nil
+	}
+	if minutes < 0 || minutes > compute.MaxDeadmanShutdownMinutes {
+		return 0, fmt.Errorf("dead-man shutdown minutes must be between 0 and %d", compute.MaxDeadmanShutdownMinutes)
+	}
+	return minutes, nil
 }
 
 // Start launches durable workers. Pending work is loaded from the store, so a

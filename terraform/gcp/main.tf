@@ -17,6 +17,12 @@ variable "project_id" {
   type        = string
 }
 
+variable "region" {
+  description = "GCP region containing the runner subnetwork."
+  type        = string
+  default     = "us-central1"
+}
+
 variable "controller_id" {
   description = "Unique controller ownership identifier (CONTROLLER_ID)."
   type        = string
@@ -32,9 +38,20 @@ variable "network" {
   type        = string
 }
 
+variable "subnetwork" {
+  description = "Existing private subnetwork name for ephemeral runner VMs."
+  type        = string
+}
+
 variable "controller_service_account_email" {
   description = "Existing service account email used by the webhook controller."
   type        = string
+}
+
+variable "controller_role" {
+  description = "Optional reviewed project or organization role ID granted to the controller service account."
+  type        = string
+  default     = ""
 }
 
 locals {
@@ -48,36 +65,25 @@ resource "google_service_account" "runner" {
   description  = "Zero-role identity attached to ephemeral runner VMs"
 }
 
-resource "google_project_iam_custom_role" "controller" {
-  project     = var.project_id
-  role_id     = replace("github_runners_controller_${lower(var.controller_id)}", "-", "_")
-  title       = "GitHub Runners Controller (${var.controller_id})"
-  description = "Least-privilege Compute Engine permissions for ephemeral runner lifecycle"
-  permissions = [
-    "compute.instances.create",
-    "compute.instances.get",
-    "compute.instances.list",
-    "compute.instances.delete",
-    "compute.zoneOperations.get",
-    "compute.images.useReadOnly",
-    "compute.disks.create",
-    "compute.subnetworks.use",
-    "compute.instances.setLabels",
-    "compute.instances.setMetadata",
-    "compute.instances.setServiceAccount",
-  ]
-}
-
-resource "google_project_iam_member" "controller" {
-  project = var.project_id
-  role    = google_project_iam_custom_role.controller.name
-  member  = "serviceAccount:${var.controller_service_account_email}"
-}
-
 resource "google_service_account_iam_member" "act_as_runner" {
   service_account_id = google_service_account.runner.name
   role               = "roles/iam.serviceAccountUser"
   member             = "serviceAccount:${var.controller_service_account_email}"
+}
+
+resource "google_compute_subnetwork_iam_member" "controller_subnet_use" {
+  project    = var.project_id
+  region     = var.region
+  subnetwork = var.subnetwork
+  role       = "roles/compute.networkUser"
+  member     = "serviceAccount:${var.controller_service_account_email}"
+}
+
+resource "google_project_iam_member" "controller" {
+  count   = var.controller_role != "" ? 1 : 0
+  project = var.project_id
+  role    = var.controller_role
+  member  = "serviceAccount:${var.controller_service_account_email}"
 }
 
 resource "google_compute_firewall" "deny_inbound" {
@@ -99,7 +105,7 @@ output "runner_service_account_email" {
   value       = google_service_account.runner.email
 }
 
-output "controller_custom_role_id" {
-  description = "Least-privilege custom role granted to the controller service account."
-  value       = google_project_iam_custom_role.controller.id
+output "deny_inbound_firewall_name" {
+  description = "Name of the deny-all-inbound firewall rule targeting runner VMs."
+  value       = google_compute_firewall.deny_inbound.name
 }
