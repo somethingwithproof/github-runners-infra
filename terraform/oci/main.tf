@@ -6,12 +6,6 @@ locals {
     "github-runners-controller" = var.controller_id
     "ManagedBy"                 = "terraform"
   })
-  dg_name = "github-runners-controller-${var.controller_id}"
-  matching_rule = (
-    var.controller_instance_ocid != ""
-    ? "instance.id = '${var.controller_instance_ocid}'"
-    : "ALL {instance.compartment.id = '${var.compartment_ocid}', tag.github-runners-controller = '${var.controller_id}'}"
-  )
 }
 
 resource "oci_core_vcn" "runners" {
@@ -102,14 +96,6 @@ resource "oci_core_subnet" "runners" {
   freeform_tags              = local.common_tags
 }
 
-resource "oci_identity_dynamic_group" "controller" {
-  compartment_id = var.tenancy_ocid
-  name           = local.dg_name
-  description    = "Least-privilege dynamic group for GitHub Actions runner controller ${var.controller_id}"
-  matching_rule  = local.matching_rule
-  freeform_tags  = local.common_tags
-}
-
 resource "oci_identity_policy" "controller" {
   compartment_id = var.compartment_ocid
   name           = "github-runners-controller-${var.controller_id}"
@@ -117,10 +103,10 @@ resource "oci_identity_policy" "controller" {
   freeform_tags  = local.common_tags
 
   statements = [
-    "Allow dynamic-group ${oci_identity_dynamic_group.controller.name} to manage instances in compartment id ${var.compartment_ocid}",
-    "Allow dynamic-group ${oci_identity_dynamic_group.controller.name} to use subnets in compartment id ${var.compartment_ocid}",
-    "Allow dynamic-group ${oci_identity_dynamic_group.controller.name} to use vnics in compartment id ${var.compartment_ocid}",
-    "Allow dynamic-group ${oci_identity_dynamic_group.controller.name} to use vnic-attachments in compartment id ${var.compartment_ocid}",
-    "Allow dynamic-group ${oci_identity_dynamic_group.controller.name} to read instance-images in compartment id ${var.compartment_ocid}",
+    "Allow group id ${var.controller_group_ocid} to manage instances in compartment id ${var.compartment_ocid}",
+    "Allow group id ${var.controller_group_ocid} to use subnets in compartment id ${var.compartment_ocid}",
+    "Allow group id ${var.controller_group_ocid} to use vnics in compartment id ${var.compartment_ocid}",
+    "Allow group id ${var.controller_group_ocid} to use vnic-attachments in compartment id ${var.compartment_ocid}",
+    "Allow group id ${var.controller_group_ocid} to read instance-images in compartment id ${var.compartment_ocid}",
   ]
 }

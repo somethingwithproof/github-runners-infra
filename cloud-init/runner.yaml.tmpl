@@ -12,6 +12,16 @@ users:
     groups: docker
 
 {{- if not .PrebakedImage}}
+{{- if .HTTPSAptMirrors}}
+apt:
+  preserve_sources_list: false
+  primary:
+    - arches: [amd64]
+      uri: https://archive.ubuntu.com/ubuntu
+  security:
+    - arches: [amd64]
+      uri: https://security.ubuntu.com/ubuntu
+{{- end}}
 package_update: true
 
 packages:
@@ -128,9 +138,9 @@ runcmd:
       if printf '%s' "$AZURE_EVENTS" | grep -q '"EventType"[[:space:]]*:[[:space:]]*"Preempt"'; then
         return 0
       fi
-      OCI_PREEMPT=$(curl -fsS --max-time 2 -H "Authorization: Bearer Oracle" \
-        http://169.254.169.254/opc/v2/instance/preemptionAction 2>/dev/null || true)
-      if [ -n "$OCI_PREEMPT" ]; then
+      if curl -fsS --max-time 2 -H "Authorization: Bearer Oracle" \
+        http://169.254.169.254/opc/v2/instance/ 2>/dev/null |
+        jq -e '.instancePreemptionAction.preemptionAction == "terminate"' >/dev/null 2>&1; then
         return 0
       fi
       return 1

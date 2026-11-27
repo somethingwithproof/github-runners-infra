@@ -38,8 +38,10 @@ const (
 )
 
 var (
-	regionRegex     = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,62}$`)
-	instanceIDRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$`)
+	// OCI Compute documents preemptible capacity by VM shape family.
+	preemptibleShape = regexp.MustCompile(`^VM\.(?:(?:Standard(?:1|2|\.B1|\.E2)|DenseIO[12]|GPU[23])\.[0-9]+|(?:Standard3|Standard\.(?:E[3-6]|A[14])|Optimized3)\.Flex)$`)
+	regionRegex      = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,62}$`)
+	instanceIDRegex  = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$`)
 )
 
 var _ compute.Provider = (*Client)(nil)
@@ -195,13 +197,20 @@ func NewClient(cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	if !strings.HasPrefix(baseURL, "https://") {
+		return nil, fmt.Errorf("OCI endpoint requires HTTPS")
+	}
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
 		httpClient = compute.DefaultHTTPClient()
 	}
 
+	// Each signature is bound to one request target. Never replay launch data on a redirect.
+	signedClient := *httpClient
+	signedClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
 	return &Client{
-		httpClient:           httpClient,
+		httpClient:           &signedClient,
 		signer:               newRequestSigner(strings.TrimSpace(cfg.TenancyOCID), strings.TrimSpace(cfg.UserOCID), strings.TrimSpace(cfg.Fingerprint), privateKey),
 		baseURL:              baseURL,
 		cloudInitTmpl:        tmpl,
@@ -227,7 +236,7 @@ func NewClient(cfg Config) (*Client, error) {
 // shape ("VM.Standard.E4.Flex" with defaults, or inline "VM.Standard.E4.Flex:4:16").
 func ParseShapeSpec(raw string, defaultOCPUsVal, defaultMemGBVal float64) (string, *shapeConfig, error) {
 	trimmed := strings.TrimSpace(raw)
-	if !compute.ValidInstanceSize(trimmed) {
+	if !compute.ValidSizeSpec(trimmed) {
 		return "", nil, fmt.Errorf("invalid OCI shape %q", raw)
 	}
 	parts := strings.Split(trimmed, ":")
@@ -266,6 +275,17 @@ func parsePositiveFloat(raw, label string) (float64, error) {
 		return 0, fmt.Errorf("invalid OCI %s value %q", label, raw)
 	}
 	return val, nil
+}
+
+// PricingSize expands bare Flex shapes using this client's validated launch dimensions.
+func (c *Client) PricingSize(shape string) string {
+	if shape == "" {
+		shape = c.shape
+	}
+	if !strings.HasSuffix(strings.ToLower(shape), ".flex") {
+		return shape
+	}
+	return shape + ":" + strconv.FormatFloat(c.ocpus, 'f', -1, 64) + ":" + strconv.FormatFloat(c.memoryGB, 'f', -1, 64)
 }
 
 // Health verifies OCI signature authentication and compartment read access.
@@ -309,6 +329,12 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 	}
 
 	useSpot := compute.ResolveSpot(c.spot, params.Spot)
+	if useSpot && !preemptibleShape.MatchString(shape) {
+		if !c.spotFallbackOnDemand {
+			return nil, fmt.Errorf("%w: OCI shape %s", compute.ErrSpotUnsupported, shape)
+		}
+		return c.launchInstance(ctx, params, desiredName, shape, shapeCfg, false, true)
+	}
 	inst, err := c.launchInstance(ctx, params, desiredName, shape, shapeCfg, useSpot, false)
 	if err == nil {
 		return inst, nil
@@ -327,6 +353,7 @@ func (c *Client) launchInstance(
 	shapeCfg *shapeConfig,
 	useSpot, isFallback bool,
 ) (*compute.RunnerInstance, error) {
+	params.HTTPSAptMirrors = true
 	userData, err := compute.RenderCloudInit(c.cloudInitTmpl, params.WithSpot(useSpot))
 	if err != nil {
 		return nil, err
@@ -399,7 +426,7 @@ func (c *Client) handleCreateError(ctx context.Context, jobKey, desiredName stri
 	)
 }
 
-// RunnerAbsent checks authoritative absence by OCI instance OCID, treating 404,
+// RunnerAbsent checks authoritative absence by OCI instance OCID, treating explicit NotFound,
 // TERMINATING, and TERMINATED instances as absent.
 func (c *Client) RunnerAbsent(ctx context.Context, id string) (bool, error) {
 	if !instanceIDRegex.MatchString(id) {
@@ -419,12 +446,18 @@ func (c *Client) RunnerAbsent(ctx context.Context, id string) (bool, error) {
 // DeleteRunner terminates an OCI instance only after verifying controller and
 // job ownership freeform tags.
 func (c *Client) DeleteRunner(ctx context.Context, id, jobKey string) error {
+	return c.deleteOwned(ctx, id, compute.JobTag(jobKey))
+}
+
+// An orphan may have no job tag, but must still belong to this controller.
+func (c *Client) deleteOwned(ctx context.Context, id, expectedJobTag string) error {
 	if !instanceIDRegex.MatchString(id) {
 		return fmt.Errorf("invalid OCI instance ID %q", id)
 	}
 	path := instancesBasePath + url.PathEscape(id)
 	var inst ociInstance
-	if err := c.doJSON(ctx, http.MethodGet, path, nil, nil, &inst, nil); err != nil {
+	var responseHeaders http.Header
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, nil, &inst, &responseHeaders); err != nil {
 		if compute.IsHTTPNotFound(err) {
 			return nil
 		}
@@ -433,7 +466,7 @@ func (c *Client) DeleteRunner(ctx context.Context, id, jobKey string) error {
 	if isAbsentLifecycleState(inst.LifecycleState) {
 		return nil
 	}
-	if !hasOwnershipTags(inst.FreeformTags, c.controllerID, jobKey) {
+	if inst.FreeformTags[controllerTagKey] != c.controllerID || (expectedJobTag != "" && inst.FreeformTags[jobTagKey] != expectedJobTag) {
 		var confirm ociInstance
 		if confirmErr := c.doJSON(ctx, http.MethodGet, path, nil, nil, &confirm, nil); confirmErr != nil {
 			if compute.IsHTTPNotFound(confirmErr) {
@@ -446,7 +479,11 @@ func (c *Client) DeleteRunner(ctx context.Context, id, jobKey string) error {
 		}
 		return fmt.Errorf("%w: refusing to delete OCI instance %s without controller and job ownership tags", compute.ErrOwnershipMismatch, id)
 	}
-	if err := c.doJSON(ctx, http.MethodDelete, path+"?preserveBootVolume=false", nil, nil, nil, nil); err != nil && !compute.IsHTTPNotFound(err) {
+	etag := responseHeaders.Get("ETag")
+	if etag == "" {
+		return fmt.Errorf("cannot conditionally delete OCI instance %s without an ETag", id)
+	}
+	if err := c.doJSON(ctx, http.MethodDelete, path+"?preserveBootVolume=false", map[string]string{"If-Match": etag}, nil, nil, nil); err != nil && !compute.IsHTTPNotFound(err) {
 		return fmt.Errorf("delete owned OCI instance %s: %w", id, err)
 	}
 	return nil
@@ -482,9 +519,11 @@ func (c *Client) SweepOrphanedRunners(ctx context.Context, known map[string]stru
 		ctx, "OCI", c.controllerTag, known, cutoff, instances,
 		func(i ociInstance) string { return i.ID },
 		instanceTags,
-		func(i ociInstance) (time.Time, error) { return time.Parse(time.RFC3339Nano, strings.TrimSpace(i.TimeCreated)) },
+		func(i ociInstance) (time.Time, error) {
+			return time.Parse(time.RFC3339Nano, strings.TrimSpace(i.TimeCreated))
+		},
 		func(delCtx context.Context, id string) error {
-			return c.doJSON(delCtx, http.MethodDelete, instancesBasePath+url.PathEscape(id)+"?preserveBootVolume=false", nil, nil, nil, nil)
+			return c.deleteOwned(delCtx, id, "")
 		},
 	)
 }
@@ -593,10 +632,6 @@ func isAbsentLifecycleState(state string) bool {
 	default:
 		return false
 	}
-}
-
-func hasOwnershipTags(tags map[string]string, controllerID, jobKey string) bool {
-	return tags[controllerTagKey] == controllerID && tags[jobTagKey] == compute.JobTag(jobKey)
 }
 
 func instanceTags(inst ociInstance) []string {

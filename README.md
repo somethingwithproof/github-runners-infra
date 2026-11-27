@@ -519,8 +519,9 @@ sizing (`Shape:ocpus:memoryGB`), Preemptible Instance support (`TERMINATE` with
 and `LimitExceeded`) for automatic failover or on-demand fallback, freeform
 ownership tags, `opc-next-page` paginated sweeps, and private-by-default VNICs.
 Provision the private VCN, NAT gateway, egress-only security list, and
-compartment-scoped IAM policy with [`terraform/oci`](terraform/oci), and build
-pre-baked images with [`packer/oci.pkr.hcl`](packer/oci.pkr.hcl).
+compartment-scoped IAM policy for the signing user’s group (`controller_group_ocid`) with [`terraform/oci`](terraform/oci), and build
+pre-baked images with [`packer/oci.pkr.hcl`](packer/oci.pkr.hcl). Both bundled
+installers use the Linux x64 runner archive and require an x86_64 image and shape.
 
 Drain all active records before changing `COMPUTE_PROVIDER`. State is bound to
 the provider that created each runner, and the controller fails closed instead

@@ -125,6 +125,7 @@ type RunnerParams struct {
 	InstanceSize            string
 	DeadmanShutdownMinutes  int
 	PrebakedImage           bool
+	HTTPSAptMirrors         bool
 	EgressAllowlist         []string
 	// Spot overrides provider-default spot provisioning: nil uses the provider
 	// default, true forces spot/preemptible, and false forces on-demand.

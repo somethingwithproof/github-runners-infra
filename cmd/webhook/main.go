@@ -106,7 +106,7 @@ func run() error {
 		ComputeClient:             computeClient,
 		BudgetTracker:             budgetTracker,
 		HourlyRateOverrides:       cfg.hourlyRateOverrides,
-		DefaultInstanceSize:       defaultInstanceSizeForEnv(computeClient.Provider()),
+		DefaultInstanceSize:       defaultInstanceSize(computeClient),
 		DefaultSpot:               cfg.runnerSpot,
 		Store:                     stateStore,
 		RequiredLabel:             cfg.requiredLabel,
@@ -331,7 +331,7 @@ func newMultiCloudRouter(
 		closers = append(closers, closeFn)
 		backends = append(backends, router.Backend{
 			Name:        name,
-			DefaultSize: defaultInstanceSizeForEnv(name),
+			DefaultSize: defaultInstanceSize(client),
 			Provider:    client,
 		})
 	}
@@ -749,8 +749,8 @@ func envNonNegativeFloat(key string) (float64, error) {
 	return parsed, nil
 }
 
-func defaultInstanceSizeForEnv(provider string) string {
-	switch provider {
+func defaultInstanceSize(client webhook.ComputeClient) string {
+	switch client.Provider() {
 	case "digitalocean":
 		return envOrDefault("DO_SIZE", "s-4vcpu-8gb-amd")
 	case "aws":
@@ -764,13 +764,7 @@ func defaultInstanceSizeForEnv(provider string) string {
 	case "linode":
 		return envOrDefault("LINODE_INSTANCE_TYPE", "g6-standard-4")
 	case "oci":
-		shape := envOrDefault("OCI_SHAPE", "VM.Standard.E4.Flex")
-		if strings.Contains(shape, ":") || !strings.HasSuffix(strings.ToLower(shape), ".flex") {
-			return shape
-		}
-		ocpus := envOrDefault("OCI_OCPUS", "4")
-		memGB := envOrDefault("OCI_MEMORY_GB", "16")
-		return shape + ":" + ocpus + ":" + memGB
+		return compute.PricingSize(client, "", "")
 	default:
 		return ""
 	}

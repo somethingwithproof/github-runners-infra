@@ -303,7 +303,7 @@ func normalizeLabelSizeMap(raw, allowedLabels map[string]string) (map[string]str
 		if !compute.ValidLabel(label) {
 			return nil, fmt.Errorf("invalid label %q in label size map", rawLabel)
 		}
-		if !compute.ValidInstanceSize(size) {
+		if !compute.ValidSizeSpec(size) {
 			return nil, fmt.Errorf("invalid instance size %q for label %q", rawSize, label)
 		}
 		key := strings.ToLower(label)
@@ -1189,10 +1189,7 @@ func (h *Handler) reserveBudget(ctx context.Context, record state.Record, resolv
 	}
 	useSpot := compute.ResolveSpot(h.defaultSpot, spotPref)
 	providerName := h.provider
-	size := resolvedSize
-	if size == "" {
-		size = h.defaultInstanceSize
-	}
+	size := compute.PricingSize(h.computeClient, resolvedSize, h.defaultInstanceSize)
 	hourlyUSD := router.HourlyRateForMode(providerName, size, useSpot, h.hourlyRateOverrides)
 	if est, ok := h.computeClient.(spotRateEstimator); ok {
 		providerName, size, hourlyUSD = est.EstimateHourlyRateForMode(resolvedSize, spotPref)

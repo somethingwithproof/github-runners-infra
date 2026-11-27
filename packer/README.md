@@ -15,7 +15,7 @@ build tools, and a SHA-256-verified `actions/runner` archive pre-installed in
 | Azure | [`azure.pkr.hcl`](./azure.pkr.hcl) | `ARM_SUBSCRIPTION_ID` + Azure CLI / Managed Identity |
 | Vultr | [`vultr.pkr.hcl`](./vultr.pkr.hcl) | `VULTR_API_KEY` |
 | Linode / Akamai | [`linode.pkr.hcl`](./linode.pkr.hcl) | `LINODE_TOKEN` |
-| Oracle Cloud (OCI) | [`oci.pkr.hcl`](./oci.pkr.hcl) | `~/.oci/config` or OCI env vars |
+| Oracle Cloud (OCI) | [`oci.pkr.hcl`](./oci.pkr.hcl) | `~/.oci/config` |
 
 ## Build example
 

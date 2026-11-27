@@ -690,6 +690,7 @@ func TestNewComputeClientSpotFallbackMixedMultiCloud(t *testing.T) {
 }
 
 func TestNewComputeClientOCIHappyPathAndLabelSizeMap(t *testing.T) {
+	setValidRuntimeEnvironment(t)
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
@@ -715,12 +716,18 @@ func TestNewComputeClientOCIHappyPathAndLabelSizeMap(t *testing.T) {
 	t.Setenv("OCI_AVAILABILITY_DOMAIN", "Uocm:US-ASHBURN-AD-1")
 	t.Setenv("OCI_IMAGE_OCID", "ocid1.image.oc1..test")
 	t.Setenv("OCI_SHAPE", "VM.Standard.E4.Flex")
-	t.Setenv("OCI_OCPUS", "4")
-	t.Setenv("OCI_MEMORY_GB", "16")
-	assertComputeProvider(t, "oci")
-
-	if got := defaultInstanceSizeForEnv("oci"); got != "VM.Standard.E4.Flex:4:16" {
-		t.Fatalf("defaultInstanceSizeForEnv(oci) = %q, want VM.Standard.E4.Flex:4:16", got)
+	t.Setenv("OCI_OCPUS", "4e0")
+	t.Setenv("OCI_MEMORY_GB", "0")
+	client, closeFn, err := newComputeClient(context.Background(), context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeFn()
+	if client.Provider() != "oci" {
+		t.Fatalf("provider = %q", client.Provider())
+	}
+	if got := defaultInstanceSize(client); got != "VM.Standard.E4.Flex:4:16" {
+		t.Fatalf("defaultInstanceSize(oci) = %q, want VM.Standard.E4.Flex:4:16", got)
 	}
 
 	setValidRuntimeEnvironment(t)

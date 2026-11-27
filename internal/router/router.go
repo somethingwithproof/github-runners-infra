@@ -138,10 +138,7 @@ func (r *MultiCloudRouter) EstimateHourlyRateForMode(sizeOverride string, spot *
 	useSpot := compute.ResolveSpot(r.defaultSpot, spot)
 	ordered := r.OrderedBackendsForMode(sizeOverride, useSpot)
 	top := ordered[0]
-	effectiveSize := sizeOverride
-	if effectiveSize == "" {
-		effectiveSize = top.DefaultSize
-	}
+	effectiveSize := compute.PricingSize(top.Provider, sizeOverride, top.DefaultSize)
 	return top.Name, effectiveSize, HourlyRateForMode(top.Name, effectiveSize, useSpot, r.hourlyRates)
 }
 
@@ -160,10 +157,7 @@ func (r *MultiCloudRouter) OrderedBackendsForMode(sizeOverride string, spot bool
 		return ordered
 	}
 	rateOf := func(b Backend) float64 {
-		size := sizeOverride
-		if size == "" {
-			size = b.DefaultSize
-		}
+		size := compute.PricingSize(b.Provider, sizeOverride, b.DefaultSize)
 		return HourlyRateForMode(b.Name, size, spot, r.hourlyRates)
 	}
 	sort.SliceStable(ordered, func(i, j int) bool {

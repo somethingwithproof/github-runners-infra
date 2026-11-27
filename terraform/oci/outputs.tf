@@ -15,8 +15,3 @@ output "security_list_id" {
   description = "Egress-only security list OCID attached to the runner subnet."
   value       = oci_core_security_list.runners.id
 }
-
-output "controller_dynamic_group_id" {
-  description = "Least-privilege OCI IAM Dynamic Group OCID for the webhook controller."
-  value       = oci_identity_dynamic_group.controller.id
-}

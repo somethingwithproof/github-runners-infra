@@ -11,7 +11,7 @@ import (
 
 var (
 	labelNameRegex    = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$`)
-	instanceSizeRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}(:[0-9]+(\.[0-9]+)?:[0-9]+(\.[0-9]+)?)?$`)
+	instanceSizeRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
 )
 
 // ValidLabel reports whether value is a safe GitHub runner label identifier.
@@ -23,6 +23,28 @@ func ValidLabel(value string) bool {
 // machine type, plan, or SKU identifier.
 func ValidInstanceSize(value string) bool {
 	return instanceSizeRegex.MatchString(value) && !strings.Contains(value, "..")
+}
+
+// ValidSizeSpec also accepts dimensions on an OCI Flex shape.
+func ValidSizeSpec(value string) bool {
+	name, dimensions, inline := strings.Cut(value, ":")
+	if !ValidInstanceSize(name) {
+		return false
+	}
+	return !inline || strings.HasSuffix(strings.ToLower(name), ".flex") && flexDimensions.MatchString(dimensions)
+}
+
+var flexDimensions = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?:[0-9]+(\.[0-9]+)?$`)
+
+// PricingSize resolves the same provider defaults used at launch.
+func PricingSize(provider interface{ Provider() string }, override, fallback string) string {
+	if override == "" {
+		override = fallback
+	}
+	if p, ok := provider.(interface{ PricingSize(string) string }); ok {
+		return p.PricingSize(override)
+	}
+	return override
 }
 
 // ParseLabelSizeMap parses comma-separated "label=size" entries into a
@@ -48,7 +70,7 @@ func ParseLabelSizeMap(raw string) (map[string]string, error) {
 		if !ValidLabel(label) {
 			return nil, fmt.Errorf("invalid label %q in label size map", rawLabel)
 		}
-		if !ValidInstanceSize(size) {
+		if !ValidSizeSpec(size) {
 			return nil, fmt.Errorf("invalid instance size %q for label %q", rawSize, label)
 		}
 		key := strings.ToLower(label)

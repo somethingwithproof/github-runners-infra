@@ -46,7 +46,15 @@ func (e *APIError) Error() string {
 // IsHTTPNotFound reports whether err represents an HTTP 404 provider response.
 func IsHTTPNotFound(err error) bool {
 	var apiErr *APIError
-	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+		return false
+	}
+	// OCI uses 404 for authorization failures too. Only an explicit NotFound is conclusive.
+	if apiErr.Provider == "oci" {
+		code, _, _ := strings.Cut(apiErr.Message, ":")
+		return code == "NotFound"
+	}
+	return true
 }
 
 // IsAmbiguousCreateError reports whether a create error may have succeeded

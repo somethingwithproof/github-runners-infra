@@ -1,16 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Thomas Vincent <thomasvincent@gmail.com>
 # SPDX-License-Identifier: MIT
 
-variable "tenancy_ocid" {
-  description = "OCI tenancy OCID where IAM dynamic group and policy are created."
-  type        = string
-
-  validation {
-    condition     = can(regex("^ocid1\\.tenancy\\.", var.tenancy_ocid))
-    error_message = "tenancy_ocid must be a valid OCI tenancy OCID."
-  }
-}
-
 variable "compartment_ocid" {
   description = "Dedicated OCI compartment OCID for ephemeral runner compute and network resources (OCI_COMPARTMENT_OCID)."
   type        = string
@@ -31,10 +21,14 @@ variable "controller_id" {
   }
 }
 
-variable "controller_instance_ocid" {
-  description = "Optional OCI instance OCID of the webhook controller host for Dynamic Group matching."
+variable "controller_group_ocid" {
+  description = "OCID of the IAM group containing the webhook API signing user."
   type        = string
-  default     = ""
+
+  validation {
+    condition     = can(regex("^ocid1\\.group\\.[a-zA-Z0-9.-]+$", var.controller_group_ocid))
+    error_message = "controller_group_ocid must be a valid OCI group OCID."
+  }
 }
 
 variable "vcn_cidr" {

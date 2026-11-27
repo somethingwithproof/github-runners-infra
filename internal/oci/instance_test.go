@@ -14,15 +14,18 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -53,18 +56,17 @@ func writeOCITemplate(t *testing.T, content string) string {
 
 var sigParamRegex = regexp.MustCompile(`([a-zA-Z]+)="([^"]*)"`)
 
-func verifyOCISignature(t *testing.T, pub *rsa.PublicKey, r *http.Request, body []byte, wantKeyID string) {
-	t.Helper()
+func verifyOCISignature(pub *rsa.PublicKey, r *http.Request, body []byte, wantKeyID string) error {
 	auth := r.Header.Get("Authorization")
 	if !strings.HasPrefix(auth, "Signature ") {
-		t.Fatalf("missing OCI Signature Authorization header: %q", auth)
+		return fmt.Errorf("missing OCI Signature Authorization header: %q", auth)
 	}
 	params := make(map[string]string)
 	for _, match := range sigParamRegex.FindAllStringSubmatch(auth, -1) {
 		params[match[1]] = match[2]
 	}
 	if params["version"] != "1" || params["algorithm"] != "rsa-sha256" || params["keyId"] != wantKeyID {
-		t.Fatalf("unexpected signature params: %#v", params)
+		return fmt.Errorf("unexpected signature params: %#v", params)
 	}
 	headerNames := strings.Fields(params["headers"])
 	wantHeaders := []string{"(request-target)", "date", "host"}
@@ -73,11 +75,11 @@ func verifyOCISignature(t *testing.T, pub *rsa.PublicKey, r *http.Request, body 
 		digest := sha256.Sum256(body)
 		wantSHA := base64.StdEncoding.EncodeToString(digest[:])
 		if got := r.Header.Get("x-content-sha256"); got != wantSHA {
-			t.Fatalf("x-content-sha256 = %q, want %q", got, wantSHA)
+			return fmt.Errorf("x-content-sha256 = %q, want %q", got, wantSHA)
 		}
 	}
 	if strings.Join(headerNames, " ") != strings.Join(wantHeaders, " ") {
-		t.Fatalf("signed headers = %v, want %v", headerNames, wantHeaders)
+		return fmt.Errorf("signed headers = %v, want %v", headerNames, wantHeaders)
 	}
 
 	var lines []string
@@ -97,11 +99,12 @@ func verifyOCISignature(t *testing.T, pub *rsa.PublicKey, r *http.Request, body 
 	sum := sha256.Sum256([]byte(signingString))
 	sigBytes, err := base64.StdEncoding.DecodeString(params["signature"])
 	if err != nil {
-		t.Fatalf("decode signature: %v", err)
+		return fmt.Errorf("decode signature: %v", err)
 	}
 	if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, sum[:], sigBytes); err != nil {
-		t.Fatalf("RSA-SHA256 signature verification failed for %s %s: %v\nsigning string:\n%s", r.Method, r.URL.RequestURI(), err, signingString)
+		return fmt.Errorf("RSA-SHA256 signature verification failed for %s %s: %v\nsigning string:\n%s", r.Method, r.URL.RequestURI(), err, signingString)
 	}
+	return nil
 }
 
 func baseTestConfig(t *testing.T, srv *httptest.Server, pemKey string) Config {
@@ -136,12 +139,18 @@ func TestOCISignatureFlexPreemptibleLifecycleAndPagination(t *testing.T) {
 	var deletedPaths []string
 	instances := make(map[string]ociInstance)
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			t.Fatal(err)
+			t.Error(err)
+			http.Error(w, "body read failed", 400)
+			return
 		}
-		verifyOCISignature(t, &privKey.PublicKey, r, body, wantKeyID)
+		if err := verifyOCISignature(&privKey.PublicKey, r, body, wantKeyID); err != nil {
+			t.Error(err)
+			http.Error(w, "invalid signature", 400)
+			return
+		}
 
 		mu.Lock()
 		defer mu.Unlock()
@@ -156,7 +165,9 @@ func TestOCISignatureFlexPreemptibleLifecycleAndPagination(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == instancesPath:
 			var req launchInstanceRequest
 			if err := json.Unmarshal(body, &req); err != nil {
-				t.Fatal(err)
+				t.Error(err)
+				http.Error(w, "invalid JSON", 400)
+				return
 			}
 			lastLaunch = req
 			lastRetryToken = r.Header.Get("opc-retry-token")
@@ -177,14 +188,20 @@ func TestOCISignatureFlexPreemptibleLifecycleAndPagination(t *testing.T) {
 				_, _ = w.Write([]byte(`{"code":"NotAuthorizedOrNotFound","message":"not found"}`))
 				return
 			}
+			w.Header().Set("ETag", "current")
 			_ = json.NewEncoder(w).Encode(inst)
 		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, instancesBasePath):
 			id := strings.TrimPrefix(r.URL.Path, instancesBasePath)
+			if r.Header.Get("If-Match") != "current" {
+				http.Error(w, "stale", 412)
+				return
+			}
 			deletedPaths = append(deletedPaths, r.URL.RequestURI())
 			delete(instances, id)
 			w.WriteHeader(http.StatusNoContent)
 		default:
-			t.Fatalf("unexpected request %s %s", r.Method, r.URL.RequestURI())
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.RequestURI())
+			http.Error(w, "unexpected request", 400)
 		}
 	}))
 	defer srv.Close()
@@ -211,22 +228,25 @@ func TestOCISignatureFlexPreemptibleLifecycleAndPagination(t *testing.T) {
 		t.Fatalf("CreateRunner() = %#v, %v", created, err)
 	}
 
-	if lastLaunch.Shape != "VM.Standard.A1.Flex" || lastLaunch.ShapeConfig == nil ||
-		lastLaunch.ShapeConfig.OCPUs != 4 || lastLaunch.ShapeConfig.MemoryInGBs != 24 {
-		t.Fatalf("unexpected flex shape config: %#v", lastLaunch)
+	mu.Lock()
+	launch, token := lastLaunch, lastRetryToken
+	mu.Unlock()
+	if launch.Shape != "VM.Standard.A1.Flex" || launch.ShapeConfig == nil ||
+		launch.ShapeConfig.OCPUs != 4 || launch.ShapeConfig.MemoryInGBs != 24 {
+		t.Fatalf("unexpected flex shape config: %#v", launch)
 	}
-	if lastLaunch.PreemptibleInstanceConfig == nil ||
-		lastLaunch.PreemptibleInstanceConfig.PreemptionAction.Type != "TERMINATE" ||
-		lastLaunch.PreemptibleInstanceConfig.PreemptionAction.PreserveBootVolume {
-		t.Fatalf("unexpected preemptible config: %#v", lastLaunch.PreemptibleInstanceConfig)
+	if launch.PreemptibleInstanceConfig == nil ||
+		launch.PreemptibleInstanceConfig.PreemptionAction.Type != "TERMINATE" ||
+		launch.PreemptibleInstanceConfig.PreemptionAction.PreserveBootVolume {
+		t.Fatalf("unexpected preemptible config: %#v", launch.PreemptibleInstanceConfig)
 	}
-	if lastLaunch.CreateVnicDetails.AssignPublicIP {
+	if launch.CreateVnicDetails.AssignPublicIP {
 		t.Fatal("private-by-default OCI VNIC unexpectedly requested public IP")
 	}
-	if lastRetryToken == "" {
+	if token == "" {
 		t.Fatal("missing opc-retry-token")
 	}
-	decodedUD, err := base64.StdEncoding.DecodeString(lastLaunch.Metadata["user_data"])
+	decodedUD, err := base64.StdEncoding.DecodeString(launch.Metadata["user_data"])
 	if err != nil || !strings.Contains(string(decodedUD), "spot=true") {
 		t.Fatalf("decoded user_data = %q, %v", decodedUD, err)
 	}
@@ -261,11 +281,14 @@ func TestOCISignatureFlexPreemptibleLifecycleAndPagination(t *testing.T) {
 	if err := client.DeleteRunner(context.Background(), created.ID, params.JobKey); err != nil {
 		t.Fatalf("DeleteRunner() error = %v", err)
 	}
-	if len(deletedPaths) != 1 || !strings.Contains(deletedPaths[0], "preserveBootVolume=false") {
-		t.Fatalf("deletedPaths = %v", deletedPaths)
+	mu.Lock()
+	paths := slices.Clone(deletedPaths)
+	mu.Unlock()
+	if len(paths) != 1 || !strings.Contains(paths[0], "preserveBootVolume=false") {
+		t.Fatalf("paths = %v", paths)
 	}
-	if absent, err := client.RunnerAbsent(context.Background(), created.ID); err != nil || !absent {
-		t.Fatalf("RunnerAbsent(404) = %v, %v, want true", absent, err)
+	if absent, err := client.RunnerAbsent(context.Background(), created.ID); err == nil || absent {
+		t.Fatalf("RunnerAbsent(404) = %v, %v, want indeterminate", absent, err)
 	}
 }
 
@@ -277,7 +300,7 @@ func TestOCICapacityClassificationAndOnDemandFallback(t *testing.T) {
 			`{"code":"InternalError","message":"Out of host capacity."}`,
 			`{"code":"LimitExceeded","message":"Service limit reached"}`,
 		} {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == http.MethodGet {
 					_, _ = w.Write([]byte(`[]`))
 					return
@@ -301,17 +324,22 @@ func TestOCICapacityClassificationAndOnDemandFallback(t *testing.T) {
 	})
 
 	t.Run("spot fallback to on-demand uses distinct retry token and drops preemptible config", func(t *testing.T) {
+		var mu sync.Mutex
 		var attempts []launchInstanceRequest
 		var retryTokens []string
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodGet {
 				_, _ = w.Write([]byte(`[]`))
 				return
 			}
 			var req launchInstanceRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				t.Fatal(err)
+				t.Error(err)
+				http.Error(w, "invalid JSON", 400)
+				return
 			}
+			mu.Lock()
+			defer mu.Unlock()
 			attempts = append(attempts, req)
 			retryTokens = append(retryTokens, r.Header.Get("opc-retry-token"))
 			if len(attempts) == 1 {
@@ -334,6 +362,8 @@ func TestOCICapacityClassificationAndOnDemandFallback(t *testing.T) {
 		if err != nil || inst.ID != "ocid1.instance.oc1..ondemand" {
 			t.Fatalf("fallback CreateRunner = %#v, %v", inst, err)
 		}
+		mu.Lock()
+		defer mu.Unlock()
 		if len(attempts) != 2 || attempts[0].PreemptibleInstanceConfig == nil || attempts[1].PreemptibleInstanceConfig != nil {
 			t.Fatalf("unexpected attempts: %#v", attempts)
 		}
@@ -349,9 +379,22 @@ func TestOCISweepPaginationOwnershipAndAmbiguousRecovery(t *testing.T) {
 	t.Run("paginated orphan sweep via opc-next-page", func(t *testing.T) {
 		old := time.Now().Add(-3 * time.Hour).UTC().Format(time.RFC3339)
 		fresh := time.Now().Add(-5 * time.Minute).UTC().Format(time.RFC3339)
+		var mu sync.Mutex
 		var deleted []string
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, instancesBasePath) {
+				id := strings.TrimPrefix(r.URL.Path, instancesBasePath)
+				w.Header().Set("ETag", id)
+				_ = json.NewEncoder(w).Encode(ociInstance{ID: id, LifecycleState: "RUNNING", FreeformTags: map[string]string{controllerTagKey: "primary"}})
+				return
+			}
 			if r.Method == http.MethodDelete {
+				if r.Header.Get("If-Match") != strings.TrimPrefix(r.URL.Path, instancesBasePath) {
+					http.Error(w, "stale", 412)
+					return
+				}
+				mu.Lock()
+				defer mu.Unlock()
 				deleted = append(deleted, strings.TrimPrefix(r.URL.Path, instancesBasePath))
 				w.WriteHeader(http.StatusNoContent)
 				return
@@ -372,7 +415,8 @@ func TestOCISweepPaginationOwnershipAndAmbiguousRecovery(t *testing.T) {
 					{ID: "ocid1.inst.orphan2", LifecycleState: "RUNNING", TimeCreated: old, FreeformTags: map[string]string{controllerTagKey: "primary"}},
 				})
 			default:
-				t.Fatalf("unexpected page %q", page)
+				t.Errorf("unexpected page %q", page)
+				http.Error(w, "unexpected page", 400)
 			}
 		}))
 		defer srv.Close()
@@ -382,15 +426,18 @@ func TestOCISweepPaginationOwnershipAndAmbiguousRecovery(t *testing.T) {
 			t.Fatal(err)
 		}
 		count, err := client.SweepOrphanedRunners(context.Background(), map[string]struct{}{"ocid1.inst.known": {}}, time.Now().Add(-time.Hour))
-		if err != nil || count != 2 || len(deleted) != 2 {
+		mu.Lock()
+		defer mu.Unlock()
+		slices.Sort(deleted)
+		if err != nil || count != 2 || !slices.Equal(deleted, []string{"ocid1.inst.orphan1", "ocid1.inst.orphan2"}) {
 			t.Fatalf("sweep = %d, %v, deleted=%v", count, err, deleted)
 		}
 	})
 
 	t.Run("ownership mismatch and duplicate guards", func(t *testing.T) {
 		jobKey := "org/repo:guard"
-		mode := "foreign"
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var duplicate atomic.Bool
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if strings.HasPrefix(r.URL.Path, instancesBasePath) {
 				_ = json.NewEncoder(w).Encode(ociInstance{
 					ID: "ocid1.inst.foreign", LifecycleState: "RUNNING",
@@ -398,7 +445,7 @@ func TestOCISweepPaginationOwnershipAndAmbiguousRecovery(t *testing.T) {
 				})
 				return
 			}
-			if mode == "foreign" {
+			if !duplicate.Load() {
 				_ = json.NewEncoder(w).Encode([]ociInstance{{
 					ID: "ocid1.inst.foreign", LifecycleState: "RUNNING",
 					FreeformTags: map[string]string{controllerTagKey: "other", jobTagKey: compute.JobTag(jobKey)},
@@ -422,7 +469,7 @@ func TestOCISweepPaginationOwnershipAndAmbiguousRecovery(t *testing.T) {
 		if err := client.DeleteRunner(context.Background(), "ocid1.inst.foreign", jobKey); !errors.Is(err, compute.ErrOwnershipMismatch) {
 			t.Fatalf("foreign DeleteRunner error = %v", err)
 		}
-		mode = "dup"
+		duplicate.Store(true)
 		if _, _, err := client.FindRunner(context.Background(), jobKey); !errors.Is(err, compute.ErrDuplicateInstances) {
 			t.Fatalf("duplicate FindRunner error = %v", err)
 		}
@@ -431,15 +478,14 @@ func TestOCISweepPaginationOwnershipAndAmbiguousRecovery(t *testing.T) {
 	t.Run("ambiguous create recovery", func(t *testing.T) {
 		params := compute.RunnerParams{JobKey: "org/repo:ambig", ProvisionEpoch: 2}
 		wantName := compute.DeterministicName("oci", params.JobKey, params.ProvisionEpoch)
-		listCalls := 0
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var listCalls atomic.Int32
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodPost {
 				w.WriteHeader(http.StatusBadGateway)
 				_, _ = w.Write([]byte(`{"code":"BadGateway","message":"transient"}`))
 				return
 			}
-			listCalls++
-			if listCalls == 1 {
+			if listCalls.Add(1) == 1 {
 				_, _ = w.Write([]byte(`[]`))
 				return
 			}
@@ -496,5 +542,135 @@ func TestOCIValidationAndPKCS8Key(t *testing.T) {
 	}
 	if _, err := loadPrivateKey("", ""); err == nil {
 		t.Fatal("accepted missing private key")
+	}
+}
+
+func TestOCIUnsupportedSpotShape(t *testing.T) {
+	_, key := generateTestRSAKey(t)
+	var posts atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = io.WriteString(w, "[]")
+			return
+		}
+		var launch launchInstanceRequest
+		if err := json.NewDecoder(r.Body).Decode(&launch); err != nil || launch.PreemptibleInstanceConfig != nil || launch.Shape != "VM.Standard.E2.1.Micro" {
+			t.Error("expected an on-demand Micro request")
+			http.Error(w, "unexpected launch", 400)
+			return
+		}
+		posts.Add(1)
+		_ = json.NewEncoder(w).Encode(ociInstance{ID: "micro"})
+	}))
+	defer srv.Close()
+	cfg := baseTestConfig(t, srv, key)
+	cfg.Shape = "VM.Standard.E2.1.Micro"
+	cfg.Spot = true
+	for _, fallback := range []bool{false, true} {
+		cfg.SpotFallbackOnDemand = fallback
+		c, err := NewClient(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = c.CreateRunner(t.Context(), compute.RunnerParams{JobKey: "micro"})
+		if !fallback && (!errors.Is(err, compute.ErrSpotUnsupported) || posts.Load() != 0) {
+			t.Fatalf("spot-only launch: posts=%d err=%v", posts.Load(), err)
+		}
+		if fallback && (err != nil || posts.Load() != 1) {
+			t.Fatalf("on-demand fallback: posts=%d err=%v", posts.Load(), err)
+		}
+	}
+}
+
+func TestOCIDeletionGuards(t *testing.T) {
+	_, key := generateTestRSAKey(t)
+	for _, tc := range []struct {
+		name                    string
+		getStatus, deleteStatus int
+		tag, etag               string
+		wantDeletes             int
+	}{
+		{"hidden", 404, 0, "", "", 0}, {"retagged", 200, 0, "other", "changed", 0},
+		{"no etag", 200, 0, "primary", "", 0}, {"changed during termination", 200, 412, "primary", "observed", 1},
+		{"termination denied", 200, 404, "primary", "observed", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var deletes atomic.Int32
+			inst := ociInstance{ID: "runner", TimeCreated: time.Now().Add(-time.Hour).Format(time.RFC3339), LifecycleState: "RUNNING", FreeformTags: map[string]string{controllerTagKey: "primary", jobTagKey: compute.JobTag("job")}}
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.URL.Path == instancesPath:
+					_ = json.NewEncoder(w).Encode([]ociInstance{inst})
+				case r.Method == http.MethodGet && tc.getStatus == 200:
+					current := inst
+					current.FreeformTags = map[string]string{controllerTagKey: tc.tag, jobTagKey: compute.JobTag("job")}
+					w.Header().Set("ETag", tc.etag)
+					_ = json.NewEncoder(w).Encode(current)
+				case r.Method == http.MethodDelete:
+					deletes.Add(1)
+					if tc.deleteStatus == 0 || r.Header.Get("If-Match") != tc.etag {
+						t.Error("unexpected termination")
+						http.Error(w, "unexpected delete", 400)
+						return
+					}
+					w.WriteHeader(tc.deleteStatus)
+					_, _ = io.WriteString(w, `{"code":"NotAuthorizedOrNotFound"}`)
+				default:
+					w.WriteHeader(tc.getStatus)
+					_, _ = io.WriteString(w, `{"code":"NotAuthorizedOrNotFound"}`)
+				}
+			}))
+			defer srv.Close()
+			c, err := NewClient(baseTestConfig(t, srv, key))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, run := range []func() error{func() error { return c.DeleteRunner(t.Context(), "runner", "job") }, func() error {
+				count, err := c.SweepOrphanedRunners(t.Context(), nil, time.Now())
+				if count != 0 {
+					t.Errorf("sweep count=%d", count)
+				}
+				return err
+			}} {
+				err := run()
+				if err == nil {
+					t.Fatal("reported successful deletion")
+				}
+				if tc.getStatus == 404 || tc.deleteStatus >= 400 {
+					var apiErr *compute.APIError
+					if !errors.As(err, &apiErr) || compute.IsHTTPNotFound(err) {
+						t.Fatalf("lost indeterminate API error: %v", err)
+					}
+				}
+				if n := deletes.Swap(0); int(n) != tc.wantDeletes {
+					t.Fatalf("delete requests=%d, want %d", n, tc.wantDeletes)
+				}
+			}
+		})
+	}
+}
+
+func TestOCIValidatedPricingAndEndpoint(t *testing.T) {
+	_, key := generateTestRSAKey(t)
+	srv := httptest.NewTLSServer(http.NotFoundHandler())
+	defer srv.Close()
+	cfg := baseTestConfig(t, srv, key)
+	cfg.OCPUs = 16
+	cfg.MemoryGB = 64
+	c, err := NewClient(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for input, want := range map[string]string{"": "VM.Standard.E4.Flex:16:64", "VM.Standard.E5.Flex": "VM.Standard.E5.Flex:16:64", "VM.Standard.E5.Flex:2:8": "VM.Standard.E5.Flex:2:8", "VM.Standard2.4": "VM.Standard2.4"} {
+		if got := compute.PricingSize(c, input, ""); got != want {
+			t.Errorf("pricing size(%q)=%q, want %q", input, got, want)
+		}
+	}
+	if _, _, err := ParseShapeSpec("VM.Standard2.4:4:16", 4, 16); err == nil {
+		t.Error("accepted dimensions on fixed shape")
+	}
+	cfg.BaseURL = "http://oci.example.invalid"
+	if _, err := NewClient(cfg); err == nil {
+		t.Error("accepted plaintext endpoint")
 	}
 }
