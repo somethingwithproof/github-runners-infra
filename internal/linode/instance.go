@@ -9,7 +9,6 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -262,27 +261,19 @@ func (c *Client) buildCreateRequest(name, instanceType, jobKey, rootPass, userDa
 }
 
 func (c *Client) handleCreateError(ctx context.Context, jobKey, desiredName string, createErr error) (*compute.RunnerInstance, error) {
-	if !compute.IsAmbiguousCreateError(createErr) {
-		return nil, fmt.Errorf("create Linode instance: %w", createErr)
-	}
-	recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.recoveryTimeout)
-	defer cancel()
-	recovered, confirmedAbsent, recoveryErr := compute.ReconcileAmbiguousCreate(
-		recoveryCtx, "Linode", desiredName, c.recoveryPoll,
+	return compute.RecoverCreateError(
+		ctx, "Linode", desiredName, c.recoveryTimeout, c.recoveryPoll, createErr,
 		func(pollCtx context.Context) (*linodeInstance, error) {
-			return c.findJobInstanceByName(pollCtx, jobKey, desiredName)
+			instances, err := c.listJobInstances(pollCtx, jobKey, "")
+			if err != nil {
+				return nil, err
+			}
+			return compute.FindUniqueByName("Linode", jobKey, desiredName, instances, func(l linodeInstance) string { return l.Label })
+		},
+		func(l *linodeInstance) *compute.RunnerInstance {
+			return &compute.RunnerInstance{ID: strconv.Itoa(l.ID), Name: l.Label}
 		},
 	)
-	if recoveryErr != nil {
-		return nil, errors.Join(fmt.Errorf("create Linode instance: %w", createErr), fmt.Errorf("reconcile ambiguous create: %w", recoveryErr))
-	}
-	if recovered != nil {
-		return &compute.RunnerInstance{ID: strconv.Itoa(recovered.ID), Name: recovered.Label}, nil
-	}
-	if confirmedAbsent {
-		return nil, fmt.Errorf("create Linode instance after confirmed absence: %w", createErr)
-	}
-	return nil, fmt.Errorf("%w: create Linode instance: %v", compute.ErrCreateOutcomeUnknown, createErr)
 }
 
 // RunnerAbsent checks authoritative absence by Linode numeric ID without mutating it.
@@ -357,48 +348,15 @@ func (c *Client) SweepOrphanedRunners(ctx context.Context, known map[string]stru
 	if err != nil {
 		return 0, fmt.Errorf("list controller Linode instances for orphan sweep: %w", err)
 	}
-	deleted := 0
-	var parseErrs []error
-	for _, inst := range instances {
-		if !compute.HasTag(inst.Tags, c.controllerTag) {
-			continue
-		}
-		id := strconv.Itoa(inst.ID)
-		if _, ok := known[id]; ok {
-			continue
-		}
-		created, err := parseLinodeTime(inst.Created)
-		if err != nil {
-			parseErrs = append(parseErrs, fmt.Errorf("parse creation time for controller Linode instance %s: %w", id, err))
-			continue
-		}
-		if !created.Before(cutoff) {
-			continue
-		}
-		if err := c.doJSON(ctx, http.MethodDelete, instancesBasePath+id, "", nil, nil); err != nil && !compute.IsHTTPNotFound(err) {
-			return deleted, fmt.Errorf("delete orphaned controller Linode instance %s: %w", id, err)
-		}
-		deleted++
-	}
-	return deleted, errors.Join(parseErrs...)
-}
-
-func (c *Client) findJobInstanceByName(ctx context.Context, jobKey, name string) (*linodeInstance, error) {
-	instances, err := c.listJobInstances(ctx, jobKey, "")
-	if err != nil {
-		return nil, err
-	}
-	var match *linodeInstance
-	for i := range instances {
-		if instances[i].Label != name {
-			continue
-		}
-		if match != nil {
-			return nil, fmt.Errorf("multiple Linode instances named %q exist for job %s", name, jobKey)
-		}
-		match = &instances[i]
-	}
-	return match, nil
+	return compute.SweepOrphans(
+		ctx, "Linode", c.controllerTag, known, cutoff, instances,
+		func(l linodeInstance) string { return strconv.Itoa(l.ID) },
+		func(l linodeInstance) []string { return l.Tags },
+		func(l linodeInstance) (time.Time, error) { return parseLinodeTime(l.Created) },
+		func(delCtx context.Context, id string) error {
+			return c.doJSON(delCtx, http.MethodDelete, instancesBasePath+id, "", nil, nil)
+		},
+	)
 }
 
 func (c *Client) listJobInstances(ctx context.Context, jobKey, excludedID string) ([]linodeInstance, error) {
@@ -406,17 +364,10 @@ func (c *Client) listJobInstances(ctx context.Context, jobKey, excludedID string
 	if err != nil {
 		return nil, fmt.Errorf("look up existing Linode runner instance: %w", err)
 	}
-	verified := make([]linodeInstance, 0, len(existing))
-	for _, inst := range existing {
-		if excludedID != "" && strconv.Itoa(inst.ID) == excludedID {
-			continue
-		}
-		if !compute.HasTag(inst.Tags, c.controllerTag) {
-			return nil, fmt.Errorf("%w: job-tagged Linode instance %d belongs to another controller", compute.ErrOwnershipMismatch, inst.ID)
-		}
-		verified = append(verified, inst)
-	}
-	return verified, nil
+	return compute.FilterOwned("Linode", excludedID, c.controllerTag, existing,
+		func(l linodeInstance) string { return strconv.Itoa(l.ID) },
+		func(l linodeInstance) []string { return l.Tags },
+	)
 }
 
 func (c *Client) listInstancesByTag(ctx context.Context, tag string) ([]linodeInstance, error) {

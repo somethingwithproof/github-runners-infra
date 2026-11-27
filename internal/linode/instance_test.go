@@ -270,24 +270,36 @@ func TestLinodePageSweepAndTimestamps(t *testing.T) {
 func TestLinodeAmbiguousCreateAndOwnershipGuards(t *testing.T) {
 	params := compute.RunnerParams{JobKey: "org/repo:88", ProvisionEpoch: 3}
 	wantName := compute.DeterministicName("linode", params.JobKey, params.ProvisionEpoch)
-	listCalls := 0
+	state := "empty"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
+			state = "created"
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte(`{"errors":[{"reason":"Service unavailable"}]}`))
 			return
 		}
-		listCalls++
-		if listCalls == 1 {
+		switch state {
+		case "empty":
 			_ = json.NewEncoder(w).Encode(listInstancesResponse{Page: 1, Pages: 1})
-			return
+		case "created":
+			_ = json.NewEncoder(w).Encode(listInstancesResponse{
+				Data: []linodeInstance{{ID: 999, Label: wantName, Tags: []string{"runner-controller-primary", compute.JobTag(params.JobKey)}}},
+				Page: 1, Pages: 1, Results: 1,
+			})
+		case "foreign":
+			_ = json.NewEncoder(w).Encode(listInstancesResponse{
+				Data: []linodeInstance{{ID: 1, Tags: []string{"runner-controller-other"}}},
+				Page: 1, Pages: 1,
+			})
+		case "dup":
+			_ = json.NewEncoder(w).Encode(listInstancesResponse{
+				Data: []linodeInstance{
+					{ID: 1, Tags: []string{"runner-controller-primary"}},
+					{ID: 2, Tags: []string{"runner-controller-primary"}},
+				},
+				Page: 1, Pages: 1,
+			})
 		}
-		_ = json.NewEncoder(w).Encode(listInstancesResponse{
-			Data: []linodeInstance{{
-				ID: 999, Label: wantName, Tags: []string{"runner-controller-primary", compute.JobTag(params.JobKey)},
-			}},
-			Page: 1, Pages: 1, Results: 1,
-		})
 	}))
 	defer srv.Close()
 
@@ -306,32 +318,12 @@ func TestLinodeAmbiguousCreateAndOwnershipGuards(t *testing.T) {
 		t.Fatalf("recovered = %#v, %v", inst, err)
 	}
 
-	for _, tc := range []struct {
-		name    string
-		data    []linodeInstance
-		wantErr error
-	}{
-		{"foreign", []linodeInstance{{ID: 1, Tags: []string{"runner-controller-other"}}}, compute.ErrOwnershipMismatch},
-		{"duplicate", []linodeInstance{
-			{ID: 1, Tags: []string{"runner-controller-primary"}},
-			{ID: 2, Tags: []string{"runner-controller-primary"}},
-		}, compute.ErrDuplicateInstances},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			guardSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				_ = json.NewEncoder(w).Encode(listInstancesResponse{Data: tc.data, Page: 1, Pages: 1})
-			}))
-			defer guardSrv.Close()
-			c, err := NewClient(Config{
-				Token: "k", ControllerID: "primary", CloudInitPath: writeLinodeTemplate(t, "#cloud-config\n"),
-				BaseURL: guardSrv.URL, HTTPClient: guardSrv.Client(),
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, _, err := c.FindRunner(context.Background(), "org/repo:1"); !errors.Is(err, tc.wantErr) {
-				t.Fatalf("FindRunner error = %v, want %v", err, tc.wantErr)
-			}
-		})
+	state = "foreign"
+	if _, _, err := client.FindRunner(context.Background(), "org/repo:1"); !errors.Is(err, compute.ErrOwnershipMismatch) {
+		t.Fatalf("foreign FindRunner error = %v", err)
+	}
+	state = "dup"
+	if _, _, err := client.FindRunner(context.Background(), "org/repo:1"); !errors.Is(err, compute.ErrDuplicateInstances) {
+		t.Fatalf("duplicate FindRunner error = %v", err)
 	}
 }

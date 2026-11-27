@@ -219,3 +219,109 @@ func DeterministicName(provider, jobKey string, provisionEpoch int) string {
 	resourceHash := sha256.Sum256([]byte(provider + ":" + jobKey + ":" + strconv.Itoa(provisionEpoch)))
 	return "ghr-" + hex.EncodeToString(resourceHash[:16])
 }
+
+// RecoverCreateError resolves an ambiguous provider create error by polling
+// lookup for the deterministically named instance before deciding whether the
+// caller may retry or must treat the outcome as unknown.
+func RecoverCreateError[T any](
+	ctx context.Context,
+	provider, desiredName string,
+	timeout, poll time.Duration,
+	createErr error,
+	lookup func(context.Context) (*T, error),
+	toRunner func(*T) *RunnerInstance,
+) (*RunnerInstance, error) {
+	if !IsAmbiguousCreateError(createErr) {
+		return nil, fmt.Errorf("create %s instance: %w", provider, createErr)
+	}
+	recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
+	recovered, confirmedAbsent, recoveryErr := ReconcileAmbiguousCreate(
+		recoveryCtx, provider, desiredName, poll, lookup,
+	)
+	if recoveryErr != nil {
+		return nil, errors.Join(fmt.Errorf("create %s instance: %w", provider, createErr), fmt.Errorf("reconcile ambiguous create: %w", recoveryErr))
+	}
+	if recovered != nil {
+		return toRunner(recovered), nil
+	}
+	if confirmedAbsent {
+		return nil, fmt.Errorf("create %s instance after confirmed absence: %w", provider, createErr)
+	}
+	return nil, fmt.Errorf("%w: create %s instance: %v", ErrCreateOutcomeUnknown, provider, createErr)
+}
+
+// FilterOwned verifies that every non-excluded item carries controllerTag.
+func FilterOwned[T any](
+	provider, excludedID, controllerTag string,
+	items []T,
+	idOf func(T) string,
+	tagsOf func(T) []string,
+) ([]T, error) {
+	verified := make([]T, 0, len(items))
+	for _, item := range items {
+		id := idOf(item)
+		if excludedID != "" && id == excludedID {
+			continue
+		}
+		if !HasTag(tagsOf(item), controllerTag) {
+			return nil, fmt.Errorf("%w: job-tagged %s instance %s belongs to another controller", ErrOwnershipMismatch, provider, id)
+		}
+		verified = append(verified, item)
+	}
+	return verified, nil
+}
+
+// FindUniqueByName locates the single item matching name among items.
+func FindUniqueByName[T any](provider, jobKey, name string, items []T, nameOf func(T) string) (*T, error) {
+	var match *T
+	for i := range items {
+		if nameOf(items[i]) != name {
+			continue
+		}
+		if match != nil {
+			return nil, fmt.Errorf("multiple %s instances named %q exist for job %s", provider, name, jobKey)
+		}
+		match = &items[i]
+	}
+	return match, nil
+}
+
+// SweepOrphans deletes controller-owned items absent from known and older than
+// cutoff while continuing past items with unparseable creation timestamps.
+func SweepOrphans[T any](
+	ctx context.Context,
+	provider, controllerTag string,
+	known map[string]struct{},
+	cutoff time.Time,
+	items []T,
+	idOf func(T) string,
+	tagsOf func(T) []string,
+	createdOf func(T) (time.Time, error),
+	deleteFn func(context.Context, string) error,
+) (int, error) {
+	deleted := 0
+	var parseErrs []error
+	for _, item := range items {
+		if !HasTag(tagsOf(item), controllerTag) {
+			continue
+		}
+		id := idOf(item)
+		if _, ok := known[id]; ok {
+			continue
+		}
+		created, err := createdOf(item)
+		if err != nil {
+			parseErrs = append(parseErrs, fmt.Errorf("parse creation time for controller %s instance %s: %w", provider, id, err))
+			continue
+		}
+		if !created.Before(cutoff) {
+			continue
+		}
+		if err := deleteFn(ctx, id); err != nil && !IsHTTPNotFound(err) {
+			return deleted, fmt.Errorf("delete orphaned controller %s instance %s: %w", provider, id, err)
+		}
+		deleted++
+	}
+	return deleted, errors.Join(parseErrs...)
+}

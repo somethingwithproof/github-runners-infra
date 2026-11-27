@@ -8,7 +8,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -261,27 +260,19 @@ func (c *Client) buildCreateRequest(name, plan, jobKey, userData string) createI
 }
 
 func (c *Client) handleCreateError(ctx context.Context, jobKey, desiredName string, createErr error) (*compute.RunnerInstance, error) {
-	if !compute.IsAmbiguousCreateError(createErr) {
-		return nil, fmt.Errorf("create Vultr instance: %w", createErr)
-	}
-	recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.recoveryTimeout)
-	defer cancel()
-	recovered, confirmedAbsent, recoveryErr := compute.ReconcileAmbiguousCreate(
-		recoveryCtx, "Vultr", desiredName, c.recoveryPoll,
+	return compute.RecoverCreateError(
+		ctx, "Vultr", desiredName, c.recoveryTimeout, c.recoveryPoll, createErr,
 		func(pollCtx context.Context) (*vultrInstance, error) {
-			return c.findJobInstanceByName(pollCtx, jobKey, desiredName)
+			instances, err := c.listJobInstances(pollCtx, jobKey, "")
+			if err != nil {
+				return nil, err
+			}
+			return compute.FindUniqueByName("Vultr", jobKey, desiredName, instances, func(v vultrInstance) string { return v.Label })
+		},
+		func(v *vultrInstance) *compute.RunnerInstance {
+			return &compute.RunnerInstance{ID: v.ID, Name: v.Label}
 		},
 	)
-	if recoveryErr != nil {
-		return nil, errors.Join(fmt.Errorf("create Vultr instance: %w", createErr), fmt.Errorf("reconcile ambiguous create: %w", recoveryErr))
-	}
-	if recovered != nil {
-		return &compute.RunnerInstance{ID: recovered.ID, Name: recovered.Label}, nil
-	}
-	if confirmedAbsent {
-		return nil, fmt.Errorf("create Vultr instance after confirmed absence: %w", createErr)
-	}
-	return nil, fmt.Errorf("%w: create Vultr instance: %v", compute.ErrCreateOutcomeUnknown, createErr)
 }
 
 // RunnerAbsent checks authoritative absence by instance ID without mutating it.
@@ -354,47 +345,15 @@ func (c *Client) SweepOrphanedRunners(ctx context.Context, known map[string]stru
 	if err != nil {
 		return 0, fmt.Errorf("list controller Vultr instances for orphan sweep: %w", err)
 	}
-	deleted := 0
-	var parseErrs []error
-	for _, inst := range instances {
-		if !compute.HasTag(inst.Tags, c.controllerTag) {
-			continue
-		}
-		if _, ok := known[inst.ID]; ok {
-			continue
-		}
-		created, err := time.Parse(time.RFC3339, inst.DateCreated)
-		if err != nil {
-			parseErrs = append(parseErrs, fmt.Errorf("parse creation time for controller Vultr instance %s: %w", inst.ID, err))
-			continue
-		}
-		if !created.Before(cutoff) {
-			continue
-		}
-		if err := c.doJSON(ctx, http.MethodDelete, instancesBasePath+url.PathEscape(inst.ID), nil, nil); err != nil && !compute.IsHTTPNotFound(err) {
-			return deleted, fmt.Errorf("delete orphaned controller Vultr instance %s: %w", inst.ID, err)
-		}
-		deleted++
-	}
-	return deleted, errors.Join(parseErrs...)
-}
-
-func (c *Client) findJobInstanceByName(ctx context.Context, jobKey, name string) (*vultrInstance, error) {
-	instances, err := c.listJobInstances(ctx, jobKey, "")
-	if err != nil {
-		return nil, err
-	}
-	var match *vultrInstance
-	for i := range instances {
-		if instances[i].Label != name {
-			continue
-		}
-		if match != nil {
-			return nil, fmt.Errorf("multiple Vultr instances named %q exist for job %s", name, jobKey)
-		}
-		match = &instances[i]
-	}
-	return match, nil
+	return compute.SweepOrphans(
+		ctx, "Vultr", c.controllerTag, known, cutoff, instances,
+		func(v vultrInstance) string { return v.ID },
+		func(v vultrInstance) []string { return v.Tags },
+		func(v vultrInstance) (time.Time, error) { return time.Parse(time.RFC3339, v.DateCreated) },
+		func(delCtx context.Context, id string) error {
+			return c.doJSON(delCtx, http.MethodDelete, instancesBasePath+url.PathEscape(id), nil, nil)
+		},
+	)
 }
 
 func (c *Client) listJobInstances(ctx context.Context, jobKey, excludedID string) ([]vultrInstance, error) {
@@ -402,17 +361,10 @@ func (c *Client) listJobInstances(ctx context.Context, jobKey, excludedID string
 	if err != nil {
 		return nil, fmt.Errorf("look up existing Vultr runner instance: %w", err)
 	}
-	verified := make([]vultrInstance, 0, len(existing))
-	for _, inst := range existing {
-		if excludedID != "" && inst.ID == excludedID {
-			continue
-		}
-		if !compute.HasTag(inst.Tags, c.controllerTag) {
-			return nil, fmt.Errorf("%w: job-tagged Vultr instance %s belongs to another controller", compute.ErrOwnershipMismatch, inst.ID)
-		}
-		verified = append(verified, inst)
-	}
-	return verified, nil
+	return compute.FilterOwned("Vultr", excludedID, c.controllerTag, existing,
+		func(v vultrInstance) string { return v.ID },
+		func(v vultrInstance) []string { return v.Tags },
+	)
 }
 
 func (c *Client) listInstancesByTag(ctx context.Context, tag string) ([]vultrInstance, error) {
