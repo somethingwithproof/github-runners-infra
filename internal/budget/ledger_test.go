@@ -6,6 +6,7 @@ package budget
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -175,5 +176,53 @@ func TestCancelDoesNotAccrueSpend(t *testing.T) {
 	snap := tracker.Snapshot()
 	if snap.DailySpendUSD != 0 || snap.MonthlySpendUSD != 0 || snap.InFlightSpendUSD != 0 {
 		t.Fatalf("spend after Cancel = %#v, want 0", snap)
+	}
+}
+
+func TestReservationRetriesFailedWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "budget.json")
+	tracker, err := NewTracker(Config{DailyCapUSD: 1, StatePath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Mkdir(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := tracker.Reserve(Reservation{Key: "job", HourlyRateUSD: 0.1}); err == nil {
+			t.Fatal("accepted reservation with unwritable ledger")
+		}
+	}
+	if tracker.Snapshot().InFlightSpendUSD != 0 {
+		t.Fatal("failed reservation counted as in flight")
+	}
+}
+
+func TestFallbackReservationReplacesSpotPrice(t *testing.T) {
+	now := time.Now()
+	tracker, err := NewTracker(Config{DailyCapUSD: 1, ReservationDuration: time.Hour, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := Reservation{Key: "job", Repository: "org/repo", Provider: "aws", Spot: true, HourlyRateUSD: 0.30}
+	if err := tracker.Reserve(res); err != nil {
+		t.Fatal(err)
+	}
+	res.Spot = false
+	res.HourlyRateUSD = 1.20
+	if err := tracker.Reserve(res); !errors.Is(err, ErrBudgetExceeded) {
+		t.Fatalf("over-cap fallback = %v", err)
+	}
+	if got := tracker.Snapshot().InFlightSpendUSD; got != 0.30 {
+		t.Fatalf("failed fallback changed reservation: %v", got)
+	}
+	res.HourlyRateUSD = 0.90
+	if err := tracker.Reserve(res); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Hour)
+	tracker.Release(res.Key)
+	if got := tracker.Snapshot().DailySpendUSD; got != 0.90 {
+		t.Fatalf("settled cost = %v", got)
 	}
 }

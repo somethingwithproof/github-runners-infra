@@ -263,6 +263,13 @@ func TestOCISignatureFlexPreemptibleLifecycleAndPagination(t *testing.T) {
 	// Terminated state is treated as absent cleanly.
 	mu.Lock()
 	termInst := instances[created.ID]
+	termInst.LifecycleState = "TERMINATING"
+	instances[created.ID] = termInst
+	mu.Unlock()
+	if absent, err := client.RunnerAbsent(context.Background(), created.ID); err != nil || absent {
+		t.Fatalf("RunnerAbsent(TERMINATING) = %v, %v", absent, err)
+	}
+	mu.Lock()
 	termInst.LifecycleState = "TERMINATED"
 	instances[created.ID] = termInst
 	mu.Unlock()
@@ -445,6 +452,7 @@ func TestOCISweepPaginationOwnershipAndAmbiguousRecovery(t *testing.T) {
 	t.Run("ownership mismatch and duplicate guards", func(t *testing.T) {
 		jobKey := "org/repo:guard"
 		var duplicate atomic.Bool
+		var inventoryCalls atomic.Int32
 		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if strings.HasPrefix(r.URL.Path, instancesBasePath) {
 				_ = json.NewEncoder(w).Encode(ociInstance{
@@ -453,6 +461,7 @@ func TestOCISweepPaginationOwnershipAndAmbiguousRecovery(t *testing.T) {
 				})
 				return
 			}
+			inventoryCalls.Add(1)
 			if !duplicate.Load() {
 				_ = json.NewEncoder(w).Encode([]ociInstance{{
 					ID: "ocid1.inst.foreign", LifecycleState: "RUNNING",
@@ -477,7 +486,21 @@ func TestOCISweepPaginationOwnershipAndAmbiguousRecovery(t *testing.T) {
 		if err := client.DeleteRunner(context.Background(), "ocid1.inst.foreign", jobKey); !errors.Is(err, compute.ErrOwnershipMismatch) {
 			t.Fatalf("foreign DeleteRunner error = %v", err)
 		}
+		lookup := client.NewReconciliationLookup()
+		before := inventoryCalls.Load()
+		if _, _, err := lookup(context.Background(), jobKey); !errors.Is(err, compute.ErrOwnershipMismatch) {
+			t.Fatalf("snapshot ownership = %v", err)
+		}
+		if _, found, err := lookup(context.Background(), "org/repo:missing"); err != nil || found {
+			t.Fatalf("snapshot missing = %v %v", found, err)
+		}
+		if got := inventoryCalls.Load() - before; got != 1 {
+			t.Fatalf("inventory requests in pass = %d", got)
+		}
 		duplicate.Store(true)
+		if _, _, err := client.NewReconciliationLookup()(context.Background(), jobKey); !errors.Is(err, compute.ErrDuplicateInstances) {
+			t.Fatalf("new pass duplicates = %v", err)
+		}
 		if _, _, err := client.FindRunner(context.Background(), jobKey); !errors.Is(err, compute.ErrDuplicateInstances) {
 			t.Fatalf("duplicate FindRunner error = %v", err)
 		}

@@ -759,7 +759,7 @@ func TestTransientProviderFailuresNeverOrphanHealthyRunner(t *testing.T) {
 			t.Fatal(err)
 		}
 		persisted.NextAttemptAt = time.Time{}
-		_, _ = handler.reconcileProvisionedRunner(context.Background(), persisted)
+		_, _ = handler.reconcileProvisionedRunner(context.Background(), persisted, handler.computeClient.FindRunner)
 	}
 	persisted, _, err := store.Get(context.Background(), record.Key)
 	if err != nil || persisted.Status != state.StatusProvisioned || persisted.ReconcileFailures != 0 || persisted.LastError == "" {

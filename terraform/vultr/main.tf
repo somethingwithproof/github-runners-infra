@@ -52,9 +52,22 @@ resource "vultr_vpc" "runners" {
   v4_subnet_mask = var.vpc_subnet_mask
 }
 
-# Vultr firewall groups deny all inbound traffic when zero inbound rules are defined.
+# Vultr starts filtering once a group has a rule. Loopback sources admit no remote peers.
 resource "vultr_firewall_group" "runners" {
   description = "github-runners-${var.controller_id}-deny-inbound"
+}
+
+resource "vultr_firewall_rule" "loopback" {
+  for_each = {
+    v4 = { address = "127.0.0.1", bits = 32 }
+    v6 = { address = "::1", bits = 128 }
+  }
+  firewall_group_id = vultr_firewall_group.runners.id
+  ip_type           = each.key
+  protocol          = "tcp"
+  port              = "1"
+  subnet            = each.value.address
+  subnet_size       = each.value.bits
 }
 
 output "vpc_id" {
@@ -63,6 +76,7 @@ output "vpc_id" {
 }
 
 output "firewall_group_id" {
+  depends_on  = [vultr_firewall_rule.loopback]
   description = "Value for VULTR_FIREWALL_GROUP_ID."
   value       = vultr_firewall_group.runners.id
 }

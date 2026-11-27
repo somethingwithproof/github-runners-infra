@@ -7,6 +7,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"text/template"
 	"time"
 
 	"github.com/thomasvincent/github-runners-infra/internal/budget"
@@ -119,7 +120,7 @@ func TestHandlerPrebakedEgressAndRegistrationTokenFallback(t *testing.T) {
 		ComputeClient:       comp,
 		Store:               store,
 		RequiredLabel:       "self-hosted",
-		AllowedLabels:       []string{"self-hosted"},
+		AllowedLabels:       []string{"self-hosted", "chef"},
 		AllowedRepositories: []string{"trusted/private-repo"},
 		RunnerVersion:       "2.336.0",
 		RunnerSHA256:        strings.Repeat("a", 64),
@@ -137,7 +138,7 @@ func TestHandlerPrebakedEgressAndRegistrationTokenFallback(t *testing.T) {
 	key := "trusted/private-repo:702"
 	if _, err := store.Create(ctx, state.Record{
 		Key: key, DeliveryID: "del-fb-1", JobID: 702,
-		Owner: "trusted", Repository: "private-repo", Labels: []string{"self-hosted"}, Provider: "test",
+		Owner: "trusted", Repository: "private-repo", Labels: []string{"self-hosted", "chef"}, Provider: "test",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -153,6 +154,14 @@ func TestHandlerPrebakedEgressAndRegistrationTokenFallback(t *testing.T) {
 		t.Fatalf("unexpected fallback auth params: %#v", comp.lastParams)
 	}
 
+	tmpl, err := template.ParseFiles("../../cloud-init/runner.yaml.tmpl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered, err := compute.RenderCloudInit(tmpl, comp.lastParams)
+	if err != nil || !strings.Contains(rendered, "--labels 'self-hosted,chef'") {
+		t.Fatalf("missing custom labels, err=%v", err)
+	}
 	// Verify RenderCloudInit renders prebaked + egress + fallback cleanly.
 	if _, err := compute.RenderCloudInit(nil, comp.lastParams); err == nil {
 		t.Fatal("expected nil template error")
@@ -161,10 +170,10 @@ func TestHandlerPrebakedEgressAndRegistrationTokenFallback(t *testing.T) {
 
 func TestHandlerLabelBasedSpotAndOnDemandPrecedenceWithSizeAndBudget(t *testing.T) {
 	cases := []struct {
-		name      string
-		labels    []string
-		wantSpot  *bool
-		wantSize  string
+		name     string
+		labels   []string
+		wantSpot *bool
+		wantSize string
 	}{
 		{name: "force spot with size", labels: []string{"self-hosted", "large", "spot"}, wantSpot: compute.BoolPtr(true), wantSize: "m7i.2xlarge"},
 		{name: "force on-demand with size", labels: []string{"self-hosted", "large", "on-demand"}, wantSpot: compute.BoolPtr(false), wantSize: "m7i.2xlarge"},

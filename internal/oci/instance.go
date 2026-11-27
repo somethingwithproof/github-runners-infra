@@ -21,6 +21,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
@@ -307,6 +308,10 @@ func (c *Client) FindRunner(ctx context.Context, jobKey string) (*compute.Runner
 	if err != nil {
 		return nil, false, err
 	}
+	return selectJobRunner(jobKey, existing)
+}
+
+func selectJobRunner(jobKey string, existing []ociInstance) (*compute.RunnerInstance, bool, error) {
 	return compute.SelectSingleRunner("OCI", jobKey, existing, func(inst ociInstance) *compute.RunnerInstance {
 		return &compute.RunnerInstance{ID: inst.ID, Name: inst.DisplayName}
 	})
@@ -353,7 +358,9 @@ func (c *Client) launchInstance(
 	shapeCfg *shapeConfig,
 	useSpot, isFallback bool,
 ) (*compute.RunnerInstance, error) {
-	params.HTTPSAptMirrors = true
+	if err := params.CheckLaunchBudget(c.Provider(), c.PricingSize(params.InstanceSize), useSpot); err != nil {
+		return nil, err
+	}
 	userData, err := compute.RenderCloudInit(c.cloudInitTmpl, params.WithSpot(useSpot))
 	if err != nil {
 		return nil, err
@@ -426,8 +433,7 @@ func (c *Client) handleCreateError(ctx context.Context, jobKey, desiredName stri
 	)
 }
 
-// RunnerAbsent checks authoritative absence by OCI instance OCID, treating explicit NotFound,
-// TERMINATING, and TERMINATED instances as absent.
+// RunnerAbsent confirms absence only after termination completes or OCI reports explicit NotFound.
 func (c *Client) RunnerAbsent(ctx context.Context, id string) (bool, error) {
 	if !instanceIDRegex.MatchString(id) {
 		return false, fmt.Errorf("invalid OCI instance ID %q", id)
@@ -440,7 +446,7 @@ func (c *Client) RunnerAbsent(ctx context.Context, id string) (bool, error) {
 		}
 		return false, fmt.Errorf("confirm OCI instance %s absence: %w", id, err)
 	}
-	return isAbsentLifecycleState(inst.LifecycleState), nil
+	return strings.EqualFold(strings.TrimSpace(inst.LifecycleState), "TERMINATED"), nil
 }
 
 // DeleteRunner terminates an OCI instance only after verifying controller and
@@ -463,7 +469,7 @@ func (c *Client) deleteOwned(ctx context.Context, id, expectedJobTag string) err
 		}
 		return fmt.Errorf("get OCI instance %s before delete: %w", id, err)
 	}
-	if isAbsentLifecycleState(inst.LifecycleState) {
+	if isTerminatingOrTerminated(inst.LifecycleState) {
 		return nil
 	}
 	if inst.FreeformTags[controllerTagKey] != c.controllerID || (expectedJobTag != "" && inst.FreeformTags[jobTagKey] != expectedJobTag) {
@@ -474,7 +480,7 @@ func (c *Client) deleteOwned(ctx context.Context, id, expectedJobTag string) err
 			}
 			return fmt.Errorf("confirm OCI instance %s after ownership mismatch: %w", id, confirmErr)
 		}
-		if isAbsentLifecycleState(confirm.LifecycleState) {
+		if isTerminatingOrTerminated(confirm.LifecycleState) {
 			return nil
 		}
 		return fmt.Errorf("%w: refusing to delete OCI instance %s without controller and job ownership tags", compute.ErrOwnershipMismatch, id)
@@ -540,10 +546,44 @@ func (c *Client) listJobInstances(ctx context.Context, jobKey, excludedID string
 			matched = append(matched, inst)
 		}
 	}
+	return c.filterOwned(excludedID, matched)
+}
+
+func (c *Client) filterOwned(excludedID string, matched []ociInstance) ([]ociInstance, error) {
 	return compute.FilterOwned("OCI", excludedID, c.controllerTag, matched,
 		func(i ociInstance) string { return i.ID },
 		instanceTags,
 	)
+}
+
+// NewReconciliationLookup indexes one paginated inventory for all jobs in a liveness pass.
+func (c *Client) NewReconciliationLookup() compute.RunnerLookup {
+	var once sync.Once
+	var byJob map[string][]ociInstance
+	var listErr error
+	return func(ctx context.Context, key string) (*compute.RunnerInstance, bool, error) {
+		once.Do(func() {
+			var instances []ociInstance
+			instances, listErr = c.listCompartmentInstances(ctx)
+			if listErr != nil {
+				return
+			}
+			byJob = make(map[string][]ociInstance)
+			for _, inst := range instances {
+				if tag := inst.FreeformTags[jobTagKey]; tag != "" {
+					byJob[tag] = append(byJob[tag], inst)
+				}
+			}
+		})
+		if listErr != nil {
+			return nil, false, listErr
+		}
+		matched, err := c.filterOwned("", byJob[compute.JobTag(key)])
+		if err != nil {
+			return nil, false, err
+		}
+		return selectJobRunner(key, matched)
+	}
 }
 
 func (c *Client) listCompartmentInstances(ctx context.Context) ([]ociInstance, error) {
@@ -563,7 +603,7 @@ func (c *Client) listCompartmentInstances(ctx context.Context) ([]ociInstance, e
 			return nil, err
 		}
 		for _, inst := range page {
-			if isAbsentLifecycleState(inst.LifecycleState) {
+			if isTerminatingOrTerminated(inst.LifecycleState) {
 				continue
 			}
 			active = append(active, inst)
@@ -625,7 +665,7 @@ func isCapacityError(err error) bool {
 		strings.Contains(msg, "out of capacity")
 }
 
-func isAbsentLifecycleState(state string) bool {
+func isTerminatingOrTerminated(state string) bool {
 	switch strings.ToUpper(strings.TrimSpace(state)) {
 	case "TERMINATED", "TERMINATING":
 		return true
