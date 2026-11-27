@@ -102,21 +102,20 @@ type RESTRequest struct {
 	ParseError      func([]byte) string
 }
 
-// DoJSON executes a bounded, context-aware authenticated JSON HTTP call.
-func DoJSON(ctx context.Context, cfg RESTRequest) error {
+func buildJSONRequest(ctx context.Context, cfg RESTRequest) (*http.Request, error) {
 	var bodyBytes []byte
 	var bodyReader io.Reader
 	if cfg.Body != nil {
 		var err error
 		bodyBytes, err = json.Marshal(cfg.Body)
 		if err != nil {
-			return fmt.Errorf("marshal %s request: %w", cfg.Provider, err)
+			return nil, fmt.Errorf("marshal %s request: %w", cfg.Provider, err)
 		}
 		bodyReader = bytes.NewReader(bodyBytes)
 	}
 	req, err := http.NewRequestWithContext(ctx, cfg.Method, cfg.URL, bodyReader)
 	if err != nil {
-		return fmt.Errorf("build %s request: %w", cfg.Provider, err)
+		return nil, fmt.Errorf("build %s request: %w", cfg.Provider, err)
 	}
 	if cfg.BearerToken != "" && cfg.SignRequest == nil {
 		req.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
@@ -132,8 +131,17 @@ func DoJSON(ctx context.Context, cfg RESTRequest) error {
 	}
 	if cfg.SignRequest != nil {
 		if err := cfg.SignRequest(req, bodyBytes); err != nil {
-			return fmt.Errorf("sign %s request: %w", cfg.Provider, err)
+			return nil, fmt.Errorf("sign %s request: %w", cfg.Provider, err)
 		}
+	}
+	return req, nil
+}
+
+// DoJSON executes a bounded, context-aware authenticated JSON HTTP call.
+func DoJSON(ctx context.Context, cfg RESTRequest) error {
+	req, err := buildJSONRequest(ctx, cfg)
+	if err != nil {
+		return err
 	}
 
 	resp, err := cfg.Client.Do(req)

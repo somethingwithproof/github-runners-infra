@@ -123,7 +123,9 @@ func (s *requestSigner) Sign(req *http.Request, body []byte) error {
 
 	signingString := strings.Join(lines, "\n")
 	sum := sha256.Sum256([]byte(signingString))
-	sig, err := rsa.SignPKCS1v15(rand.Reader, s.privateKey, crypto.SHA256, sum[:])
+	// OCI HTTP Signature version="1" algorithm="rsa-sha256" requires RSASSA-PKCS1-v1_5
+	// with SHA-256, which (*rsa.PrivateKey).Sign produces when given crypto.SHA256.
+	sig, err := s.privateKey.Sign(rand.Reader, sum[:], crypto.SHA256)
 	if err != nil {
 		return fmt.Errorf("sign OCI request digest: %w", err)
 	}
