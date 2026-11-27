@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -85,5 +86,42 @@ func TestSweepContinuesAfterResourceError(t *testing.T) {
 		})
 	if !errors.Is(err, failure) || deleted != 1 || len(attempted) != 2 || attempted[1] != "second" {
 		t.Fatalf("deleted=%d, attempts=%v, err=%v", deleted, attempted, err)
+	}
+}
+
+func TestProviderBaseURLRequiresCleanHTTPS(t *testing.T) {
+	for _, url := range []string{"http://api.example.com", "https://user@example.com", "https://api.example.com/v2?", "https://api.example.com/v2?view=page", "https://api.example.com/v2#", "https://api.example.com/v4#fragment"} {
+		if _, err := NormalizeBaseURL(url, "", "test"); err == nil {
+			t.Errorf("accepted %q", url)
+		}
+	}
+}
+
+func TestDoJSONRequiresExpectedBodyAndPreservesErrorStatus(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/missing":
+			w.Header().Set("Content-Length", "20")
+			w.WriteHeader(http.StatusNotFound)
+		case "/list":
+			_, _ = w.Write([]byte("[]"))
+		}
+	}))
+	defer server.Close()
+	var list []string
+	request := func(path string, out any) error {
+		return DoJSON(context.Background(), RESTRequest{Provider: "test", Client: server.Client(), URL: server.URL + path, Method: http.MethodGet, Out: out})
+	}
+	if err := request("/missing", &list); !IsHTTPNotFound(err) {
+		t.Fatalf("truncated 404 = %v", err)
+	}
+	if err := request("/empty", &list); err == nil {
+		t.Fatal("accepted empty inventory response")
+	}
+	if err := request("/empty", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := request("/list", &list); err != nil || list == nil {
+		t.Fatalf("empty JSON list = %v %v", list, err)
 	}
 }

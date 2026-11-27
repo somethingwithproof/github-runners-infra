@@ -138,7 +138,7 @@ func TestVultrConfigValidation(t *testing.T) {
 
 func TestVultrLifecycleAndSizeOverride(t *testing.T) {
 	mock := &vultrMock{token: "test-vultr-key"}
-	srv := httptest.NewServer(mock)
+	srv := httptest.NewTLSServer(mock)
 	defer srv.Close()
 
 	tmplPath := writeVultrTemplate(t, "#cloud-config\njit={{.RunnerJITConfig}}\ndeadman={{.DeadmanShutdownMinutes}}\n")
@@ -205,7 +205,7 @@ func TestVultrCursorSweepAndUndatedTolerance(t *testing.T) {
 	freshTime := time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339)
 	var deleted, cursors []string
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete {
 			deleted = append(deleted, strings.TrimPrefix(r.URL.Path, instancesBasePath))
 			w.WriteHeader(http.StatusNoContent)
@@ -250,7 +250,7 @@ func TestVultrAmbiguousCreateAndOwnershipGuards(t *testing.T) {
 	params := compute.RunnerParams{JobKey: "org/repo:77", ProvisionEpoch: 2}
 	wantName := compute.DeterministicName("vultr", params.JobKey, params.ProvisionEpoch)
 	listCalls := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			w.WriteHeader(http.StatusBadGateway)
 			_, _ = w.Write([]byte(`{"error":"upstream timeout"}`))
@@ -294,7 +294,7 @@ func TestVultrAmbiguousCreateAndOwnershipGuards(t *testing.T) {
 		}, compute.ErrDuplicateInstances},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			guardSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			guardSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				_ = json.NewEncoder(w).Encode(map[string]any{"instances": tc.instances})
 			}))
 			defer guardSrv.Close()
