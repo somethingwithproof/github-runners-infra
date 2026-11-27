@@ -75,9 +75,10 @@ func TestCloudInitContainsOnlyJITBootstrapMaterial(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			wantFuse := "systemd-run --unit=runner-deadman-shutdown --on-active=180m /sbin/shutdown --poweroff now"
-			if !strings.Contains(renderedDeadman.String(), wantFuse) {
-				t.Fatalf("rendered cloud-init missing dead-man fuse %q", wantFuse)
+			for _, want := range []string{"date -u -d '+180 minutes'", "OnCalendar=$deadline", "Persistent=true", "ExecStart=/sbin/shutdown --poweroff now", "systemctl enable --now runner-deadman-shutdown.timer"} {
+				if !strings.Contains(renderedDeadman.String(), want) {
+					t.Errorf("missing shutdown timer directive %q", want)
+				}
 			}
 			if strings.Contains(renderedDeadman.String(), "set -eu#") || strings.Contains(renderedDeadman.String(), "set -eusystemctl") {
 				t.Fatalf("dead-man template tags collapsed adjacent shell lines:\n%s", renderedDeadman.String())

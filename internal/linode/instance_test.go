@@ -224,7 +224,7 @@ func TestLinodeOwnershipDeleteAndAbsence(t *testing.T) {
 
 func assertLinodeCreatePayload(t *testing.T, req createInstanceRequest) {
 	t.Helper()
-	if req.Type != "g6-dedicated-8" || req.FirewallID != 55 || len(req.Interfaces) != 1 || req.Interfaces[0].SubnetID != 88 {
+	if req.Type != "g6-dedicated-8" || req.FirewallID != 55 || len(req.Interfaces) != 1 || req.Interfaces[0].SubnetID != 88 || req.Interfaces[0].IPv4 == nil || req.Interfaces[0].IPv4.NAT != "any" {
 		t.Fatalf("unexpected create payload: %#v", req)
 	}
 	if len(req.RootPass) < 20 || req.Metadata == nil {
