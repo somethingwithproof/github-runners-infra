@@ -89,32 +89,38 @@ func NormalizeBaseURL(raw, defaultURL, provider string) (string, error) {
 
 // RESTRequest describes a single authenticated JSON request against a cloud REST API.
 type RESTRequest struct {
-	Provider    string
-	Client      *http.Client
-	Method      string
-	URL         string
-	BearerToken string
-	Headers     map[string]string
-	Body        any
-	Out         any
-	ParseError  func([]byte) string
+	Provider        string
+	Client          *http.Client
+	Method          string
+	URL             string
+	BearerToken     string
+	SignRequest     func(req *http.Request, body []byte) error
+	Headers         map[string]string
+	Body            any
+	Out             any
+	ResponseHeaders *http.Header
+	ParseError      func([]byte) string
 }
 
 // DoJSON executes a bounded, context-aware authenticated JSON HTTP call.
 func DoJSON(ctx context.Context, cfg RESTRequest) error {
+	var bodyBytes []byte
 	var bodyReader io.Reader
 	if cfg.Body != nil {
-		encoded, err := json.Marshal(cfg.Body)
+		var err error
+		bodyBytes, err = json.Marshal(cfg.Body)
 		if err != nil {
 			return fmt.Errorf("marshal %s request: %w", cfg.Provider, err)
 		}
-		bodyReader = bytes.NewReader(encoded)
+		bodyReader = bytes.NewReader(bodyBytes)
 	}
 	req, err := http.NewRequestWithContext(ctx, cfg.Method, cfg.URL, bodyReader)
 	if err != nil {
 		return fmt.Errorf("build %s request: %w", cfg.Provider, err)
 	}
-	req.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+	if cfg.BearerToken != "" && cfg.SignRequest == nil {
+		req.Header.Set("Authorization", "Bearer "+cfg.BearerToken)
+	}
 	req.Header.Set("Accept", "application/json")
 	if cfg.Body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -122,6 +128,11 @@ func DoJSON(ctx context.Context, cfg RESTRequest) error {
 	for k, v := range cfg.Headers {
 		if v != "" {
 			req.Header.Set(k, v)
+		}
+	}
+	if cfg.SignRequest != nil {
+		if err := cfg.SignRequest(req, bodyBytes); err != nil {
+			return fmt.Errorf("sign %s request: %w", cfg.Provider, err)
 		}
 	}
 
@@ -133,6 +144,10 @@ func DoJSON(ctx context.Context, cfg RESTRequest) error {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
 	}()
+
+	if cfg.ResponseHeaders != nil {
+		*cfg.ResponseHeaders = resp.Header.Clone()
+	}
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, MaxRESTResponseBytes+1))
 	if err != nil {

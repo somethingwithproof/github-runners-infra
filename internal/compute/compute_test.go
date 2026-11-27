@@ -89,6 +89,8 @@ func TestRenderCloudInitSpotPreemptionWatcher(t *testing.T) {
 		"latest/meta-data/spot/instance-action",
 		"computeMetadata/v1/instance/preempted",
 		"metadata/scheduledevents?api-version=2020-07-01",
+		"opc/v2/instance/preemptionAction",
+		"Authorization: Bearer Oracle",
 		"pkill -TERM -f Runner.Listener",
 		`kill "$PREEMPT_WATCH_PID"`,
 	} {

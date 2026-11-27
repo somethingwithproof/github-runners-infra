@@ -56,12 +56,21 @@ var DefaultHourlyRates = map[string]float64{
 	"azure:Standard_D8s_v5": 0.3840,
 	"azure:Standard_F4s_v2": 0.1690,
 	"azure:Standard_F8s_v2": 0.3380,
+	// Oracle Cloud Infrastructure (OCI Flex & fixed on-demand reference)
+	"oci:VM.Standard.A1.Flex:4:24": 0.0760,
+	"oci:VM.Standard.A1.Flex":      0.0760,
+	"oci:VM.Standard.E4.Flex:4:16": 0.1240,
+	"oci:VM.Standard.E4.Flex":      0.1240,
+	"oci:VM.Standard.E4.Flex:8:32": 0.2480,
+	"oci:VM.Standard.E5.Flex:4:16": 0.1520,
+	"oci:VM.Standard3.Flex:4:16":   0.1840,
 }
 
 var defaultProviderFallbackRates = map[string]float64{
 	"vultr":        0.075,
 	"linode":       0.080,
 	"digitalocean": 0.090,
+	"oci":          0.124,
 	"azure":        0.195,
 	"gcp":          0.200,
 	"aws":          0.205,
@@ -74,6 +83,7 @@ var DefaultSpotDiscountFactors = map[string]float64{
 	"aws":   0.35,
 	"gcp":   0.30,
 	"azure": 0.35,
+	"oci":   0.50,
 }
 
 const unknownProviderFallbackRate = 0.250
@@ -142,10 +152,41 @@ func HourlyRate(provider, size string, overrides map[string]float64) float64 {
 	if rate, ok := DefaultHourlyRates[lowerKey]; ok {
 		return rate
 	}
+	if p == "oci" {
+		if rate, ok := ociFlexHourlyRate(s); ok {
+			return rate
+		}
+	}
 	if rate, ok := defaultProviderFallbackRates[p]; ok {
 		return rate
 	}
 	return unknownProviderFallbackRate
+}
+
+func ociFlexHourlyRate(size string) (float64, bool) {
+	parts := strings.Split(strings.TrimSpace(size), ":")
+	if len(parts) != 3 {
+		return 0, false
+	}
+	ocpus, err1 := strconv.ParseFloat(parts[1], 64)
+	memGB, err2 := strconv.ParseFloat(parts[2], 64)
+	if err1 != nil || err2 != nil || ocpus <= 0 || memGB <= 0 {
+		return 0, false
+	}
+	var perOCPU, perGB float64
+	switch strings.ToLower(parts[0]) {
+	case "vm.standard.a1.flex":
+		perOCPU, perGB = 0.010, 0.0015
+	case "vm.standard.e4.flex":
+		perOCPU, perGB = 0.025, 0.0015
+	case "vm.standard.e5.flex":
+		perOCPU, perGB = 0.030, 0.0020
+	case "vm.standard3.flex":
+		perOCPU, perGB = 0.040, 0.0015
+	default:
+		return 0, false
+	}
+	return ocpus*perOCPU + memGB*perGB, true
 }
 
 // ParseHourlyRateOverrides parses comma-separated "provider:size=rate" or
@@ -193,16 +234,17 @@ func normalizeRateKey(raw string) (string, error) {
 	if strings.EqualFold(rest, "spot") {
 		return provider + ":spot", nil
 	}
-	size, suffix, hasSuffix := strings.Cut(rest, ":")
-	size = strings.TrimSpace(size)
+	isSpot := false
+	size := rest
+	if strings.HasSuffix(strings.ToLower(rest), ":spot") {
+		isSpot = true
+		size = strings.TrimSpace(rest[:len(rest)-len(":spot")])
+	}
 	if !compute.ValidInstanceSize(size) {
 		return "", fmt.Errorf("invalid instance size %q in hourly rate override %q", size, raw)
 	}
-	if !hasSuffix {
-		return provider + ":" + size, nil
+	if isSpot {
+		return provider + ":" + size + ":spot", nil
 	}
-	if !strings.EqualFold(strings.TrimSpace(suffix), "spot") {
-		return "", fmt.Errorf("invalid rate suffix %q in hourly rate override %q", suffix, raw)
-	}
-	return provider + ":" + size + ":spot", nil
+	return provider + ":" + size, nil
 }

@@ -11,7 +11,7 @@ import (
 
 var (
 	labelNameRegex    = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$`)
-	instanceSizeRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
+	instanceSizeRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}(:[0-9]+(\.[0-9]+)?:[0-9]+(\.[0-9]+)?)?$`)
 )
 
 // ValidLabel reports whether value is a safe GitHub runner label identifier.

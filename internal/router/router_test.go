@@ -401,7 +401,7 @@ func TestRouterSpotPricingFailoverAndOnDemandFallback(t *testing.T) {
 	})
 
 	t.Run("explicit :spot hourly rate override", func(t *testing.T) {
-		overrides, err := ParseHourlyRateOverrides("aws:m7i.xlarge:spot=0.055, gcp:spot=0.045")
+		overrides, err := ParseHourlyRateOverrides("aws:m7i.xlarge:spot=0.055, gcp:spot=0.045, oci:VM.Standard.E4.Flex:4:16:spot=0.050")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -410,6 +410,16 @@ func TestRouterSpotPricingFailoverAndOnDemandFallback(t *testing.T) {
 		}
 		if got := HourlyRateForMode("gcp", "n2-standard-4", true, overrides); got != 0.045 {
 			t.Fatalf("gcp spot override = %v, want 0.045", got)
+		}
+		if got := HourlyRateForMode("oci", "VM.Standard.E4.Flex:4:16", true, overrides); got != 0.050 {
+			t.Fatalf("oci flex spot override = %v, want 0.050", got)
+		}
+		// Dynamic OCI Flex rate + 50% Preemptible discount when no override is set.
+		if got := HourlyRate("oci", "VM.Standard.A1.Flex:8:48", nil); got < 0.151 || got > 0.153 {
+			t.Fatalf("oci dynamic A1.Flex:8:48 rate = %v, want ~0.152", got)
+		}
+		if got := HourlyRateForMode("oci", "VM.Standard.E4.Flex:4:16", true, nil); got != 0.062 {
+			t.Fatalf("oci default E4.Flex preemptible rate = %v, want 0.062", got)
 		}
 	})
 }

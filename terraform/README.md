@@ -9,6 +9,7 @@ prerequisites for one supported compute provider:
 - [`azure/`](./azure): runner resource group, deny-inbound NSG, and scoped custom role definition
 - [`vultr/`](./vultr): private VPC and deny-all-inbound Firewall Group
 - [`linode/`](./linode): private VPC, subnet, and default-DROP Cloud Firewall (HTTPS and DNS egress only)
+- [`oci/`](./oci): private VCN, NAT gateway, egress-only security list, private subnet, and compartment-scoped IAM dynamic group/policy
 
 Validate formatting locally with:
 

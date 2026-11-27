@@ -23,7 +23,7 @@
 
 A Go controller that creates one-job, repository-scoped GitHub Actions runners
 on DigitalOcean, AWS EC2, Google Compute Engine, Azure VMs, Vultr Cloud Compute,
-or Akamai Cloud (Linode). GitHub webhook deliveries are persisted before
+Akamai Cloud (Linode), or Oracle Cloud Infrastructure (OCI). GitHub webhook deliveries are persisted before
 acknowledgement, provisioning is retried after transient failures or controller
 restarts, and only controller-owned resources can be deleted.
 
@@ -89,9 +89,18 @@ egress through NAT and security groups or firewall rules with no inbound access.
 | `azure` | Standard VM | Spot VM, delete eviction policy | Supported (`AZURE_VM_SIZE` override) | [`terraform/azure`](terraform/azure) |
 | `vultr` | Cloud Compute | Not available; `RUNNER_SPOT=true` fails closed | Supported (`VULTR_PLAN` override) | [`terraform/vultr`](terraform/vultr) |
 | `linode` | Akamai Cloud / Linode | Not available; `RUNNER_SPOT=true` fails closed | Supported (`LINODE_INSTANCE_TYPE` override) | [`terraform/linode`](terraform/linode) |
+| `oci` | OCI Compute (Flex / Fixed) | Preemptible Instance (`TERMINATE`, no preserved boot volume) | Supported (`OCI_SHAPE` / `Shape:ocpus:memGB`, also accepts `OCI_LABEL_SIZE_MAP`) | [`terraform/oci`](terraform/oci) |
 
-`RUNNER_SPOT` defaults to `false`. Spot instances can disappear at any time and
-have no availability guarantee. A preempted GitHub job may need to be retried by
+`RUNNER_SPOT` defaults to `false`. Set `SPOT_FALLBACK_ON_DEMAND=true` to retry
+with on-demand capacity after spot pool exhaustion (across all spot-capable
+backends first in `MultiCloudRouter` mode). Workflows can override the default
+per job with `[self-hosted, spot]` or `[self-hosted, on-demand]` labels when
+allowlisted in `ALLOWED_LABELS` (`on-demand` wins if both labels are present so
+deploy and release jobs are never preempted). On spot/preemptible instances,
+cloud-init starts a secret-free background IMDS watcher (AWS IMDSv2, GCP, Azure
+Scheduled Events, and OCI IMDSv2) that sends `SIGTERM` to `Runner.Listener` upon
+receiving a preemption notice. Spot instances can disappear at any time and have
+no availability guarantee. A preempted GitHub job may need to be retried by
 workflow policy; the lifecycle TTL remains the cleanup backstop.
 
 DigitalOcean firewall posture is validated through its API before provisioning.
@@ -193,10 +202,11 @@ reclaimed only after `MAX_RUNNER_AGE`.
 `LABEL_SIZE_MAP` maps allowlisted workflow labels to provider-specific instance
 sizes (for example `large=c-8,xlarge=c-16` on DigitalOcean, `large=m7i.2xlarge`
 on AWS, `large=n2-standard-8` on GCP, `large=Standard_D8s_v5` on Azure,
-`large=vhf-8c-16gb` on Vultr, or `large=g6-dedicated-8` on Linode). Every label
-key must also appear in `ALLOWED_LABELS`, and size values are validated against
-a strict character allowlist. Set either `LABEL_SIZE_MAP` or the DigitalOcean
-alias `DO_LABEL_SIZE_MAP`, not both.
+`large=vhf-8c-16gb` on Vultr, `large=g6-dedicated-8` on Linode, or
+`large=VM.Standard.E4.Flex:8:32` on OCI). Every label key must also appear in
+`ALLOWED_LABELS`, and size values are validated against a strict character
+allowlist. Set only one of `LABEL_SIZE_MAP`, `DO_LABEL_SIZE_MAP`, or
+`OCI_LABEL_SIZE_MAP`.
 
 `RUNNER_DEADMAN_MINUTES` arms a secret-free transient `systemd-run` poweroff
 timer inside each runner VM (default `180` minutes, `0` disables). No cloud API
@@ -262,7 +272,11 @@ AWS_REGION=us-west-2
 AWS_AMI_ID=ami-pinned-id
 AWS_INSTANCE_TYPE=m7i.xlarge
 AWS_SUBNET_ID=subnet-private-id
+# Optional: comma-separated alternate subnets for EC2 capacity failover.
+AWS_ALTERNATE_SUBNET_IDS=
 AWS_SECURITY_GROUP_IDS=sg-egress-only-id
+# Optional: retry as on-demand when all spot subnets/providers fail capacity.
+SPOT_FALLBACK_ON_DEMAND=false
 AWS_INSTANCE_PROFILE_ARN=
 AWS_KEY_NAME=
 AWS_EXTERNAL_IP=false
@@ -411,6 +425,39 @@ queries, ambiguous-create recovery polling, authoritative 404 absence checks,
 and paginated orphan sweeps. Provision the VPC, subnet, and default-DROP Cloud
 Firewall with [`terraform/linode`](terraform/linode). Powered-off Linode
 instances continue billing until destroyed by the controller.
+
+### Oracle Cloud Infrastructure (OCI)
+
+```dotenv
+COMPUTE_PROVIDER=oci
+RUNNER_SPOT=true
+SPOT_FALLBACK_ON_DEMAND=true
+OCI_TENANCY_OCID=ocid1.tenancy.oc1..example
+OCI_USER_OCID=ocid1.user.oc1..example
+OCI_FINGERPRINT=aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99
+OCI_PRIVATE_KEY_PATH=/etc/github-runners/oci-api-key.pem
+OCI_REGION=us-ashburn-1
+OCI_COMPARTMENT_OCID=ocid1.compartment.oc1..example
+OCI_SUBNET_OCID=ocid1.subnet.oc1..example
+OCI_AVAILABILITY_DOMAIN=Uocm:US-ASHBURN-AD-1
+OCI_IMAGE_OCID=ocid1.image.oc1.iad.example
+OCI_SHAPE=VM.Standard.E4.Flex
+OCI_OCPUS=4
+OCI_MEMORY_GB=16
+# Optional: per-label Flex/fixed overrides (or use LABEL_SIZE_MAP).
+OCI_LABEL_SIZE_MAP=arm=VM.Standard.A1.Flex:4:24,large=VM.Standard.E4.Flex:8:32
+OCI_ASSIGN_PUBLIC_IP=false
+```
+
+The OCI adapter uses the OCI Compute REST API directly over `net/http` with
+RFC-compliant OCI HTTP Signature v1 (`RSA-SHA256`) request signing, Flex shape
+sizing (`Shape:ocpus:memoryGB`), Preemptible Instance support (`TERMINATE` with
+`preserveBootVolume: false`), capacity-error classification (`Out of host capacity`
+and `LimitExceeded`) for automatic failover or on-demand fallback, freeform
+ownership tags, `opc-next-page` paginated sweeps, and private-by-default VNICs.
+Provision the private VCN, NAT gateway, egress-only security list, and
+compartment-scoped IAM policy with [`terraform/oci`](terraform/oci), and build
+pre-baked images with [`packer/oci.pkr.hcl`](packer/oci.pkr.hcl).
 
 Drain all active records before changing `COMPUTE_PROVIDER`. State is bound to
 the provider that created each runner, and the controller fails closed instead
