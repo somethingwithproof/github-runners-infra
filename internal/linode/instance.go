@@ -110,32 +110,25 @@ func (c *Client) Provider() string { return "linode" }
 
 // NewClient constructs a Linode API v4 compute client.
 func NewClient(cfg Config) (*Client, error) {
-	token := strings.TrimSpace(cfg.Token)
-	if token == "" {
-		return nil, fmt.Errorf("linode API token is required")
-	}
-	if !compute.ValidControllerID(cfg.ControllerID) {
-		return nil, fmt.Errorf("controller ID must contain only letters, numbers, underscores, and hyphens")
-	}
-	if strings.TrimSpace(cfg.CloudInitPath) == "" {
-		return nil, fmt.Errorf("linode cloud-init template path is required")
-	}
-	tmpl, err := template.ParseFiles(cfg.CloudInitPath)
+	base, err := compute.InitRESTBase(compute.RESTBaseConfig{
+		Provider:       "linode",
+		TokenName:      "API token",
+		Token:          cfg.Token,
+		ControllerID:   cfg.ControllerID,
+		CloudInitPath:  cfg.CloudInitPath,
+		Region:         cfg.Region,
+		DefaultRegion:  defaultRegion,
+		Size:           cfg.InstanceType,
+		DefaultSize:    defaultInstanceType,
+		SizeLabel:      "Linode instance type",
+		BaseURL:        cfg.BaseURL,
+		DefaultBaseURL: defaultBaseURL,
+		HTTPClient:     cfg.HTTPClient,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("parse cloud-init template: %w", err)
+		return nil, err
 	}
 
-	region := strings.TrimSpace(cfg.Region)
-	if region == "" {
-		region = defaultRegion
-	}
-	instanceType := strings.TrimSpace(cfg.InstanceType)
-	if instanceType == "" {
-		instanceType = defaultInstanceType
-	}
-	if !compute.ValidInstanceSize(instanceType) {
-		return nil, fmt.Errorf("invalid Linode instance type %q", instanceType)
-	}
 	image := strings.TrimSpace(cfg.Image)
 	if image == "" {
 		image = defaultImage
@@ -147,27 +140,18 @@ func NewClient(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("linode VPC subnet ID must be positive when set")
 	}
 
-	baseURL, err := compute.NormalizeBaseURL(cfg.BaseURL, defaultBaseURL, "linode")
-	if err != nil {
-		return nil, err
-	}
-	httpClient := cfg.HTTPClient
-	if httpClient == nil {
-		httpClient = compute.DefaultHTTPClient()
-	}
-
 	return &Client{
-		httpClient:      httpClient,
-		baseURL:         baseURL,
-		token:           token,
-		cloudInitTmpl:   tmpl,
-		region:          region,
-		instanceType:    instanceType,
+		httpClient:      base.HTTPClient,
+		baseURL:         base.BaseURL,
+		token:           base.Token,
+		cloudInitTmpl:   base.CloudInitTmpl,
+		region:          base.Region,
+		instanceType:    base.Size,
 		image:           image,
 		authorizedKeys:  append([]string(nil), cfg.AuthorizedKeys...),
 		firewallID:      cfg.FirewallID,
 		vpcSubnetID:     cfg.VPCSubnetID,
-		controllerTag:   "runner-controller-" + cfg.ControllerID,
+		controllerTag:   base.ControllerTag,
 		recoveryTimeout: 15 * time.Second,
 		recoveryPoll:    2 * time.Second,
 	}, nil
@@ -193,14 +177,9 @@ func (c *Client) FindRunner(ctx context.Context, jobKey string) (*compute.Runner
 	if err != nil {
 		return nil, false, err
 	}
-	if len(existing) == 0 {
-		return nil, false, nil
-	}
-	if len(existing) > 1 {
-		return nil, false, fmt.Errorf("%w: multiple Linode instances exist for job %s", compute.ErrDuplicateInstances, jobKey)
-	}
-	inst := existing[0]
-	return &compute.RunnerInstance{ID: strconv.Itoa(inst.ID), Name: inst.Label}, true, nil
+	return compute.SelectSingleRunner("Linode", jobKey, existing, func(inst linodeInstance) *compute.RunnerInstance {
+		return &compute.RunnerInstance{ID: strconv.Itoa(inst.ID), Name: inst.Label}
+	})
 }
 
 // CreateRunner provisions an ephemeral Linode instance with ownership tags and cloud-init metadata.
@@ -209,15 +188,10 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 	if existing, found, err := c.FindRunner(ctx, params.JobKey); err != nil || found {
 		return existing, err
 	}
-
-	instanceType := c.instanceType
-	if params.InstanceSize != "" {
-		if !compute.ValidInstanceSize(params.InstanceSize) {
-			return nil, fmt.Errorf("invalid Linode instance type %q", params.InstanceSize)
-		}
-		instanceType = params.InstanceSize
+	instanceType, err := compute.SelectSizeOverride(c.instanceType, params.InstanceSize, "Linode instance type")
+	if err != nil {
+		return nil, err
 	}
-
 	userData, err := compute.RenderCloudInit(c.cloudInitTmpl, params)
 	if err != nil {
 		return nil, err

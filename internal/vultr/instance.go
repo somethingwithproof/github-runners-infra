@@ -113,31 +113,23 @@ func (c *Client) Provider() string { return "vultr" }
 
 // NewClient constructs a Vultr API v2 compute client.
 func NewClient(cfg Config) (*Client, error) {
-	apiKey := strings.TrimSpace(cfg.APIKey)
-	if apiKey == "" {
-		return nil, fmt.Errorf("vultr API key is required")
-	}
-	if !compute.ValidControllerID(cfg.ControllerID) {
-		return nil, fmt.Errorf("controller ID must contain only letters, numbers, underscores, and hyphens")
-	}
-	if strings.TrimSpace(cfg.CloudInitPath) == "" {
-		return nil, fmt.Errorf("vultr cloud-init template path is required")
-	}
-	tmpl, err := template.ParseFiles(cfg.CloudInitPath)
+	base, err := compute.InitRESTBase(compute.RESTBaseConfig{
+		Provider:       "vultr",
+		TokenName:      "API key",
+		Token:          cfg.APIKey,
+		ControllerID:   cfg.ControllerID,
+		CloudInitPath:  cfg.CloudInitPath,
+		Region:         cfg.Region,
+		DefaultRegion:  defaultRegion,
+		Size:           cfg.Plan,
+		DefaultSize:    defaultPlan,
+		SizeLabel:      "Vultr plan",
+		BaseURL:        cfg.BaseURL,
+		DefaultBaseURL: defaultBaseURL,
+		HTTPClient:     cfg.HTTPClient,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("parse cloud-init template: %w", err)
-	}
-
-	region := strings.TrimSpace(cfg.Region)
-	if region == "" {
-		region = defaultRegion
-	}
-	plan := strings.TrimSpace(cfg.Plan)
-	if plan == "" {
-		plan = defaultPlan
-	}
-	if !compute.ValidInstanceSize(plan) {
-		return nil, fmt.Errorf("invalid Vultr plan %q", plan)
+		return nil, err
 	}
 
 	snapshotID := strings.TrimSpace(cfg.SnapshotID)
@@ -149,28 +141,19 @@ func NewClient(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("vultr OS ID must be positive")
 	}
 
-	baseURL, err := compute.NormalizeBaseURL(cfg.BaseURL, defaultBaseURL, "vultr")
-	if err != nil {
-		return nil, err
-	}
-	httpClient := cfg.HTTPClient
-	if httpClient == nil {
-		httpClient = compute.DefaultHTTPClient()
-	}
-
 	return &Client{
-		httpClient:      httpClient,
-		baseURL:         baseURL,
-		apiKey:          apiKey,
-		cloudInitTmpl:   tmpl,
-		region:          region,
-		plan:            plan,
+		httpClient:      base.HTTPClient,
+		baseURL:         base.BaseURL,
+		apiKey:          base.Token,
+		cloudInitTmpl:   base.CloudInitTmpl,
+		region:          base.Region,
+		plan:            base.Size,
 		osID:            osID,
 		snapshotID:      snapshotID,
 		sshKeyIDs:       append([]string(nil), cfg.SSHKeyIDs...),
 		firewallGroupID: strings.TrimSpace(cfg.FirewallGroupID),
 		vpcID:           strings.TrimSpace(cfg.VPCID),
-		controllerTag:   "runner-controller-" + cfg.ControllerID,
+		controllerTag:   base.ControllerTag,
 		recoveryTimeout: 15 * time.Second,
 		recoveryPoll:    2 * time.Second,
 	}, nil
@@ -193,14 +176,9 @@ func (c *Client) FindRunner(ctx context.Context, jobKey string) (*compute.Runner
 	if err != nil {
 		return nil, false, err
 	}
-	if len(existing) == 0 {
-		return nil, false, nil
-	}
-	if len(existing) > 1 {
-		return nil, false, fmt.Errorf("%w: multiple Vultr instances exist for job %s", compute.ErrDuplicateInstances, jobKey)
-	}
-	inst := existing[0]
-	return &compute.RunnerInstance{ID: inst.ID, Name: inst.Label}, true, nil
+	return compute.SelectSingleRunner("Vultr", jobKey, existing, func(inst vultrInstance) *compute.RunnerInstance {
+		return &compute.RunnerInstance{ID: inst.ID, Name: inst.Label}
+	})
 }
 
 // CreateRunner provisions an ephemeral Vultr instance with ownership tags.
@@ -209,15 +187,10 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 	if existing, found, err := c.FindRunner(ctx, params.JobKey); err != nil || found {
 		return existing, err
 	}
-
-	plan := c.plan
-	if params.InstanceSize != "" {
-		if !compute.ValidInstanceSize(params.InstanceSize) {
-			return nil, fmt.Errorf("invalid Vultr plan %q", params.InstanceSize)
-		}
-		plan = params.InstanceSize
+	plan, err := compute.SelectSizeOverride(c.plan, params.InstanceSize, "Vultr plan")
+	if err != nil {
+		return nil, err
 	}
-
 	userData, err := compute.RenderCloudInit(c.cloudInitTmpl, params)
 	if err != nil {
 		return nil, err

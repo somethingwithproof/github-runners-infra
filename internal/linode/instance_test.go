@@ -152,56 +152,73 @@ func TestLinodeConfigValidation(t *testing.T) {
 	}
 }
 
-func TestLinodeLifecycleAndSizeOverride(t *testing.T) {
-	mock := &linodeMock{token: "test-linode-token"}
+func newMockLinodeClient(t *testing.T, mock *linodeMock) (*Client, func()) {
+	t.Helper()
 	srv := httptest.NewServer(mock)
-	defer srv.Close()
-
 	tmplPath := writeLinodeTemplate(t, "#cloud-config\njit={{.RunnerJITConfig}}\ndeadman={{.DeadmanShutdownMinutes}}\n")
 	client, err := NewClient(Config{
-		Token: "test-linode-token", Region: "us-east", InstanceType: "g6-standard-4",
+		Token: mock.token, Region: "us-east", InstanceType: "g6-standard-4",
 		FirewallID: 55, VPCSubnetID: 88, AuthorizedKeys: []string{"ssh-ed25519 AAAA"},
 		CloudInitPath: tmplPath, ControllerID: "primary", BaseURL: srv.URL, HTTPClient: srv.Client(),
 	})
 	if err != nil {
+		srv.Close()
 		t.Fatal(err)
 	}
-	if err := client.Health(context.Background()); err != nil {
+	return client, srv.Close
+}
+
+func TestLinodeCreateAndHealth(t *testing.T) {
+	mock := &linodeMock{token: "test-linode-token"}
+	client, cleanup := newMockLinodeClient(t, mock)
+	defer cleanup()
+
+	ctx := context.Background()
+	if err := client.Health(ctx); err != nil {
 		t.Fatalf("Health() error = %v", err)
 	}
-
-	params := compute.RunnerParams{
-		JobKey:                 "org/repo:42",
-		ProvisionEpoch:         1,
-		RunnerName:             "eph-repo-42",
-		RunnerJITConfig:        "encoded-jit",
-		InstanceSize:           "g6-dedicated-8",
-		DeadmanShutdownMinutes: 180,
+	if _, err := client.CreateRunner(ctx, compute.RunnerParams{JobKey: "org/repo:bad", InstanceSize: "bad/type"}); err == nil {
+		t.Fatal("CreateRunner accepted invalid size override")
 	}
-	created, err := client.CreateRunner(context.Background(), params)
+
+	created, err := client.CreateRunner(ctx, compute.RunnerParams{
+		JobKey: "org/repo:42", ProvisionEpoch: 1, RunnerName: "eph-repo-42",
+		RunnerJITConfig: "encoded-jit", InstanceSize: "g6-dedicated-8", DeadmanShutdownMinutes: 180,
+	})
 	if err != nil || created.ID != "7001" {
 		t.Fatalf("CreateRunner() = %#v, %v", created, err)
 	}
 	assertLinodeCreatePayload(t, mock.lastCreate)
+}
 
-	foundInst, found, err := client.FindRunner(context.Background(), params.JobKey)
+func TestLinodeOwnershipDeleteAndAbsence(t *testing.T) {
+	jobKey := "org/repo:42"
+	mock := &linodeMock{
+		token: "test-linode-token",
+		items: []linodeInstance{{
+			ID: 7001, Label: "ghr-existing",
+			Tags: []string{"runner-controller-primary", compute.JobTag(jobKey)},
+		}},
+	}
+	client, cleanup := newMockLinodeClient(t, mock)
+	defer cleanup()
+
+	ctx := context.Background()
+	foundInst, found, err := client.FindRunner(ctx, jobKey)
 	if err != nil || !found || foundInst.ID != "7001" {
 		t.Fatalf("FindRunner() = %#v, %v, %v", foundInst, found, err)
 	}
-	if absent, err := client.RunnerAbsent(context.Background(), "7001"); err != nil || absent {
+	if absent, err := client.RunnerAbsent(ctx, "7001"); err != nil || absent {
 		t.Fatalf("RunnerAbsent(existing) = %v, %v", absent, err)
 	}
-	if err := client.DeleteRunner(context.Background(), "7001", "org/repo:other"); !errors.Is(err, compute.ErrOwnershipMismatch) {
+	if err := client.DeleteRunner(ctx, "7001", "org/repo:other"); !errors.Is(err, compute.ErrOwnershipMismatch) {
 		t.Fatalf("wrong-job delete error = %v", err)
 	}
-	if err := client.DeleteRunner(context.Background(), "7001", params.JobKey); err != nil {
+	if err := client.DeleteRunner(ctx, "7001", jobKey); err != nil {
 		t.Fatalf("DeleteRunner() error = %v", err)
 	}
-	if absent, err := client.RunnerAbsent(context.Background(), "7001"); err != nil || !absent {
+	if absent, err := client.RunnerAbsent(ctx, "7001"); err != nil || !absent {
 		t.Fatalf("RunnerAbsent(deleted) = %v, %v", absent, err)
-	}
-	if _, err := client.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:bad", InstanceSize: "bad/type"}); err == nil {
-		t.Fatal("CreateRunner accepted invalid size override")
 	}
 }
 

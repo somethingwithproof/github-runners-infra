@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"text/template"
 	"time"
 )
 
@@ -218,6 +219,105 @@ func JobTag(jobKey string) string {
 func DeterministicName(provider, jobKey string, provisionEpoch int) string {
 	resourceHash := sha256.Sum256([]byte(provider + ":" + jobKey + ":" + strconv.Itoa(provisionEpoch)))
 	return "ghr-" + hex.EncodeToString(resourceHash[:16])
+}
+
+// RESTBaseConfig holds the validated common fields shared by token-based REST
+// compute adapters.
+type RESTBaseConfig struct {
+	Provider       string
+	TokenName      string
+	Token          string
+	ControllerID   string
+	CloudInitPath  string
+	Region         string
+	DefaultRegion  string
+	Size           string
+	DefaultSize    string
+	SizeLabel      string
+	BaseURL        string
+	DefaultBaseURL string
+	HTTPClient     *http.Client
+}
+
+// RESTBase holds initialized common state for a REST compute adapter.
+type RESTBase struct {
+	HTTPClient    *http.Client
+	BaseURL       string
+	Token         string
+	CloudInitTmpl *template.Template
+	Region        string
+	Size          string
+	ControllerTag string
+}
+
+// InitRESTBase validates common REST adapter settings, parses the cloud-init
+// template, and constructs a bounded default HTTP client when none is supplied.
+func InitRESTBase(cfg RESTBaseConfig) (RESTBase, error) {
+	token := strings.TrimSpace(cfg.Token)
+	if token == "" {
+		return RESTBase{}, fmt.Errorf("%s %s is required", cfg.Provider, cfg.TokenName)
+	}
+	if !ValidControllerID(cfg.ControllerID) {
+		return RESTBase{}, fmt.Errorf("controller ID must contain only letters, numbers, underscores, and hyphens")
+	}
+	if strings.TrimSpace(cfg.CloudInitPath) == "" {
+		return RESTBase{}, fmt.Errorf("%s cloud-init template path is required", cfg.Provider)
+	}
+	tmpl, err := template.ParseFiles(cfg.CloudInitPath)
+	if err != nil {
+		return RESTBase{}, fmt.Errorf("parse cloud-init template: %w", err)
+	}
+	region := strings.TrimSpace(cfg.Region)
+	if region == "" {
+		region = cfg.DefaultRegion
+	}
+	size := strings.TrimSpace(cfg.Size)
+	if size == "" {
+		size = cfg.DefaultSize
+	}
+	if !ValidInstanceSize(size) {
+		return RESTBase{}, fmt.Errorf("invalid %s %q", cfg.SizeLabel, size)
+	}
+	baseURL, err := NormalizeBaseURL(cfg.BaseURL, cfg.DefaultBaseURL, cfg.Provider)
+	if err != nil {
+		return RESTBase{}, err
+	}
+	httpClient := cfg.HTTPClient
+	if httpClient == nil {
+		httpClient = DefaultHTTPClient()
+	}
+	return RESTBase{
+		HTTPClient:    httpClient,
+		BaseURL:       baseURL,
+		Token:         token,
+		CloudInitTmpl: tmpl,
+		Region:        region,
+		Size:          size,
+		ControllerTag: "runner-controller-" + cfg.ControllerID,
+	}, nil
+}
+
+// SelectSingleRunner enforces unique job instance ownership from a filtered slice.
+func SelectSingleRunner[T any](provider, jobKey string, items []T, toRunner func(T) *RunnerInstance) (*RunnerInstance, bool, error) {
+	if len(items) == 0 {
+		return nil, false, nil
+	}
+	if len(items) > 1 {
+		return nil, false, fmt.Errorf("%w: multiple %s instances exist for job %s", ErrDuplicateInstances, provider, jobKey)
+	}
+	return toRunner(items[0]), true, nil
+}
+
+// SelectSizeOverride validates an optional per-job instance size override or
+// returns defaultSize when override is empty.
+func SelectSizeOverride(defaultSize, override, sizeLabel string) (string, error) {
+	if override == "" {
+		return defaultSize, nil
+	}
+	if !ValidInstanceSize(override) {
+		return "", fmt.Errorf("invalid %s %q", sizeLabel, override)
+	}
+	return override, nil
 }
 
 // RecoverCreateError resolves an ambiguous provider create error by polling
