@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"math/rand/v2"
 	"net/http"
@@ -19,11 +20,14 @@ import (
 
 	"github.com/thomasvincent/github-runners-infra/internal/aws"
 	"github.com/thomasvincent/github-runners-infra/internal/azure"
+	"github.com/thomasvincent/github-runners-infra/internal/compute"
 	"github.com/thomasvincent/github-runners-infra/internal/digitalocean"
 	"github.com/thomasvincent/github-runners-infra/internal/gcp"
 	gh "github.com/thomasvincent/github-runners-infra/internal/github"
 	"github.com/thomasvincent/github-runners-infra/internal/i18n"
+	"github.com/thomasvincent/github-runners-infra/internal/linode"
 	"github.com/thomasvincent/github-runners-infra/internal/state"
+	"github.com/thomasvincent/github-runners-infra/internal/vultr"
 	"github.com/thomasvincent/github-runners-infra/internal/webhook"
 )
 
@@ -90,6 +94,7 @@ func run() error {
 		Store:                     stateStore,
 		RequiredLabel:             cfg.requiredLabel,
 		AllowedLabels:             cfg.allowedLabels,
+		LabelSizeMap:              cfg.labelSizeMap,
 		AllowedRepositories:       cfg.allowedRepositories,
 		AllowedPublicRepositories: cfg.allowedPublicRepositories,
 		RunnerVersion:             cfg.runnerVersion,
@@ -104,6 +109,8 @@ func run() error {
 		RegistrationTimeout:       cfg.registrationTimeout,
 		LivenessSettleWindow:      cfg.livenessSettleWindow,
 		LivenessConfirmations:     cfg.livenessConfirmations,
+		DeadmanShutdownMinutes:    cfg.deadmanShutdownMinutes,
+		DisableDeadmanShutdown:    cfg.disableDeadmanShutdown,
 		InstallationID:            cfg.installationID,
 	})
 	if err != nil {
@@ -339,6 +346,77 @@ func newComputeClient(startupCtx, lifetimeCtx context.Context) (webhook.ComputeC
 			return nil, noClose, err
 		}
 		return client, noClose, nil
+	case "vultr":
+		if spot {
+			return nil, noClose, errors.New(i18n.T("webhook.err.provider_no_spot", "Vultr"))
+		}
+		apiKey, err := requiredEnv("VULTR_API_KEY")
+		if err != nil {
+			return nil, noClose, err
+		}
+		osID, err := optionalPositiveInt("VULTR_OS_ID")
+		if err != nil {
+			return nil, noClose, err
+		}
+		client, err := vultr.NewClient(vultr.Config{
+			APIKey:          apiKey,
+			Region:          envOrDefault("VULTR_REGION", "ewr"),
+			Plan:            envOrDefault("VULTR_PLAN", "vc2-4c-8gb"),
+			OSID:            osID,
+			SnapshotID:      strings.TrimSpace(os.Getenv("VULTR_SNAPSHOT_ID")),
+			SSHKeyIDs:       splitCSV(os.Getenv("VULTR_SSH_KEY_IDS")),
+			FirewallGroupID: strings.TrimSpace(os.Getenv("VULTR_FIREWALL_GROUP_ID")),
+			VPCID:           strings.TrimSpace(os.Getenv("VULTR_VPC_ID")),
+			CloudInitPath:   cloudInitPath,
+			ControllerID:    controllerID,
+			BaseURL:         strings.TrimSpace(os.Getenv("VULTR_API_URL")),
+		})
+		if err != nil {
+			return nil, noClose, err
+		}
+		return client, noClose, nil
+	case "linode":
+		if spot {
+			return nil, noClose, errors.New(i18n.T("webhook.err.provider_no_spot", "Linode"))
+		}
+		token, err := requiredEnv("LINODE_TOKEN")
+		if err != nil {
+			return nil, noClose, err
+		}
+		firewallID, err := optionalPositiveInt("LINODE_FIREWALL_ID")
+		if err != nil {
+			return nil, noClose, err
+		}
+		vpcSubnetID, err := optionalPositiveInt("LINODE_VPC_SUBNET_ID")
+		if err != nil {
+			return nil, noClose, err
+		}
+		var authorizedKeys []string
+		if keyPath := strings.TrimSpace(os.Getenv("LINODE_SSH_PUBLIC_KEY_FILE")); keyPath != "" {
+			keyBytes, readErr := os.ReadFile(keyPath)
+			if readErr != nil {
+				return nil, noClose, fmt.Errorf("read Linode SSH public key: %w", readErr)
+			}
+			if trimmed := strings.TrimSpace(string(keyBytes)); trimmed != "" {
+				authorizedKeys = []string{trimmed}
+			}
+		}
+		client, err := linode.NewClient(linode.Config{
+			Token:          token,
+			Region:         envOrDefault("LINODE_REGION", "us-east"),
+			InstanceType:   envOrDefault("LINODE_INSTANCE_TYPE", "g6-standard-4"),
+			Image:          envOrDefault("LINODE_IMAGE", "linode/ubuntu24.04"),
+			AuthorizedKeys: authorizedKeys,
+			FirewallID:     firewallID,
+			VPCSubnetID:    vpcSubnetID,
+			CloudInitPath:  cloudInitPath,
+			ControllerID:   controllerID,
+			BaseURL:        strings.TrimSpace(os.Getenv("LINODE_API_URL")),
+		})
+		if err != nil {
+			return nil, noClose, err
+		}
+		return client, noClose, nil
 	default:
 		return nil, noClose, errors.New(i18n.T("webhook.err.unsupported_provider", provider))
 	}
@@ -362,6 +440,7 @@ type runtimeConfig struct {
 	runnerSHA256, chefInstallerSHA256  string
 	allowedLabels, allowedRepositories []string
 	allowedPublicRepositories          []string
+	labelSizeMap                       map[string]string
 	runnerGroupID                      int64
 	workerCount, maxLiveRunners        int
 	maxAttempts                        int
@@ -369,6 +448,8 @@ type runtimeConfig struct {
 	registrationTimeout                time.Duration
 	livenessSettleWindow               time.Duration
 	livenessConfirmations              int
+	deadmanShutdownMinutes             int
+	disableDeadmanShutdown             bool
 	deletedRetention                   time.Duration
 }
 
@@ -443,10 +524,56 @@ func loadRuntimeConfig() (runtimeConfig, error) {
 	if cfg.deletedRetention, err = envDuration("DELETED_RECORD_RETENTION", 24*time.Hour); err != nil {
 		return cfg, err
 	}
+	if cfg.labelSizeMap, err = loadLabelSizeMap(); err != nil {
+		return cfg, err
+	}
+	if cfg.deadmanShutdownMinutes, cfg.disableDeadmanShutdown, err = envDeadmanMinutes("RUNNER_DEADMAN_MINUTES", compute.DefaultDeadmanShutdownMinutes); err != nil {
+		return cfg, err
+	}
 	cfg.stateFile = envOrDefault("STATE_FILE", "/var/lib/github-runners/state.json")
 	cfg.requiredLabel = envOrDefault("REQUIRED_LABEL", "self-hosted")
 	cfg.listenAddr = envOrDefault("LISTEN_ADDR", ":8080")
 	return cfg, nil
+}
+
+func loadLabelSizeMap() (map[string]string, error) {
+	generic := strings.TrimSpace(os.Getenv("LABEL_SIZE_MAP"))
+	doAlias := strings.TrimSpace(os.Getenv("DO_LABEL_SIZE_MAP"))
+	if generic != "" && doAlias != "" {
+		return nil, fmt.Errorf("set LABEL_SIZE_MAP or DO_LABEL_SIZE_MAP, not both")
+	}
+	raw := generic
+	if raw == "" {
+		raw = doAlias
+	}
+	return compute.ParseLabelSizeMap(raw)
+}
+
+func envDeadmanMinutes(key string, fallback int) (int, bool, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback, false, nil
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed < 0 || parsed > compute.MaxDeadmanShutdownMinutes {
+		return 0, false, fmt.Errorf("%s must be an integer between 0 and %d", key, compute.MaxDeadmanShutdownMinutes)
+	}
+	if parsed == 0 {
+		return 0, true, nil
+	}
+	return parsed, false, nil
+}
+
+func optionalPositiveInt(key string) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return 0, nil
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed <= 0 {
+		return 0, errors.New(i18n.T("webhook.err.env_positive_int", key))
+	}
+	return parsed, nil
 }
 
 func requiredEnv(key string) (string, error) {
