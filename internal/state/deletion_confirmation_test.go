@@ -91,18 +91,7 @@ func TestUnassignedCancellationDuringActiveDeleteDoesNotDeadlock(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	key := "org/repo:42"
-	if _, err := store.Create(ctx, Record{Key: key, DeliveryID: "delivery", JobID: 42, Owner: "org", Repository: "repo", Provider: "digitalocean"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := store.ClaimNext(ctx, time.Now(), 3); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.MarkJITCreated(ctx, key, 101, "runner"); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.MarkProvisioned(ctx, key, "123", 101, "runner"); err != nil {
-		t.Fatal(err)
-	}
+	provisionTestRunner(t, store, Record{Key: key, DeliveryID: "delivery", JobID: 42, Owner: "org", Repository: "repo", Provider: "digitalocean"}, "123", 101, "runner")
 	// Cross-job completion triggers WorkDelete with RecheckDemand=true.
 	if err := store.RecordCompletion(ctx, Record{
 		Key: "org/repo:43", JobID: 43, Owner: "org", Repository: "repo", GitHubRunnerID: 101,
@@ -144,15 +133,7 @@ func TestDeletionConfirmationEscalatesWhenBudgetExhausted(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	key := "org/repo:confirm-budget"
-	if _, err := store.Create(ctx, Record{Key: key, DeliveryID: "delivery", Provider: "digitalocean"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := store.ClaimNext(ctx, time.Now(), 3); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.MarkProvisioned(ctx, key, "123", 101, "runner"); err != nil {
-		t.Fatal(err)
-	}
+	provisionTestRunner(t, store, Record{Key: key, DeliveryID: "delivery", Provider: "digitalocean"}, "123", 101, "runner")
 	if err := store.MarkCompleted(ctx, key); err != nil {
 		t.Fatal(err)
 	}

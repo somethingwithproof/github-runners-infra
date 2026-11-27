@@ -9,26 +9,35 @@ import (
 	"time"
 )
 
-func TestStaleReaperGuardCannotMutateReplenishedRunner(t *testing.T) {
+func provisionTestRunner(t *testing.T, store *FileStore, rec Record, instanceID string, runnerID int64, runnerName string) Record {
+	t.Helper()
 	ctx := context.Background()
-	store := openTestStore(t)
-	key := "org/repo:42"
-	if _, err := store.Create(ctx, Record{Key: key, DeliveryID: "d1", JobID: 42, Owner: "org", Repository: "repo", Provider: "test"}); err != nil {
+	if _, err := store.Create(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := store.ClaimNext(ctx, time.Now(), 3); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MarkJITCreated(ctx, key, 101, "runner-old"); err != nil {
+	if runnerID != 0 {
+		if err := store.MarkJITCreated(ctx, rec.Key, runnerID, runnerName); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.MarkProvisioned(ctx, rec.Key, instanceID, runnerID, runnerName); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MarkProvisioned(ctx, key, "inst-old", 101, "runner-old"); err != nil {
-		t.Fatal(err)
-	}
-	staleSnapshot, _, err := store.Get(ctx, key)
+	out, _, err := store.Get(ctx, rec.Key)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return out
+}
+
+func TestStaleReaperGuardCannotMutateReplenishedRunner(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	key := "org/repo:42"
+	staleSnapshot := provisionTestRunner(t, store, Record{Key: key, DeliveryID: "d1", JobID: 42, Owner: "org", Repository: "repo", Provider: "test"}, "inst-old", 101, "runner-old")
 	staleGuard := staleSnapshot.Guard()
 
 	// Cross-job completion cleans up old runner and replenishes into epoch 1.
@@ -93,15 +102,7 @@ func TestReleaseSweptOrphansProtectsOwnershipMismatchAndTOCTOU(t *testing.T) {
 
 	setupOrphan := func(key, instanceID, lastErr string) {
 		t.Helper()
-		if _, err := store.Create(ctx, Record{Key: key, DeliveryID: key, Provider: "test"}); err != nil {
-			t.Fatal(err)
-		}
-		if _, _, err := store.ClaimNext(ctx, time.Now(), 3); err != nil {
-			t.Fatal(err)
-		}
-		if err := store.MarkProvisioned(ctx, key, instanceID, 1, "runner"); err != nil {
-			t.Fatal(err)
-		}
+		provisionTestRunner(t, store, Record{Key: key, DeliveryID: key, Provider: "test"}, instanceID, 1, "runner")
 		if err := store.update(key, func(r *Record) { r.ProvisionedAt = oldTime; r.CreatedAt = oldTime }); err != nil {
 			t.Fatal(err)
 		}

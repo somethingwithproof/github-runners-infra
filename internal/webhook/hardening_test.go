@@ -115,6 +115,25 @@ func TestPersistent404WorkflowJobStatusExhaustsReassignedDemandBudget(t *testing
 	}
 }
 
+func provisionWebhookRunner(t *testing.T, store *state.FileStore, key, instanceID string, runnerID int64) state.Record {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := store.Create(ctx, state.Record{Key: key, DeliveryID: key, Provider: "test", Owner: "trusted", Repository: "private-repo"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.ClaimNext(ctx, time.Now(), 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkProvisioned(ctx, key, instanceID, runnerID, "runner"); err != nil {
+		t.Fatal(err)
+	}
+	rec, _, err := store.Get(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rec
+}
+
 func TestAbsenceCheckerProviderNeverUsesBlindAgeReleaseForLiveOrphans(t *testing.T) {
 	handler, store, _, client := newTestHandler(t)
 	checker := &absenceCompute{fakeCompute: client, absent: false}
@@ -125,15 +144,7 @@ func TestAbsenceCheckerProviderNeverUsesBlindAgeReleaseForLiveOrphans(t *testing
 	}
 
 	key := "trusted/private-repo:tag-stripped"
-	if _, err := store.Create(ctx, state.Record{Key: key, DeliveryID: "d1", Provider: "test"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := store.ClaimNext(ctx, time.Now(), 3); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.MarkProvisioned(ctx, key, "inst-live", 101, "runner"); err != nil {
-		t.Fatal(err)
-	}
+	provisionWebhookRunner(t, store, key, "inst-live", 101)
 	if err := store.MarkOrphaned(ctx, key, compute.ErrOwnershipMismatch.Error()); err != nil {
 		t.Fatal(err)
 	}
@@ -175,23 +186,8 @@ func TestNonCheckerSweepProtectsOwnershipMismatchAndTOCTOUOrphans(t *testing.T) 
 	// transitions to orphaned during SweepOrphanedRunners (TOCTOU window).
 	ownershipKey := "trusted/private-repo:own"
 	toctouKey := "trusted/private-repo:toctou"
-	for _, item := range []struct {
-		key  string
-		inst string
-	}{
-		{ownershipKey, "inst-own"},
-		{toctouKey, "inst-toctou"},
-	} {
-		if _, err := store.Create(ctx, state.Record{Key: item.key, DeliveryID: item.key, Provider: "test"}); err != nil {
-			t.Fatal(err)
-		}
-		if _, _, err := store.ClaimNext(ctx, time.Now(), 3); err != nil {
-			t.Fatal(err)
-		}
-		if err := store.MarkProvisioned(ctx, item.key, item.inst, 10, "runner"); err != nil {
-			t.Fatal(err)
-		}
-	}
+	provisionWebhookRunner(t, store, ownershipKey, "inst-own", 10)
+	provisionWebhookRunner(t, store, toctouKey, "inst-toctou", 11)
 	if err := store.MarkOrphaned(ctx, ownershipKey, compute.ErrOwnershipMismatch.Error()); err != nil {
 		t.Fatal(err)
 	}
@@ -347,15 +343,7 @@ func TestDeletionConfirmationExponentialBackoffAndEscalation(t *testing.T) {
 	ctx := context.Background()
 
 	key := "trusted/private-repo:confirm-esc"
-	if _, err := store.Create(ctx, state.Record{Key: key, DeliveryID: "d-esc", Provider: "test", Owner: "trusted", Repository: "private-repo"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := store.ClaimNext(ctx, time.Now(), 1); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.MarkProvisioned(ctx, key, "inst-stuck", 101, "runner"); err != nil {
-		t.Fatal(err)
-	}
+	provisionWebhookRunner(t, store, key, "inst-stuck", 101)
 	if err := store.MarkCompleted(ctx, key); err != nil {
 		t.Fatal(err)
 	}

@@ -1315,11 +1315,7 @@ func (h *Handler) removeIdleJIT(ctx context.Context, record state.Record) error 
 	return nil
 }
 
-func (h *Handler) deferDemandCheck(ctx context.Context, record state.Record, cause error) {
-	if ctx.Err() != nil {
-		h.provisionFailed(ctx, record, cause)
-		return
-	}
+func (h *Handler) demandDeferSpec(record state.Record, cause error) (time.Time, state.DeferPolicy) {
 	retryAt, rateLimited := gh.RateLimitReset(cause)
 	countFailure := !rateLimited && gh.PersistentClientError(cause)
 	switch {
@@ -1330,12 +1326,20 @@ func (h *Handler) deferDemandCheck(ctx context.Context, record state.Record, cau
 	default:
 		retryAt = time.Now().Add(time.Minute)
 	}
-	policy := state.DeferPolicy{
+	return retryAt, state.DeferPolicy{
 		MaxAttempts:   h.maxAttempts,
 		CountFailure:  countFailure,
 		CountThrottle: rateLimited,
 		MaxAge:        h.maxRunnerAge,
 	}
+}
+
+func (h *Handler) deferDemandCheck(ctx context.Context, record state.Record, cause error) {
+	if ctx.Err() != nil {
+		h.provisionFailed(ctx, record, cause)
+		return
+	}
+	retryAt, policy := h.demandDeferSpec(record, cause)
 	if err := h.store.DeferProvisioningDemand(context.WithoutCancel(ctx), record.Key, cause.Error(), retryAt, policy); err != nil {
 		log.Printf("ERROR: defer job demand check for %s: %v", record.Key, err)
 	}
@@ -1525,22 +1529,7 @@ func (h *Handler) delete(ctx context.Context, record state.Record) {
 		if h.releaseCanceledDelete(ctx, persistCtx, record, err) {
 			return
 		}
-		retryAt, rateLimited := gh.RateLimitReset(err)
-		countFailure := !rateLimited && gh.PersistentClientError(err)
-		switch {
-		case rateLimited:
-			retryAt = clampThrottleRetryAt(retryAt)
-		case countFailure:
-			retryAt = time.Now().Add(retryDelay(record.ReconcileFailures + 1))
-		default:
-			retryAt = time.Now().Add(time.Minute)
-		}
-		policy := state.DeferPolicy{
-			MaxAttempts:   h.maxAttempts,
-			CountFailure:  countFailure,
-			CountThrottle: rateLimited,
-			MaxAge:        h.maxRunnerAge,
-		}
+		retryAt, policy := h.demandDeferSpec(record, err)
 		terminated, stateErr := h.store.DeferReassignmentDemand(persistCtx, record.Key, err.Error(), retryAt, policy)
 		if stateErr != nil {
 			log.Printf("ERROR: defer reassigned runner demand for %s: %v", record.Key, stateErr)
