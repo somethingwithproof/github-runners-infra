@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -304,12 +305,16 @@ func (c *Client) CleanupRunnerExcept(ctx context.Context, jobKey, excludedID str
 	if err != nil {
 		return err
 	}
+	var failures []error
 	for _, inst := range instances {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(failures, err)...)
+		}
 		if err := c.DeleteRunner(ctx, inst.ID, jobKey); err != nil {
-			return err
+			failures = append(failures, err)
 		}
 	}
-	return nil
+	return errors.Join(failures...)
 }
 
 // SweepOrphanedRunners reclaims controller-owned instances absent from known and older than cutoff.
