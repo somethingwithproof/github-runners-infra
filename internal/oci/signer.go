@@ -20,16 +20,16 @@ import (
 )
 
 type requestSigner struct {
-	keyID      string
-	privateKey *rsa.PrivateKey
-	now        func() time.Time
+	keyID  string
+	signer crypto.Signer
+	now    func() time.Time
 }
 
-func newRequestSigner(tenancyOCID, userOCID, fingerprint string, privateKey *rsa.PrivateKey) *requestSigner {
+func newRequestSigner(tenancyOCID, userOCID, fingerprint string, signer crypto.Signer) *requestSigner {
 	return &requestSigner{
-		keyID:      tenancyOCID + "/" + userOCID + "/" + fingerprint,
-		privateKey: privateKey,
-		now:        time.Now,
+		keyID:  tenancyOCID + "/" + userOCID + "/" + fingerprint,
+		signer: signer,
+		now:    time.Now,
 	}
 }
 
@@ -124,8 +124,8 @@ func (s *requestSigner) Sign(req *http.Request, body []byte) error {
 	signingString := strings.Join(lines, "\n")
 	sum := sha256.Sum256([]byte(signingString))
 	// OCI HTTP Signature version="1" algorithm="rsa-sha256" requires RSASSA-PKCS1-v1_5
-	// with SHA-256, which (*rsa.PrivateKey).Sign produces when given crypto.SHA256.
-	sig, err := s.privateKey.Sign(rand.Reader, sum[:], crypto.SHA256)
+	// with SHA-256 via crypto.Signer.
+	sig, err := s.signer.Sign(rand.Reader, sum[:], crypto.SHA256)
 	if err != nil {
 		return fmt.Errorf("sign OCI request digest: %w", err)
 	}
