@@ -84,6 +84,32 @@ func TestCloudInitContainsOnlyJITBootstrapMaterial(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("runner.yaml.tmpl prebaked and egress allowlist", func(t *testing.T) {
+		data, err := os.ReadFile("../../cloud-init/runner.yaml.tmpl")
+		if err != nil {
+			t.Fatal(err)
+		}
+		tmpl, err := template.New("runner").Parse(string(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := compute.RenderCloudInit(tmpl, compute.RunnerParams{
+			RunnerJITConfig:        "encoded-jit-config",
+			PrebakedImage:          true,
+			EgressAllowlist:        []string{"api.github.com", "140.82.112.0/20"},
+			DeadmanShutdownMinutes: 180,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(out, "package_update: true") || strings.Contains(out, "omnitruck.chef.io") {
+			t.Fatalf("prebaked cloud-init should skip package install and tarball download:\n%s", out)
+		}
+		if !strings.Contains(out, "iptables -A OUTPUT -j REJECT") || !strings.Contains(out, "'api.github.com'") {
+			t.Fatalf("egress allowlist rules missing:\n%s", out)
+		}
+	})
 }
 
 func TestNewClientRequiresPrivateNetworkAndFirewall(t *testing.T) {

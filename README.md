@@ -416,6 +416,61 @@ Drain all active records before changing `COMPUTE_PROVIDER`. State is bound to
 the provider that created each runner, and the controller fails closed instead
 of passing an old resource ID to a different provider adapter.
 
+## Multi-cloud routing, spend caps, and fast-boot images
+
+### Cross-cloud failover and cost-aware routing
+
+Set `CLOUD_PROVIDERS` to a comma-separated list of two or more configured
+providers (for example `vultr,linode,digitalocean,aws,gcp,azure`) to enable
+`internal/router.MultiCloudRouter`:
+
+```dotenv
+CLOUD_PROVIDERS=vultr,linode,digitalocean
+ROUTER_STRATEGY=cheapest
+# Optional: override built-in USD/hour reference rates (provider:size=rate)
+ROUTER_HOURLY_RATES=vultr:vc2-4c-8gb=0.071,linode:g6-standard-4=0.072
+```
+
+- `ROUTER_STRATEGY=priority` (default) tries backends in list order.
+- `ROUTER_STRATEGY=cheapest` sorts backends ascending by hourly USD rate and
+  breaks ties by configured order.
+- Provisioning automatically fails over to the next backend on quota, capacity,
+  or transient 5xx/429 errors, while refusing to fail over on ambiguous creates
+  (`ErrCreateOutcomeUnknown`) to prevent duplicate VMs.
+- Every instance ID is stored with its owning provider prefix (`<provider>:<id>`)
+  so deletion, absence confirmation, and age-gated orphan sweeps always target
+  the exact owning cloud.
+
+### Hard spend circuit breaker
+
+Configure daily, monthly, or per-repository USD caps to fail closed on new
+provisioning without ever blocking deletion or orphan cleanup of running VMs:
+
+```dotenv
+BUDGET_DAILY_USD=25
+BUDGET_MONTHLY_USD=400
+BUDGET_REPO_DAILY_USD=10
+BUDGET_STATE_FILE=/var/lib/github-runners/budget.json
+```
+
+`GET /metrics` exposes `budget_blocked_total` and
+`estimated_spend_usd{window="daily|monthly|in_flight"}` in Prometheus text
+format.
+
+### JIT config, pre-baked images, and optional egress allowlist
+
+```dotenv
+# Single-use generate-jitconfig (default true); set false only for registration-token fallback.
+GITHUB_USE_JIT_CONFIG=true
+# Skip apt-get and runner tarball download when booting from a Packer image.
+RUNNER_PREBAKED=false
+# Optional comma-separated host/CIDR HTTPS allowlist (off by default).
+RUNNER_EGRESS_ALLOWLIST=
+```
+
+Build pre-baked images across all six clouds using the HCL2 templates under
+[`packer/`](packer/README.md).
+
 ## Build, test, and deploy
 
 Deployment is gated on a staging run that uses the intended provider settings.

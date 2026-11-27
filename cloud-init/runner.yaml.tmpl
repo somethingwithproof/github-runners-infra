@@ -11,6 +11,7 @@ users:
     shell: /bin/bash
     groups: docker
 
+{{- if not .PrebakedImage}}
 package_update: true
 
 packages:
@@ -24,6 +25,7 @@ packages:
   - libyaml-dev
   - libssl-dev
   - zlib1g-dev
+{{- end}}
 
 runcmd:
   - |
@@ -37,7 +39,30 @@ runcmd:
     systemd-run --unit=runner-deadman-shutdown --on-active={{.DeadmanShutdownMinutes}}m /sbin/shutdown --poweroff now
     {{- end}}
     systemctl enable --now docker
+    {{- if .EgressAllowlist}}
 
+    # Optional egress allowlist for untrusted workflow isolation (disabled by default).
+    if command -v iptables >/dev/null 2>&1; then
+      iptables -F OUTPUT || true
+      iptables -A OUTPUT -o lo -j ACCEPT
+      iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+      iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+      iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
+      {{- range .EgressAllowlist}}
+      for DEST in $(getent ahostsv4 '{{.}}' 2>/dev/null | awk '{print $1}' | sort -u); do
+        iptables -A OUTPUT -p tcp --dport 443 -d "$DEST" -j ACCEPT
+      done
+      case '{{.}}' in
+        *[0-9].*[0-9]*)
+          iptables -A OUTPUT -p tcp --dport 443 -d '{{.}}' -j ACCEPT 2>/dev/null || true
+          ;;
+      esac
+      {{- end}}
+      iptables -A OUTPUT -j REJECT
+    fi
+    {{- end}}
+
+    {{- if not .PrebakedImage}}
     # Template sources and controller validation restrict these single-quoted
     # values to URLs, hex digests, versions, and base64 without apostrophes.
     # Revisit shell quoting before changing those sources or validators.
@@ -69,17 +94,38 @@ runcmd:
     tar --extract --gzip --file "$RUNNER_TARBALL"
     shred --remove "$RUNNER_TARBALL"
     chown -R runner:runner /home/runner/actions-runner
+    {{- else}}
+    install -d -o runner -g runner /opt/hostedtoolcache
+    cd /home/runner/actions-runner
+    {{- end}}
 
+    RUNNER_EXIT=0
+    {{- if .RunnerJITConfig}}
     install -m 0600 -o runner -g runner /dev/null /home/runner/.jit-config
     printf '%s' '{{.RunnerJITConfig}}' > /home/runner/.jit-config
     JIT_CONFIG=$(cat /home/runner/.jit-config)
     shred --remove /home/runner/.jit-config
 
-    RUNNER_EXIT=0
     runuser -u runner -- ./run.sh --jitconfig "$JIT_CONFIG" || RUNNER_EXIT=$?
     unset JIT_CONFIG
+    {{- else if .RunnerRegistrationToken}}
+    install -m 0600 -o runner -g runner /dev/null /home/runner/.reg-token
+    printf '%s' '{{.RunnerRegistrationToken}}' > /home/runner/.reg-token
+    REG_TOKEN=$(cat /home/runner/.reg-token)
+    shred --remove /home/runner/.reg-token
 
-    # The trusted controller deletes the droplet after the workflow_job
+    runuser -u runner -- ./config.sh --ephemeral --unattended \
+      --url '{{.RunnerRepoURL}}' \
+      --name '{{.RunnerName}}' \
+      --token "$REG_TOKEN"
+    unset REG_TOKEN
+    runuser -u runner -- ./run.sh || RUNNER_EXIT=$?
+    {{- else}}
+    echo "ERROR: neither JIT config nor registration token was provided" >&2
+    RUNNER_EXIT=1
+    {{- end}}
+
+    # The trusted controller deletes the instance after the workflow_job
     # completion event. Power off immediately to stop workload execution while
     # waiting for that control-plane deletion or TTL reconciliation.
     shutdown --poweroff now

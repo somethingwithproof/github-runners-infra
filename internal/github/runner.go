@@ -28,10 +28,17 @@ const (
 	acceptGitHubJSON = "application/vnd.github+json"
 )
 
-// JITConfig is the one-time configuration for a repository-scoped runner.
+// JITConfig is the one-time configuration for a repository- or org-scoped runner.
 type JITConfig struct {
 	RunnerID      int64
 	EncodedConfig string
+}
+
+// RegistrationToken is a short-lived fallback registration token used only when
+// GITHUB_USE_JIT_CONFIG is explicitly disabled.
+type RegistrationToken struct {
+	Token     string
+	ExpiresAt time.Time
 }
 
 // RunnerStatus distinguishes an unregistered runner from a JIT runner that
@@ -126,10 +133,28 @@ func (a *App) RepoRunnerStatus(ctx context.Context, owner, repo string, runnerID
 	return RunnerOffline, nil
 }
 
-// GenerateRepoJITConfig creates a one-job runner configuration. The encoded
-// configuration is safe to give only to the runner being provisioned; it does
-// not grant DigitalOcean or GitHub App control-plane access.
+// GenerateRepoJITConfig creates a one-job repository-scoped runner configuration.
+// The encoded configuration is safe to give only to the runner being provisioned;
+// it does not grant cloud or GitHub App control-plane access.
 func (a *App) GenerateRepoJITConfig(ctx context.Context, owner, repo, name string, runnerGroupID int64, labels []string) (JITConfig, error) {
+	endpoint := fmt.Sprintf(
+		"https://api.github.com/repos/%s/%s/actions/runners/generate-jitconfig",
+		url.PathEscape(owner), url.PathEscape(repo),
+	)
+	return a.generateJITConfig(ctx, endpoint, "repository", name, runnerGroupID, labels)
+}
+
+// GenerateOrgJITConfig creates a one-job organization-scoped runner configuration
+// via POST /orgs/{org}/actions/runners/generate-jitconfig.
+func (a *App) GenerateOrgJITConfig(ctx context.Context, org, name string, runnerGroupID int64, labels []string) (JITConfig, error) {
+	endpoint := fmt.Sprintf(
+		"https://api.github.com/orgs/%s/actions/runners/generate-jitconfig",
+		url.PathEscape(org),
+	)
+	return a.generateJITConfig(ctx, endpoint, "organization", name, runnerGroupID, labels)
+}
+
+func (a *App) generateJITConfig(ctx context.Context, endpoint, scope, name string, runnerGroupID int64, labels []string) (JITConfig, error) {
 	token, err := a.InstallationTokenContext(ctx)
 	if err != nil {
 		return JITConfig{}, fmt.Errorf("get installation token: %w", err)
@@ -150,10 +175,6 @@ func (a *App) GenerateRepoJITConfig(ctx context.Context, owner, repo, name strin
 		return JITConfig{}, fmt.Errorf("encode JIT request: %w", err)
 	}
 
-	endpoint := fmt.Sprintf(
-		"https://api.github.com/repos/%s/%s/actions/runners/generate-jitconfig",
-		url.PathEscape(owner), url.PathEscape(repo),
-	)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return JITConfig{}, err
@@ -165,11 +186,11 @@ func (a *App) GenerateRepoJITConfig(ctx context.Context, owner, repo, name strin
 
 	resp, err := HTTPClient.Do(req)
 	if err != nil {
-		return JITConfig{}, fmt.Errorf("request repository JIT config: %w", err)
+		return JITConfig{}, fmt.Errorf("request %s JIT config: %w", scope, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusCreated {
-		return JITConfig{}, apiStatusError(resp, "requesting repository JIT config")
+		return JITConfig{}, apiStatusError(resp, fmt.Sprintf("requesting %s JIT config", scope))
 	}
 
 	var result struct {
@@ -179,16 +200,57 @@ func (a *App) GenerateRepoJITConfig(ctx context.Context, owner, repo, name strin
 		EncodedConfig string `json:"encoded_jit_config"`
 	}
 	if err := decodeJSON(resp.Body, &result); err != nil {
-		return JITConfig{}, fmt.Errorf("decode repository JIT config: %w", err)
+		return JITConfig{}, fmt.Errorf("decode %s JIT config: %w", scope, err)
 	}
 	if result.Runner.ID == 0 || result.EncodedConfig == "" {
-		return JITConfig{}, fmt.Errorf("GitHub returned an incomplete repository JIT config")
+		return JITConfig{}, fmt.Errorf("GitHub returned an incomplete %s JIT config", scope)
 	}
 	decoded, err := base64.StdEncoding.DecodeString(result.EncodedConfig)
 	if err != nil || len(decoded) == 0 || base64.StdEncoding.EncodeToString(decoded) != result.EncodedConfig {
-		return JITConfig{}, fmt.Errorf("GitHub returned an invalid base64 repository JIT config")
+		return JITConfig{}, fmt.Errorf("GitHub returned an invalid base64 %s JIT config", scope)
 	}
 	return JITConfig{RunnerID: result.Runner.ID, EncodedConfig: result.EncodedConfig}, nil
+}
+
+// GenerateRepoRegistrationToken creates a short-lived repository registration
+// token for fallback provisioning when JIT configuration is explicitly disabled.
+func (a *App) GenerateRepoRegistrationToken(ctx context.Context, owner, repo string) (RegistrationToken, error) {
+	token, err := a.InstallationTokenContext(ctx)
+	if err != nil {
+		return RegistrationToken{}, fmt.Errorf("get installation token: %w", err)
+	}
+	endpoint := fmt.Sprintf(
+		"https://api.github.com/repos/%s/%s/actions/runners/registration-token",
+		url.PathEscape(owner), url.PathEscape(repo),
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+	if err != nil {
+		return RegistrationToken{}, err
+	}
+	req.Header.Set("Authorization", bearerPrefix+token)
+	req.Header.Set("Accept", acceptGitHubJSON)
+	req.Header.Set("X-GitHub-Api-Version", githubAPIVersion)
+
+	resp, err := HTTPClient.Do(req)
+	if err != nil {
+		return RegistrationToken{}, fmt.Errorf("request repository registration token: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusCreated {
+		return RegistrationToken{}, apiStatusError(resp, "requesting repository registration token")
+	}
+
+	var result struct {
+		Token     string    `json:"token"`
+		ExpiresAt time.Time `json:"expires_at"`
+	}
+	if err := decodeJSON(resp.Body, &result); err != nil {
+		return RegistrationToken{}, fmt.Errorf("decode repository registration token: %w", err)
+	}
+	if strings.TrimSpace(result.Token) == "" || strings.ContainsAny(result.Token, "'\r\n ") {
+		return RegistrationToken{}, fmt.Errorf("GitHub returned an invalid repository registration token")
+	}
+	return RegistrationToken{Token: result.Token, ExpiresAt: result.ExpiresAt}, nil
 }
 
 func decodeJSON(r io.Reader, v any) error {

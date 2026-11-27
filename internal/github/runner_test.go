@@ -64,6 +64,48 @@ func TestGenerateRepoJITConfig(t *testing.T) {
 	}
 }
 
+func TestGenerateOrgJITConfigAndRegistrationTokenFallback(t *testing.T) {
+	original := HTTPClient
+	t.Cleanup(func() { HTTPClient = original })
+
+	var paths []string
+	HTTPClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		paths = append(paths, request.Method+" "+request.URL.Path)
+		switch request.URL.Path {
+		case "/orgs/trusted/actions/runners/generate-jitconfig":
+			return &http.Response{
+				StatusCode: http.StatusCreated,
+				Body:       io.NopCloser(strings.NewReader(`{"runner":{"id":456},"encoded_jit_config":"b3JnLWppdA=="}`)),
+				Header:     make(http.Header),
+			}, nil
+		case "/repos/trusted/repo/actions/runners/registration-token":
+			return &http.Response{
+				StatusCode: http.StatusCreated,
+				Body:       io.NopCloser(strings.NewReader(`{"token":"REGTOKEN123","expires_at":"2026-11-27T02:00:00Z"}`)),
+				Header:     make(http.Header),
+			}, nil
+		default:
+			t.Fatalf("unexpected request %s %s", request.Method, request.URL.Path)
+			return nil, nil
+		}
+	})}
+
+	app := &App{cachedToken: "installation-token", cachedScope: "trusted/repo|administration:write", tokenExpires: time.Now().Add(time.Hour), AllowedRepositories: []string{"trusted/repo"}}
+
+	orgJIT, err := app.GenerateOrgJITConfig(context.Background(), "trusted", "org-runner-1", 1, []string{"self-hosted"})
+	if err != nil || orgJIT.RunnerID != 456 || orgJIT.EncodedConfig != "b3JnLWppdA==" {
+		t.Fatalf("GenerateOrgJITConfig = %#v, %v", orgJIT, err)
+	}
+
+	regTok, err := app.GenerateRepoRegistrationToken(context.Background(), "trusted", "repo")
+	if err != nil || regTok.Token != "REGTOKEN123" || regTok.ExpiresAt.IsZero() {
+		t.Fatalf("GenerateRepoRegistrationToken = %#v, %v", regTok, err)
+	}
+	if len(paths) != 2 {
+		t.Fatalf("expected 2 requests, got %v", paths)
+	}
+}
+
 func TestRepoRunnerOnline(t *testing.T) {
 	tests := []struct {
 		name       string
