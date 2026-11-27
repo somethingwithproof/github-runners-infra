@@ -263,6 +263,12 @@ func TestNewComputeClientRejectsInvalidProviderConfiguration(t *testing.T) {
 		t.Run(provider+" spot", func(t *testing.T) {
 			t.Setenv("CONTROLLER_ID", "controller-1")
 			t.Setenv("COMPUTE_PROVIDER", provider)
+			t.Setenv("CLOUD_INIT_PATH", writeRunnerTemplate(t))
+			t.Setenv("VULTR_API_KEY", "test-token")
+			t.Setenv("LINODE_TOKEN", "test-token")
+			t.Setenv("DIGITALOCEAN_TOKEN", "test-token")
+			t.Setenv("DO_VPC_UUID", "vpc-id")
+			t.Setenv("DO_FIREWALL_ID", "firewall-id")
 			t.Setenv("RUNNER_SPOT", "true")
 			if _, _, err := newComputeClient(context.Background(), context.Background()); !compute.IsSpotUnsupported(err) {
 				t.Fatalf("newComputeClient(%s, spot) error = %v, want ErrSpotUnsupported", provider, err)
