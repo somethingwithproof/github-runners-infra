@@ -13,6 +13,8 @@ import (
 
 	"cloud.google.com/go/compute/apiv1/computepb"
 	"google.golang.org/api/googleapi"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/thomasvincent/github-runners-infra/internal/compute"
 )
@@ -21,8 +23,11 @@ type fakeInstances struct {
 	instance     *computepb.Instance
 	getErr       error
 	insertReq    *computepb.InsertInstanceRequest
+	insertReqs   []*computepb.InsertInstanceRequest
 	insertOp     operation
+	insertOps    []operation
 	insertErr    error
+	insertErrs   []error
 	deleteOp     operation
 	deleteErr    error
 	deletes      int
@@ -40,6 +45,19 @@ func (f *fakeInstances) Get(context.Context, *computepb.GetInstanceRequest) (*co
 
 func (f *fakeInstances) Insert(_ context.Context, req *computepb.InsertInstanceRequest) (operation, error) {
 	f.insertReq = req
+	f.insertReqs = append(f.insertReqs, req)
+	if len(f.insertErrs) > 0 {
+		err := f.insertErrs[0]
+		f.insertErrs = f.insertErrs[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(f.insertOps) > 0 {
+		op := f.insertOps[0]
+		f.insertOps = f.insertOps[1:]
+		return op, nil
+	}
 	return f.insertOp, f.insertErr
 }
 
@@ -274,4 +292,75 @@ func TestCreateRunnerAppliesMachineTypeOverride(t *testing.T) {
 	}); err == nil {
 		t.Fatal("CreateRunner accepted invalid GCP machine type override")
 	}
+}
+
+func TestGCPSpotCapacityFallbackAndPreemptedAbsence(t *testing.T) {
+	t.Run("classifies capacity errors and falls back to on-demand", func(t *testing.T) {
+		instances := &fakeInstances{
+			getErr: &googleapi.Error{Code: 404},
+			insertOps: []operation{
+				fakeOperation{err: errors.New("ZONE_RESOURCE_POOL_EXHAUSTED in us-central1-a")},
+				fakeOperation{},
+			},
+		}
+		client := testClient(instances)
+		client.spot = true
+		client.spotFallbackOnDemand = true
+		inst, err := client.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:gcp-fb", RunnerJITConfig: "jit"})
+		if err != nil || inst == nil {
+			t.Fatalf("CreateRunner fallback = %#v, %v", inst, err)
+		}
+		if len(instances.insertReqs) != 2 {
+			t.Fatalf("Insert calls = %d, want 2", len(instances.insertReqs))
+		}
+		if instances.insertReqs[0].GetInstanceResource().GetScheduling().GetProvisioningModel() != "SPOT" {
+			t.Fatal("first attempt did not request SPOT")
+		}
+		if instances.insertReqs[1].GetInstanceResource().GetScheduling() != nil {
+			t.Fatal("on-demand fallback still requested SPOT scheduling")
+		}
+		if instances.insertReqs[0].GetRequestId() == instances.insertReqs[1].GetRequestId() {
+			t.Fatal("fallback reused primary RequestId")
+		}
+	})
+
+	t.Run("classifies ResourceExhausted without fallback", func(t *testing.T) {
+		instances := &fakeInstances{
+			getErr:    &googleapi.Error{Code: 404},
+			insertErr: status.Error(codes.ResourceExhausted, "RESOURCE_EXHAUSTED"),
+		}
+		client := testClient(instances)
+		client.spot = true
+		_, err := client.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:gcp-cap"})
+		if !compute.IsCapacityError(err) {
+			t.Fatalf("error = %v, want ErrCapacityUnavailable", err)
+		}
+	})
+
+	t.Run("terminated VM treated as absent in FindRunner and RunnerAbsent", func(t *testing.T) {
+		name := resourceName("org/repo:gcp-term")
+		terminated := "TERMINATED"
+		instances := &fakeInstances{
+			instance: &computepb.Instance{
+				Name:   &name,
+				Status: &terminated,
+				Labels: map[string]string{
+					controllerLabel: shortHash("primary"),
+					jobLabel:        shortHash("org/repo:gcp-term"),
+				},
+			},
+		}
+		client := testClient(instances)
+		if _, found, err := client.FindRunner(context.Background(), "org/repo:gcp-term"); err != nil || found {
+			t.Fatalf("FindRunner(TERMINATED) = found=%v err=%v, want absent", found, err)
+		}
+		if absent, err := client.RunnerAbsent(context.Background(), name); err != nil || !absent {
+			t.Fatalf("RunnerAbsent(TERMINATED) = absent=%v err=%v, want true", absent, err)
+		}
+		running := "RUNNING"
+		instances.instance.Status = &running
+		if absent, err := client.RunnerAbsent(context.Background(), name); err != nil || absent {
+			t.Fatalf("RunnerAbsent(RUNNING) = absent=%v err=%v, want false", absent, err)
+		}
+	})
 }

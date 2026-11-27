@@ -53,6 +53,7 @@ type Config struct {
 	// ProjectID optionally assigns runner droplets to a DigitalOcean project
 	// so billing is attributed correctly; unset leaves the account default.
 	ProjectID string
+	Spot      bool
 }
 
 var _ compute.Provider = (*Client)(nil)
@@ -61,6 +62,9 @@ func (c *Client) Provider() string { return "digitalocean" }
 
 // NewClient creates a new DigitalOcean API client.
 func NewClient(cfg Config) (*Client, error) {
+	if err := compute.RejectSpotUnsupported("DigitalOcean", cfg.Spot); err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(cfg.Token) == "" {
 		return nil, fmt.Errorf("DigitalOcean token is required")
 	}
@@ -121,6 +125,9 @@ func NewClient(cfg Config) (*Client, error) {
 
 // CreateRunner spins up an ephemeral runner droplet.
 func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) (*compute.RunnerInstance, error) {
+	if err := compute.RejectSpotUnsupported("DigitalOcean", compute.ResolveSpot(false, params.Spot)); err != nil {
+		return nil, err
+	}
 	desiredName := dropletName(params.JobKey, params.ProvisionEpoch)
 	existing, found, err := c.FindRunner(ctx, params.JobKey)
 	if err != nil {

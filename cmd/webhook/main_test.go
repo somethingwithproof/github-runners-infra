@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thomasvincent/github-runners-infra/internal/compute"
 	gh "github.com/thomasvincent/github-runners-infra/internal/github"
 )
 
@@ -263,8 +264,8 @@ func TestNewComputeClientRejectsInvalidProviderConfiguration(t *testing.T) {
 			t.Setenv("CONTROLLER_ID", "controller-1")
 			t.Setenv("COMPUTE_PROVIDER", provider)
 			t.Setenv("RUNNER_SPOT", "true")
-			if _, _, err := newComputeClient(context.Background(), context.Background()); err == nil {
-				t.Fatalf("newComputeClient accepted %s spot", provider)
+			if _, _, err := newComputeClient(context.Background(), context.Background()); !compute.IsSpotUnsupported(err) {
+				t.Fatalf("newComputeClient(%s, spot) error = %v, want ErrSpotUnsupported", provider, err)
 			}
 		})
 	}
@@ -543,7 +544,7 @@ func setValidRuntimeEnvironment(t *testing.T) {
 	// in the developer's or runner's environment would change what the tests
 	// observe. Clear them so every test starts from the documented defaults.
 	for _, key := range []string{
-		"AZURE_ADMIN_USERNAME", "BUDGET_DAILY_USD", "BUDGET_MONTHLY_USD", "BUDGET_REPO_DAILY_USD",
+		"AWS_ALTERNATE_SUBNET_IDS", "AZURE_ADMIN_USERNAME", "BUDGET_DAILY_USD", "BUDGET_MONTHLY_USD", "BUDGET_REPO_DAILY_USD",
 		"BUDGET_STATE_FILE", "CANCELLED_RUNNER_TTL", "CLOUD_INIT_PATH", "CLOUD_PROVIDERS",
 		"COMPUTE_PROVIDER", "DELETED_RECORD_RETENTION", "DO_IMAGE", "DO_LABEL_SIZE_MAP",
 		"DO_REGION", "DO_SIZE", "GITHUB_USE_JIT_CONFIG", "LABEL_SIZE_MAP", "LINODE_API_URL",
@@ -552,7 +553,8 @@ func setValidRuntimeEnvironment(t *testing.T) {
 		"LIVENESS_CONFIRMATIONS", "LIVENESS_SETTLE_WINDOW", "MAX_ATTEMPTS", "MAX_LIVE_RUNNERS",
 		"MAX_RUNNER_AGE", "REQUIRED_LABEL", "ROUTER_HOURLY_RATES", "ROUTER_STRATEGY",
 		"RUNNER_DEADMAN_MINUTES", "RUNNER_EGRESS_ALLOWLIST", "RUNNER_PREBAKED",
-		"RUNNER_REGISTRATION_TIMEOUT", "STATE_FILE", "VULTR_API_URL", "VULTR_FIREWALL_GROUP_ID",
+		"RUNNER_REGISTRATION_TIMEOUT", "RUNNER_SPOT", "SPOT_FALLBACK_ON_DEMAND", "STATE_FILE",
+		"VULTR_API_URL", "VULTR_FIREWALL_GROUP_ID",
 		"VULTR_OS_ID", "VULTR_PLAN", "VULTR_REGION", "VULTR_SNAPSHOT_ID", "VULTR_SSH_KEY_IDS",
 		"VULTR_VPC_ID", "WORKER_COUNT",
 	} {
@@ -649,5 +651,32 @@ func TestNewComputeClientMultiCloudRouterAndBudgetRuntimeConfig(t *testing.T) {
 	}
 	if cfg.budgetDailyUSD != 25.5 || cfg.budgetMonthlyUSD != 500 || cfg.budgetRepoDailyUSD != 10 || !cfg.useJITConfig || !cfg.prebakedImage || len(cfg.egressAllowlist) != 2 {
 		t.Fatalf("unexpected runtime config: %#v", cfg)
+	}
+}
+
+func TestNewComputeClientSpotFallbackMixedMultiCloud(t *testing.T) {
+	t.Setenv("CONTROLLER_ID", "controller-1")
+	t.Setenv("CLOUD_INIT_PATH", writeRunnerTemplate(t))
+	t.Setenv("CLOUD_PROVIDERS", "aws,vultr")
+	t.Setenv("RUNNER_SPOT", "true")
+	t.Setenv("SPOT_FALLBACK_ON_DEMAND", "true")
+	t.Setenv("AWS_REGION", "us-west-2")
+	t.Setenv("AWS_AMI_ID", "ami-0123456789abcdef0")
+	t.Setenv("AWS_INSTANCE_TYPE", "m7i.large")
+	t.Setenv("AWS_SUBNET_ID", "subnet-a")
+	t.Setenv("AWS_ALTERNATE_SUBNET_IDS", "subnet-b,subnet-c")
+	t.Setenv("AWS_SECURITY_GROUP_IDS", "sg-test")
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	t.Setenv("VULTR_API_KEY", "test-vultr-key")
+
+	client, closeFn, err := newComputeClient(context.Background(), context.Background())
+	if err != nil {
+		t.Fatalf("mixed spot+fallback multi-cloud error = %v", err)
+	}
+	defer closeFn()
+	if client.Provider() != "multi" {
+		t.Fatalf("provider = %q, want multi", client.Provider())
 	}
 }

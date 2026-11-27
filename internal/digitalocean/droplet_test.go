@@ -533,3 +533,18 @@ func TestCreateRunnerAppliesSizeOverrideAndRejectsInvalidSize(t *testing.T) {
 		t.Fatal("CreateRunner accepted invalid droplet size override")
 	}
 }
+
+func TestDigitalOceanRejectsSpotConfigAndRequest(t *testing.T) {
+	if _, err := NewClient(Config{
+		Token: "tok", CloudInitPath: "unused", ControllerID: "primary",
+		VPCUUID: "vpc", FirewallID: "fw", Spot: true,
+	}); !compute.IsSpotUnsupported(err) {
+		t.Fatalf("NewClient(Spot=true) error = %v, want ErrSpotUnsupported", err)
+	}
+	client := &Client{controllerTag: "runner-controller-test"}
+	if _, err := client.CreateRunner(context.Background(), compute.RunnerParams{
+		JobKey: "org/repo:spot", Spot: compute.BoolPtr(true),
+	}); !compute.IsSpotUnsupported(err) {
+		t.Fatalf("CreateRunner(Spot=true) error = %v, want ErrSpotUnsupported", err)
+	}
+}

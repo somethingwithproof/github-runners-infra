@@ -344,3 +344,22 @@ func TestLinodeAmbiguousCreateAndOwnershipGuards(t *testing.T) {
 		t.Fatalf("duplicate FindRunner error = %v", err)
 	}
 }
+
+func TestLinodeRejectsSpotConfigAndRequest(t *testing.T) {
+	if _, err := NewClient(Config{
+		Token: "tok", ControllerID: "primary", CloudInitPath: writeLinodeTemplate(t, "#cloud-config\n"), Spot: true,
+	}); !compute.IsSpotUnsupported(err) {
+		t.Fatalf("NewClient(Spot=true) error = %v, want ErrSpotUnsupported", err)
+	}
+	client, err := NewClient(Config{
+		Token: "tok", ControllerID: "primary", CloudInitPath: writeLinodeTemplate(t, "#cloud-config\n"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.CreateRunner(context.Background(), compute.RunnerParams{
+		JobKey: "org/repo:spot", Spot: compute.BoolPtr(true),
+	}); !compute.IsSpotUnsupported(err) {
+		t.Fatalf("CreateRunner(Spot=true) error = %v, want ErrSpotUnsupported", err)
+	}
+}

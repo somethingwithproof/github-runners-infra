@@ -10,6 +10,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
 	"text/template"
 	"time"
 
@@ -96,24 +98,26 @@ type Config struct {
 	ControllerID  string
 	// ServiceAccountEmail identifies a dedicated runner identity whose IAM
 	// roles must grant no cloud access beyond the workload's explicit needs.
-	ServiceAccountEmail string
-	Spot                bool
-	ExternalIP          bool
+	ServiceAccountEmail  string
+	Spot                 bool
+	SpotFallbackOnDemand bool
+	ExternalIP           bool
 }
 
 // Client owns Compute Engine instances created for one controller.
 type Client struct {
-	instances           instancesAPI
-	tmpl                *template.Template
-	projectID           string
-	zone                string
-	machineType         string
-	sourceImage         string
-	subnetwork          string
-	serviceAccountEmail string
-	controllerHash      string
-	spot                bool
-	externalIP          bool
+	instances            instancesAPI
+	tmpl                 *template.Template
+	projectID            string
+	zone                 string
+	machineType          string
+	sourceImage          string
+	subnetwork           string
+	serviceAccountEmail  string
+	controllerHash       string
+	spot                 bool
+	spotFallbackOnDemand bool
+	externalIP           bool
 }
 
 var _ compute.Provider = (*Client)(nil)
@@ -141,8 +145,11 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 	return &Client{
 		instances: &instancesClient{client: instances}, tmpl: tmpl, projectID: cfg.ProjectID, zone: cfg.Zone,
 		machineType: cfg.MachineType, sourceImage: cfg.SourceImage, subnetwork: cfg.Subnetwork,
-		serviceAccountEmail: cfg.ServiceAccountEmail,
-		controllerHash:      shortHash(cfg.ControllerID), spot: cfg.Spot, externalIP: cfg.ExternalIP,
+		serviceAccountEmail:  cfg.ServiceAccountEmail,
+		controllerHash:       shortHash(cfg.ControllerID),
+		spot:                 cfg.Spot,
+		spotFallbackOnDemand: cfg.SpotFallbackOnDemand,
+		externalIP:           cfg.ExternalIP,
 	}, nil
 }
 
@@ -161,7 +168,23 @@ func (c *Client) FindRunner(ctx context.Context, jobKey string) (*compute.Runner
 	if instance.Labels[controllerLabel] != c.controllerHash || instance.Labels[jobLabel] != shortHash(jobKey) {
 		return nil, false, fmt.Errorf("%w: GCP instance %s exists without expected ownership labels", compute.ErrOwnershipMismatch, name)
 	}
+	if isAbsentStatus(instance.GetStatus()) {
+		return nil, false, nil
+	}
 	return &compute.RunnerInstance{ID: name, Name: name}, true, nil
+}
+
+// RunnerAbsent checks authoritative absence by GCP instance name, treating
+// missing or TERMINATED/preempted instances as absent.
+func (c *Client) RunnerAbsent(ctx context.Context, instanceID string) (bool, error) {
+	instance, err := c.instances.Get(ctx, &computepb.GetInstanceRequest{Project: c.projectID, Zone: c.zone, Instance: instanceID})
+	if err != nil {
+		if isNotFound(err) {
+			return true, nil
+		}
+		return false, fmt.Errorf("confirm GCP runner %s absence: %w", instanceID, err)
+	}
+	return isAbsentStatus(instance.GetStatus()), nil
 }
 
 func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) (*compute.RunnerInstance, error) {
@@ -175,26 +198,49 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 		}
 		machineType = params.InstanceSize
 	}
-	userData, err := compute.RenderCloudInit(c.tmpl, params)
+	useSpot := compute.ResolveSpot(c.spot, params.Spot)
+	inst, err := c.insertInstance(ctx, params, machineType, useSpot, requestID(params.JobKey, params.ProvisionEpoch))
+	if err == nil {
+		return inst, nil
+	}
+	if useSpot && c.spotFallbackOnDemand && compute.IsCapacityError(err) {
+		log.Printf("WARN: GCP spot capacity unavailable for %s (%v); falling back to on-demand", params.JobKey, err)
+		return c.insertInstance(ctx, params, machineType, false, requestIDForFallback(params.JobKey, params.ProvisionEpoch))
+	}
+	return nil, err
+}
+
+func (c *Client) insertInstance(
+	ctx context.Context,
+	params compute.RunnerParams,
+	machineType string,
+	useSpot bool,
+	reqID string,
+) (*compute.RunnerInstance, error) {
+	userData, err := compute.RenderCloudInit(c.tmpl, params.WithSpot(useSpot))
 	if err != nil {
 		return nil, err
 	}
 	name := resourceName(params.JobKey)
-	instance := c.instanceSpec(params.JobKey, machineType, userData)
+	instance := c.instanceSpecForMode(params.JobKey, machineType, userData, useSpot)
 	op, err := c.instances.Insert(ctx, &computepb.InsertInstanceRequest{
 		Project: c.projectID, Zone: c.zone, InstanceResource: instance,
-		RequestId: stringPtr(requestID(params.JobKey, params.ProvisionEpoch)),
+		RequestId: stringPtr(reqID),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("create GCP runner: %w", err)
+		return nil, classifyCreateError("create GCP runner", err)
 	}
 	if err := op.Wait(ctx); err != nil {
-		return nil, fmt.Errorf("wait for GCP runner creation: %w", err)
+		return nil, classifyCreateError("wait for GCP runner creation", err)
 	}
 	return &compute.RunnerInstance{ID: name, Name: name}, nil
 }
 
 func (c *Client) instanceSpec(jobKey, machineType, userData string) *computepb.Instance {
+	return c.instanceSpecForMode(jobKey, machineType, userData, c.spot)
+}
+
+func (c *Client) instanceSpecForMode(jobKey, machineType, userData string, useSpot bool) *computepb.Instance {
 	name := resourceName(jobKey)
 	boot, autoDelete := true, true
 	network := &computepb.NetworkInterface{Subnetwork: stringPtr(c.subnetwork)}
@@ -215,7 +261,7 @@ func (c *Client) instanceSpec(jobKey, machineType, userData string) *computepb.I
 		}},
 		Metadata: &computepb.Metadata{Items: []*computepb.Items{{Key: stringPtr("user-data"), Value: &userData}}},
 	}
-	if c.spot {
+	if useSpot {
 		automaticRestart := false
 		instance.Scheduling = &computepb.Scheduling{
 			ProvisioningModel: stringPtr("SPOT"), InstanceTerminationAction: stringPtr("DELETE"),
@@ -255,6 +301,37 @@ func isNotFound(err error) bool {
 	}
 	var apiErr *googleapi.Error
 	return errors.As(err, &apiErr) && apiErr.Code == 404
+}
+
+func isAbsentStatus(instanceStatus string) bool {
+	return strings.EqualFold(strings.TrimSpace(instanceStatus), "TERMINATED")
+}
+
+func classifyCreateError(action string, err error) error {
+	if isCapacityError(err) {
+		return fmt.Errorf("%w: %s: %w", compute.ErrCapacityUnavailable, action, err)
+	}
+	return fmt.Errorf("%s: %w", action, err)
+}
+
+func isCapacityError(err error) bool {
+	if status.Code(err) == codes.ResourceExhausted {
+		return true
+	}
+	msg := strings.ToUpper(err.Error())
+	if strings.Contains(msg, "ZONE_RESOURCE_POOL_EXHAUSTED") || strings.Contains(msg, "RESOURCE_EXHAUSTED") {
+		return true
+	}
+	var apiErr *googleapi.Error
+	if errors.As(err, &apiErr) {
+		for _, item := range apiErr.Errors {
+			reason := strings.ToUpper(item.Reason)
+			if strings.Contains(reason, "ZONE_RESOURCE_POOL_EXHAUSTED") || strings.Contains(reason, "RESOURCE_EXHAUSTED") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (c *Client) CleanupRunner(ctx context.Context, jobKey string) error {
@@ -319,7 +396,15 @@ func shortHash(value string) string {
 }
 
 func requestID(jobKey string, epoch int) string {
-	hash := sha256.Sum256([]byte(fmt.Sprintf("gcp:%s:%d", jobKey, epoch)))
+	return deterministicUUID(fmt.Sprintf("gcp:%s:%d", jobKey, epoch))
+}
+
+func requestIDForFallback(jobKey string, epoch int) string {
+	return deterministicUUID(fmt.Sprintf("gcp:%s:%d:ondemand", jobKey, epoch))
+}
+
+func deterministicUUID(seed string) string {
+	hash := sha256.Sum256([]byte(seed))
 	rawBytes := hash[:16]
 	rawBytes[6] = (rawBytes[6] & 0x0f) | 0x40
 	rawBytes[8] = (rawBytes[8] & 0x3f) | 0x80

@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"text/template"
@@ -157,28 +158,30 @@ type Config struct {
 	VMSize         string
 	Image          string // publisher:offer:sku:version; version must be pinned
 	// Subnet/NSG ingress policy is operator/IaC-managed; VMs receive no public IP.
-	SubnetID      string
-	AdminUsername string
-	SSHPublicKey  string
-	CloudInitPath string
-	ControllerID  string
-	Spot          bool
+	SubnetID             string
+	AdminUsername        string
+	SSHPublicKey         string
+	CloudInitPath        string
+	ControllerID         string
+	Spot                 bool
+	SpotFallbackOnDemand bool
 }
 
 // Client owns Azure VMs and NICs created for one controller.
 type Client struct {
-	vms           virtualMachinesAPI
-	nics          networkInterfacesAPI
-	tmpl          *template.Template
-	resourceGroup string
-	location      string
-	vmSize        armcompute.VirtualMachineSizeTypes
-	image         [4]string
-	subnetID      string
-	adminUsername string
-	sshPublicKey  string
-	controllerID  string
-	spot          bool
+	vms                  virtualMachinesAPI
+	nics                 networkInterfacesAPI
+	tmpl                 *template.Template
+	resourceGroup        string
+	location             string
+	vmSize               armcompute.VirtualMachineSizeTypes
+	image                [4]string
+	subnetID             string
+	adminUsername        string
+	sshPublicKey         string
+	controllerID         string
+	spot                 bool
+	spotFallbackOnDemand bool
 }
 
 var _ compute.Provider = (*Client)(nil)
@@ -221,7 +224,7 @@ func NewClient(cfg Config) (*Client, error) {
 		resourceGroup: cfg.ResourceGroup, location: cfg.Location,
 		vmSize: armcompute.VirtualMachineSizeTypes(cfg.VMSize), subnetID: cfg.SubnetID,
 		adminUsername: cfg.AdminUsername, sshPublicKey: cfg.SSHPublicKey,
-		controllerID: cfg.ControllerID, spot: cfg.Spot,
+		controllerID: cfg.ControllerID, spot: cfg.Spot, spotFallbackOnDemand: cfg.SpotFallbackOnDemand,
 	}
 	copy(client.image[:], parts)
 	return client, nil
@@ -240,7 +243,23 @@ func (c *Client) FindRunner(ctx context.Context, jobKey string) (*compute.Runner
 		tagValue(vm.Tags, controllerTag) == c.controllerID && tagValue(vm.Tags, jobTagKey) == jobHash(jobKey)); err != nil {
 		return nil, false, err
 	}
+	if isAbsentVM(vm) {
+		return nil, false, nil
+	}
 	return &compute.RunnerInstance{ID: name, Name: name}, true, nil
+}
+
+// RunnerAbsent checks authoritative absence by Azure VM name, treating missing,
+// deleting, or evicted/deallocated VMs as absent.
+func (c *Client) RunnerAbsent(ctx context.Context, instanceID string) (bool, error) {
+	vm, err := c.vms.Get(ctx, c.resourceGroup, instanceID)
+	if err != nil {
+		if isNotFound(err) {
+			return true, nil
+		}
+		return false, fmt.Errorf("confirm Azure runner %s absence: %w", instanceID, err)
+	}
+	return isAbsentVM(vm), nil
 }
 
 func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) (*compute.RunnerInstance, error) {
@@ -254,7 +273,8 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 		}
 		vmSize = armcompute.VirtualMachineSizeTypes(params.InstanceSize)
 	}
-	userData, err := compute.RenderCloudInit(c.tmpl, params)
+	useSpot := compute.ResolveSpot(c.spot, params.Spot)
+	userData, err := compute.RenderCloudInit(c.tmpl, params.WithSpot(useSpot))
 	if err != nil {
 		return nil, err
 	}
@@ -263,18 +283,44 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 	if err != nil {
 		return nil, err
 	}
-	vm := c.vmSpec(params.JobKey, name, nicID, vmSize, userData)
-	op, err := c.vms.CreateOrUpdate(ctx, c.resourceGroup, name, vm)
-	if err != nil {
-		return nil, c.cleanupNICAfterVMFailure(ctx, name, params.JobKey, fmt.Errorf("create Azure runner: %w", err))
+	err = c.createAndWaitVM(ctx, params.JobKey, name, nicID, vmSize, userData, useSpot)
+	if err != nil && useSpot && c.spotFallbackOnDemand && compute.IsCapacityError(err) {
+		log.Printf("WARN: Azure spot capacity unavailable for %s (%v); falling back to on-demand", params.JobKey, err)
+		fallbackData, renderErr := compute.RenderCloudInit(c.tmpl, params.WithSpot(false))
+		if renderErr != nil {
+			return nil, c.cleanupNICAfterVMFailure(ctx, name, params.JobKey, renderErr)
+		}
+		err = c.createAndWaitVM(ctx, params.JobKey, name, nicID, vmSize, fallbackData, false)
 	}
-	if err := op.Wait(ctx); err != nil {
-		return nil, c.cleanupNICAfterVMFailure(ctx, name, params.JobKey, fmt.Errorf("wait for Azure runner creation: %w", err))
+	if err != nil {
+		return nil, c.cleanupNICAfterVMFailure(ctx, name, params.JobKey, err)
 	}
 	return &compute.RunnerInstance{ID: name, Name: name}, nil
 }
 
+func (c *Client) createAndWaitVM(
+	ctx context.Context,
+	jobKey, name, nicID string,
+	vmSize armcompute.VirtualMachineSizeTypes,
+	userData string,
+	useSpot bool,
+) error {
+	vm := c.vmSpecForMode(jobKey, name, nicID, vmSize, userData, useSpot)
+	op, err := c.vms.CreateOrUpdate(ctx, c.resourceGroup, name, vm)
+	if err != nil {
+		return classifyCreateError("create Azure runner", err)
+	}
+	if err := op.Wait(ctx); err != nil {
+		return classifyCreateError("wait for Azure runner creation", err)
+	}
+	return nil
+}
+
 func (c *Client) vmSpec(jobKey, name, nicID string, vmSize armcompute.VirtualMachineSizeTypes, userData string) armcompute.VirtualMachine {
+	return c.vmSpecForMode(jobKey, name, nicID, vmSize, userData, c.spot)
+}
+
+func (c *Client) vmSpecForMode(jobKey, name, nicID string, vmSize armcompute.VirtualMachineSizeTypes, userData string, useSpot bool) armcompute.VirtualMachine {
 	disablePassword, primary := true, true
 	deleteDisk, deleteNIC := armcompute.DiskDeleteOptionTypesDelete, armcompute.DeleteOptionsDelete
 	vm := armcompute.VirtualMachine{
@@ -300,7 +346,7 @@ func (c *Client) vmSpec(jobKey, name, nicID string, vmSize armcompute.VirtualMac
 			}}},
 		},
 	}
-	if c.spot {
+	if useSpot {
 		priority, eviction := armcompute.VirtualMachinePriorityTypesSpot, armcompute.VirtualMachineEvictionPolicyTypesDelete
 		// Azure's exact -1 sentinel caps cost at the on-demand price without
 		// application-side currency arithmetic.
@@ -508,6 +554,47 @@ func tagValue(tags map[string]*string, key string) string {
 func isNotFound(err error) bool {
 	var responseErr *azcore.ResponseError
 	return errors.As(err, &responseErr) && responseErr.StatusCode == http.StatusNotFound
+}
+
+func isAbsentVM(vm armcompute.VirtualMachine) bool {
+	if vm.Properties == nil {
+		return false
+	}
+	if vm.Properties.ProvisioningState != nil && strings.EqualFold(*vm.Properties.ProvisioningState, "Deleting") {
+		return true
+	}
+	if vm.Properties.InstanceView != nil {
+		for _, s := range vm.Properties.InstanceView.Statuses {
+			if s != nil && s.Code != nil && strings.EqualFold(*s.Code, "PowerState/deallocated") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func classifyCreateError(action string, err error) error {
+	if isCapacityError(err) {
+		return fmt.Errorf("%w: %s: %w", compute.ErrCapacityUnavailable, action, err)
+	}
+	return fmt.Errorf("%s: %w", action, err)
+}
+
+func isCapacityError(err error) bool {
+	var responseErr *azcore.ResponseError
+	if errors.As(err, &responseErr) {
+		switch responseErr.ErrorCode {
+		case "SkuNotAvailable", "AllocationFailed", "OverconstrainedAllocationRequest", "ZonalAllocationFailed":
+			return true
+		}
+	}
+	msg := err.Error()
+	for _, token := range []string{"SkuNotAvailable", "AllocationFailed", "OverconstrainedAllocationRequest", "ZonalAllocationFailed"} {
+		if strings.Contains(msg, token) {
+			return true
+		}
+	}
+	return false
 }
 
 func slicesContainEmpty(values []string) bool {

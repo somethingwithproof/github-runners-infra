@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"text/template"
 	"time"
 )
@@ -43,6 +44,64 @@ var ErrDuplicateInstances = errors.New("duplicate provider instances")
 // though no resource identity was returned. Retrying would risk duplication.
 var ErrCreateOutcomeUnknown = errors.New("provider create outcome unknown")
 
+// ErrCapacityUnavailable marks a provider capacity, quota, or spot pool
+// exhaustion failure where failover to another subnet, provider, or on-demand
+// capacity is safe.
+var ErrCapacityUnavailable = errors.New("provider capacity unavailable")
+
+// ErrSpotUnsupported marks a request for spot capacity on a provider that only
+// offers on-demand instances.
+var ErrSpotUnsupported = errors.New("provider does not support spot instances")
+
+// IsCapacityError reports whether err indicates provider capacity exhaustion.
+func IsCapacityError(err error) bool {
+	return errors.Is(err, ErrCapacityUnavailable)
+}
+
+// IsSpotUnsupported reports whether err indicates spot instances are unsupported.
+func IsSpotUnsupported(err error) bool {
+	return errors.Is(err, ErrSpotUnsupported)
+}
+
+// RejectSpotUnsupported returns a wrapped ErrSpotUnsupported when requested is true.
+func RejectSpotUnsupported(provider string, requested bool) error {
+	if !requested {
+		return nil
+	}
+	return fmt.Errorf("%w: %s does not support spot instances", ErrSpotUnsupported, provider)
+}
+
+// BoolPtr returns a pointer to value.
+func BoolPtr(value bool) *bool { return &value }
+
+// ResolveSpot returns the effective spot setting from a provider default and an
+// optional per-request override.
+func ResolveSpot(defaultSpot bool, override *bool) bool {
+	if override != nil {
+		return *override
+	}
+	return defaultSpot
+}
+
+// ResolveSpotPreference inspects GitHub runner labels for explicit "spot" or
+// "on-demand" provisioning mode selectors. When both labels appear, "on-demand"
+// wins so release and deployment jobs are never preempted mid-flight.
+func ResolveSpotPreference(labels []string) *bool {
+	wantSpot := false
+	for _, raw := range labels {
+		switch strings.ToLower(strings.TrimSpace(raw)) {
+		case "on-demand":
+			return BoolPtr(false)
+		case "spot":
+			wantSpot = true
+		}
+	}
+	if wantSpot {
+		return BoolPtr(true)
+	}
+	return nil
+}
+
 var controllerIDRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$`)
 
 // ValidControllerID applies the provider-safe controller ownership identifier
@@ -67,6 +126,20 @@ type RunnerParams struct {
 	DeadmanShutdownMinutes  int
 	PrebakedImage           bool
 	EgressAllowlist         []string
+	// Spot overrides provider-default spot provisioning: nil uses the provider
+	// default, true forces spot/preemptible, and false forces on-demand.
+	Spot *bool
+	// SpotActive is populated for cloud-init rendering when the instance is
+	// actually launched as a spot/preemptible VM.
+	SpotActive bool
+}
+
+// WithSpot returns a copy of params configured for the effective spot mode so
+// cloud-init only installs the preemption watcher on spot instances.
+func (p RunnerParams) WithSpot(useSpot bool) RunnerParams {
+	p.Spot = BoolPtr(useSpot)
+	p.SpotActive = useSpot
+	return p
 }
 
 // RunnerInstance is a provider-neutral resource identity.
@@ -92,6 +165,9 @@ func RenderCloudInit(tmpl *template.Template, params RunnerParams) (string, erro
 		if !ValidEgressEntry(entry) {
 			return "", fmt.Errorf("invalid egress allowlist entry %q", entry)
 		}
+	}
+	if params.Spot != nil && *params.Spot {
+		params.SpotActive = true
 	}
 	var userData bytes.Buffer
 	if err := tmpl.Execute(&userData, params); err != nil {

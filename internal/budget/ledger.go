@@ -44,6 +44,7 @@ type Reservation struct {
 	Repository    string
 	Provider      string
 	Size          string
+	Spot          bool
 	HourlyRateUSD float64
 }
 
@@ -62,6 +63,7 @@ type activeReservation struct {
 	Repository      string    `json:"repository"`
 	Provider        string    `json:"provider"`
 	Size            string    `json:"size"`
+	Spot            bool      `json:"spot,omitempty"`
 	HourlyRateUSD   float64   `json:"hourly_rate_usd"`
 	EstimatedCapUSD float64   `json:"estimated_cap_usd"`
 	StartedAt       time.Time `json:"started_at"`
@@ -190,6 +192,7 @@ func (t *Tracker) Reserve(res Reservation) error {
 		Repository:      repo,
 		Provider:        strings.ToLower(strings.TrimSpace(res.Provider)),
 		Size:            strings.TrimSpace(res.Size),
+		Spot:            res.Spot,
 		HourlyRateUSD:   res.HourlyRateUSD,
 		EstimatedCapUSD: estCost,
 		StartedAt:       nowUTC,

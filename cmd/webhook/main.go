@@ -106,6 +106,7 @@ func run() error {
 		BudgetTracker:             budgetTracker,
 		HourlyRateOverrides:       cfg.hourlyRateOverrides,
 		DefaultInstanceSize:       defaultInstanceSizeForEnv(computeClient.Provider()),
+		DefaultSpot:               cfg.runnerSpot,
 		Store:                     stateStore,
 		RequiredLabel:             cfg.requiredLabel,
 		AllowedLabels:             cfg.allowedLabels,
@@ -281,19 +282,23 @@ func newComputeClient(startupCtx, lifetimeCtx context.Context) (webhook.ComputeC
 	if err != nil {
 		return nil, noopClose, err
 	}
+	spotFallbackOnDemand, err := envBoolValue("SPOT_FALLBACK_ON_DEMAND", false)
+	if err != nil {
+		return nil, noopClose, err
+	}
 
 	if providers := splitCSV(os.Getenv("CLOUD_PROVIDERS")); len(providers) > 0 {
-		return newMultiCloudRouter(startupCtx, lifetimeCtx, providers, controllerID, cloudInitPath, spot)
+		return newMultiCloudRouter(startupCtx, lifetimeCtx, providers, controllerID, cloudInitPath, spot, spotFallbackOnDemand)
 	}
 	provider := strings.ToLower(envOrDefault("COMPUTE_PROVIDER", "digitalocean"))
-	return newSingleComputeClient(startupCtx, lifetimeCtx, provider, controllerID, cloudInitPath, spot)
+	return newSingleComputeClient(startupCtx, lifetimeCtx, provider, controllerID, cloudInitPath, spot, spotFallbackOnDemand)
 }
 
 func newMultiCloudRouter(
 	startupCtx, lifetimeCtx context.Context,
 	providers []string,
 	controllerID, cloudInitPath string,
-	spot bool,
+	spot, spotFallbackOnDemand bool,
 ) (webhook.ComputeClient, func(), error) {
 	strategy := router.Strategy(strings.ToLower(envOrDefault("ROUTER_STRATEGY", string(router.StrategyPriority))))
 	overrides, err := router.ParseHourlyRateOverrides(os.Getenv("ROUTER_HOURLY_RATES"))
@@ -311,7 +316,13 @@ func newMultiCloudRouter(
 
 	for _, rawProvider := range providers {
 		name := strings.ToLower(strings.TrimSpace(rawProvider))
-		client, closeFn, err := newSingleComputeClient(startupCtx, lifetimeCtx, name, controllerID, cloudInitPath, spot)
+		backendSpot := spot
+		if backendSpot && spotFallbackOnDemand && !router.ProviderSupportsSpot(name) {
+			backendSpot = false
+		}
+		// Disable per-backend on-demand fallback so the router exhausts spot
+		// capacity across all configured clouds before falling back to on-demand.
+		client, closeFn, err := newSingleComputeClient(startupCtx, lifetimeCtx, name, controllerID, cloudInitPath, backendSpot, false)
 		if err != nil {
 			closeAll()
 			return nil, noopClose, fmt.Errorf("initialize provider %q for CLOUD_PROVIDERS: %w", name, err)
@@ -325,9 +336,11 @@ func newMultiCloudRouter(
 	}
 
 	multi, err := router.New(router.Config{
-		Strategy:    strategy,
-		Backends:    backends,
-		HourlyRates: overrides,
+		Strategy:             strategy,
+		Backends:             backends,
+		HourlyRates:          overrides,
+		DefaultSpot:          spot,
+		SpotFallbackOnDemand: spotFallbackOnDemand,
 	})
 	if err != nil {
 		closeAll()
@@ -339,14 +352,14 @@ func newMultiCloudRouter(
 func newSingleComputeClient(
 	startupCtx, lifetimeCtx context.Context,
 	provider, controllerID, cloudInitPath string,
-	spot bool,
+	spot, spotFallbackOnDemand bool,
 ) (webhook.ComputeClient, func(), error) {
 	noClose := noopClose
 
 	switch provider {
 	case "digitalocean":
 		if spot {
-			return nil, noClose, errors.New(i18n.T("webhook.err.do_no_spot"))
+			return nil, noClose, fmt.Errorf("%w: %s", compute.ErrSpotUnsupported, i18n.T("webhook.err.do_no_spot"))
 		}
 		required, err := requiredValues("DIGITALOCEAN_TOKEN", "DO_VPC_UUID", "DO_FIREWALL_ID")
 		if err != nil {
@@ -374,9 +387,11 @@ func newSingleComputeClient(
 		}
 		client, err := aws.NewClient(startupCtx, aws.Config{
 			Region: required["AWS_REGION"], AMI: required["AWS_AMI_ID"], InstanceType: required["AWS_INSTANCE_TYPE"],
-			SubnetID: required["AWS_SUBNET_ID"], SecurityGroupIDs: splitCSV(required["AWS_SECURITY_GROUP_IDS"]),
+			SubnetID: required["AWS_SUBNET_ID"], AlternateSubnetIDs: splitCSV(os.Getenv("AWS_ALTERNATE_SUBNET_IDS")),
+			SecurityGroupIDs:   splitCSV(required["AWS_SECURITY_GROUP_IDS"]),
 			InstanceProfileARN: os.Getenv("AWS_INSTANCE_PROFILE_ARN"), KeyName: os.Getenv("AWS_KEY_NAME"),
-			CloudInitPath: cloudInitPath, ControllerID: controllerID, Spot: spot, ExternalIP: externalIP,
+			CloudInitPath: cloudInitPath, ControllerID: controllerID,
+			Spot: spot, SpotFallbackOnDemand: spotFallbackOnDemand, ExternalIP: externalIP,
 		})
 		if err != nil {
 			return nil, noClose, err
@@ -401,7 +416,8 @@ func newSingleComputeClient(
 			ProjectID: required["GCP_PROJECT_ID"], Zone: required["GCP_ZONE"], MachineType: required["GCP_MACHINE_TYPE"],
 			SourceImage: required["GCP_SOURCE_IMAGE"], Subnetwork: required["GCP_SUBNETWORK"],
 			ServiceAccountEmail: required["GCP_RUNNER_SERVICE_ACCOUNT_EMAIL"],
-			CloudInitPath:       cloudInitPath, ControllerID: controllerID, Spot: spot, ExternalIP: externalIP,
+			CloudInitPath:       cloudInitPath, ControllerID: controllerID,
+			Spot: spot, SpotFallbackOnDemand: spotFallbackOnDemand, ExternalIP: externalIP,
 		})
 		if err != nil {
 			return nil, noClose, err
@@ -424,7 +440,7 @@ func newSingleComputeClient(
 			Location: required["AZURE_LOCATION"], VMSize: required["AZURE_VM_SIZE"], Image: required["AZURE_IMAGE"],
 			SubnetID: required["AZURE_SUBNET_ID"], AdminUsername: envOrDefault("AZURE_ADMIN_USERNAME", "runneradmin"),
 			SSHPublicKey: strings.TrimSpace(string(sshPublicKey)), CloudInitPath: cloudInitPath, ControllerID: controllerID,
-			Spot: spot,
+			Spot: spot, SpotFallbackOnDemand: spotFallbackOnDemand,
 		})
 		if err != nil {
 			return nil, noClose, err
@@ -432,7 +448,7 @@ func newSingleComputeClient(
 		return client, noClose, nil
 	case "vultr":
 		if spot {
-			return nil, noClose, errors.New(i18n.T("webhook.err.provider_no_spot", "Vultr"))
+			return nil, noClose, fmt.Errorf("%w: %s", compute.ErrSpotUnsupported, i18n.T("webhook.err.provider_no_spot", "Vultr"))
 		}
 		apiKey, err := requiredEnv("VULTR_API_KEY")
 		if err != nil {
@@ -461,7 +477,7 @@ func newSingleComputeClient(
 		return client, noClose, nil
 	case "linode":
 		if spot {
-			return nil, noClose, errors.New(i18n.T("webhook.err.provider_no_spot", "Linode"))
+			return nil, noClose, fmt.Errorf("%w: %s", compute.ErrSpotUnsupported, i18n.T("webhook.err.provider_no_spot", "Linode"))
 		}
 		token, err := requiredEnv("LINODE_TOKEN")
 		if err != nil {
@@ -532,6 +548,7 @@ type runtimeConfig struct {
 	budgetStateFile                    string
 	useJITConfig                       bool
 	prebakedImage                      bool
+	runnerSpot                         bool
 	egressAllowlist                    []string
 	runnerGroupID                      int64
 	workerCount, maxLiveRunners        int
@@ -650,6 +667,9 @@ func loadRoutingBudgetAndBootstrapConfig(cfg *runtimeConfig) error {
 		return err
 	}
 	if cfg.prebakedImage, err = envBoolValue("RUNNER_PREBAKED", false); err != nil {
+		return err
+	}
+	if cfg.runnerSpot, err = envBoolValue("RUNNER_SPOT", false); err != nil {
 		return err
 	}
 	if cfg.egressAllowlist, err = compute.ParseEgressAllowlist(os.Getenv("RUNNER_EGRESS_ALLOWLIST")); err != nil {

@@ -92,6 +92,10 @@ type rateEstimator interface {
 	EstimateHourlyRate(sizeOverride string) (providerName, size string, hourlyUSD float64)
 }
 
+type spotRateEstimator interface {
+	EstimateHourlyRateForMode(sizeOverride string, spot *bool) (providerName, size string, hourlyUSD float64)
+}
+
 // Handler authenticates webhooks and drives durable runner lifecycle workers.
 type Handler struct {
 	webhookSecret             []byte
@@ -100,6 +104,7 @@ type Handler struct {
 	budgetTracker             *budget.Tracker
 	hourlyRateOverrides       map[string]float64
 	defaultInstanceSize       string
+	defaultSpot               bool
 	store                     state.Store
 	requiredLabel             string
 	allowedLabels             map[string]string
@@ -141,6 +146,7 @@ type Config struct {
 	BudgetTracker             *budget.Tracker
 	HourlyRateOverrides       map[string]float64
 	DefaultInstanceSize       string
+	DefaultSpot               bool
 	Store                     state.Store
 	RequiredLabel             string
 	AllowedLabels             []string
@@ -212,6 +218,7 @@ func NewHandler(cfg Config) (*Handler, error) {
 		budgetTracker:             cfg.BudgetTracker,
 		hourlyRateOverrides:       cfg.HourlyRateOverrides,
 		defaultInstanceSize:       strings.TrimSpace(cfg.DefaultInstanceSize),
+		defaultSpot:               cfg.DefaultSpot,
 		store:                     cfg.Store,
 		requiredLabel:             requiredLabel,
 		allowedLabels:             allowedLabels,
@@ -1097,7 +1104,8 @@ func (h *Handler) provision(ctx context.Context, record state.Record) {
 	}
 
 	resolvedSize := compute.ResolveInstanceSize(record.Labels, h.requiredLabel, h.labelSizeMap)
-	if !h.reserveBudget(ctx, record, resolvedSize) {
+	spotPref := compute.ResolveSpotPreference(record.Labels)
+	if !h.reserveBudget(ctx, record, resolvedSize, spotPref) {
 		return
 	}
 
@@ -1114,6 +1122,7 @@ func (h *Handler) provision(ctx context.Context, record state.Record) {
 		DeadmanShutdownMinutes:  h.deadmanShutdownMinutes,
 		PrebakedImage:           h.prebakedImage,
 		EgressAllowlist:         h.egressAllowlist,
+		Spot:                    spotPref,
 	}
 	if regToken != "" {
 		params.RunnerRepoURL = fmt.Sprintf("https://github.com/%s/%s", record.Owner, record.Repository)
@@ -1174,17 +1183,20 @@ func (h *Handler) acquireRunnerBootstrapAuth(
 	return jit, "", true
 }
 
-func (h *Handler) reserveBudget(ctx context.Context, record state.Record, resolvedSize string) bool {
+func (h *Handler) reserveBudget(ctx context.Context, record state.Record, resolvedSize string, spotPref *bool) bool {
 	if h.budgetTracker == nil || !h.budgetTracker.Enabled() {
 		return true
 	}
+	useSpot := compute.ResolveSpot(h.defaultSpot, spotPref)
 	providerName := h.provider
 	size := resolvedSize
 	if size == "" {
 		size = h.defaultInstanceSize
 	}
-	hourlyUSD := router.HourlyRate(providerName, size, h.hourlyRateOverrides)
-	if est, ok := h.computeClient.(rateEstimator); ok {
+	hourlyUSD := router.HourlyRateForMode(providerName, size, useSpot, h.hourlyRateOverrides)
+	if est, ok := h.computeClient.(spotRateEstimator); ok {
+		providerName, size, hourlyUSD = est.EstimateHourlyRateForMode(resolvedSize, spotPref)
+	} else if est, ok := h.computeClient.(rateEstimator); ok {
 		providerName, size, hourlyUSD = est.EstimateHourlyRate(resolvedSize)
 	}
 	err := h.budgetTracker.Reserve(budget.Reservation{
@@ -1192,6 +1204,7 @@ func (h *Handler) reserveBudget(ctx context.Context, record state.Record, resolv
 		Repository:    record.Owner + "/" + record.Repository,
 		Provider:      providerName,
 		Size:          size,
+		Spot:          useSpot,
 		HourlyRateUSD: hourlyUSD,
 	})
 	if err == nil {
