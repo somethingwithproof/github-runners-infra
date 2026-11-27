@@ -25,7 +25,7 @@ variable "controller_id" {
 variable "region" {
   description = "Linode / Akamai Cloud region ID (LINODE_REGION)."
   type        = string
-  default     = "us-east"
+  default     = "us-ord"
 }
 
 variable "subnet_ipv4" {

@@ -194,7 +194,11 @@ func (t *Tracker) Reserve(res Reservation) error {
 		EstimatedCapUSD: estCost,
 		StartedAt:       nowUTC,
 	}
-	return t.persistLocked()
+	if err := t.persistLocked(); err != nil {
+		delete(t.state.InFlight, res.Key)
+		return err
+	}
+	return nil
 }
 
 // Release settles an in-flight runner into accrued daily/monthly spend based on

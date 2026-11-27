@@ -33,7 +33,7 @@ build {
   sources = ["source.googlecompute.runner"]
 
   provisioner "shell" {
-    execute_command = "sudo -E bash '{{.Path}}'"
+    execute_command = "sudo env {{.Vars}} bash '{{.Path}}'"
     script          = "${path.root}/scripts/install-runner.sh"
     environment_vars = [
       "RUNNER_VERSION=${var.runner_version}",

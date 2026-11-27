@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"text/template"
 	"time"
 )
@@ -60,6 +61,7 @@ type RunnerParams struct {
 	RunnerJITConfig         string
 	RunnerRegistrationToken string
 	RunnerRepoURL           string
+	RegistrationLabels      []string
 	RunnerVersion           string
 	RunnerSHA256            string
 	ChefInstallerSHA256     string
@@ -77,6 +79,9 @@ type RunnerInstance struct {
 
 var safeRepoURLRegex = regexp.MustCompile(`^https://github\.com/[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}/(\.github|[a-zA-Z0-9][a-zA-Z0-9._-]{0,99})$`)
 
+// LabelList returns the comma-separated labels expected by config.sh.
+func (p RunnerParams) LabelList() string { return strings.Join(p.RegistrationLabels, ",") }
+
 // RenderCloudInit renders the shared, provider-neutral cloud-init template.
 func RenderCloudInit(tmpl *template.Template, params RunnerParams) (string, error) {
 	if tmpl == nil {
@@ -87,6 +92,11 @@ func RenderCloudInit(tmpl *template.Template, params RunnerParams) (string, erro
 	}
 	if params.RunnerRepoURL != "" && !safeRepoURLRegex.MatchString(params.RunnerRepoURL) {
 		return "", fmt.Errorf("invalid runner repository URL %q", params.RunnerRepoURL)
+	}
+	for _, label := range params.RegistrationLabels {
+		if !ValidLabel(label) {
+			return "", fmt.Errorf("invalid registration label %q", label)
+		}
 	}
 	for _, entry := range params.EgressAllowlist {
 		if !ValidEgressEntry(entry) {

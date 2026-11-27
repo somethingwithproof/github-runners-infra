@@ -6,6 +6,7 @@ package budget
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -175,5 +176,24 @@ func TestCancelDoesNotAccrueSpend(t *testing.T) {
 	snap := tracker.Snapshot()
 	if snap.DailySpendUSD != 0 || snap.MonthlySpendUSD != 0 || snap.InFlightSpendUSD != 0 {
 		t.Fatalf("spend after Cancel = %#v, want 0", snap)
+	}
+}
+
+func TestReservationRetriesFailedWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "budget.json")
+	tracker, err := NewTracker(Config{DailyCapUSD: 1, StatePath: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Mkdir(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := tracker.Reserve(Reservation{Key: "job", HourlyRateUSD: 0.1}); err == nil {
+			t.Fatal("accepted reservation with unwritable ledger")
+		}
+	}
+	if tracker.Snapshot().InFlightSpendUSD != 0 {
+		t.Fatal("failed reservation counted as in flight")
 	}
 }

@@ -1116,6 +1116,7 @@ func (h *Handler) provision(ctx context.Context, record state.Record) {
 		EgressAllowlist:         h.egressAllowlist,
 	}
 	if regToken != "" {
+		params.RegistrationLabels = record.Labels
 		params.RunnerRepoURL = fmt.Sprintf("https://github.com/%s/%s", record.Owner, record.Repository)
 	}
 	instance, err := h.computeClient.CreateRunner(ctx, params)

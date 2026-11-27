@@ -60,7 +60,7 @@ locals {
 
 resource "google_service_account" "runner" {
   project      = var.project_id
-  account_id   = substr("gh-runner-${local.safe_id}", 0, 30)
+  account_id   = replace(substr("gh-runner-${local.safe_id}", 0, 30), "/-+$/", "")
   display_name = "Ephemeral GitHub Actions Runner (${var.controller_id})"
   description  = "Zero-role identity attached to ephemeral runner VMs"
 }

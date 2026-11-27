@@ -401,8 +401,11 @@ func SweepOrphans[T any](
 	deleteFn func(context.Context, string) error,
 ) (int, error) {
 	deleted := 0
-	var parseErrs []error
+	var sweepErrs []error
 	for _, item := range items {
+		if err := ctx.Err(); err != nil {
+			return deleted, errors.Join(append(sweepErrs, err)...)
+		}
 		if !HasTag(tagsOf(item), controllerTag) {
 			continue
 		}
@@ -412,16 +415,20 @@ func SweepOrphans[T any](
 		}
 		created, err := createdOf(item)
 		if err != nil {
-			parseErrs = append(parseErrs, fmt.Errorf("parse creation time for controller %s instance %s: %w", provider, id, err))
+			sweepErrs = append(sweepErrs, fmt.Errorf("parse creation time for controller %s instance %s: %w", provider, id, err))
 			continue
 		}
 		if !created.Before(cutoff) {
 			continue
 		}
 		if err := deleteFn(ctx, id); err != nil && !IsHTTPNotFound(err) {
-			return deleted, fmt.Errorf("delete orphaned controller %s instance %s: %w", provider, id, err)
+			sweepErrs = append(sweepErrs, fmt.Errorf("delete orphaned controller %s instance %s: %w", provider, id, err))
+			if ctx.Err() != nil {
+				break
+			}
+			continue
 		}
 		deleted++
 	}
-	return deleted, errors.Join(parseErrs...)
+	return deleted, errors.Join(sweepErrs...)
 }
