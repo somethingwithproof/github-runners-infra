@@ -6,11 +6,30 @@ package compute
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"regexp"
 	"text/template"
+	"time"
 )
+
+const (
+	// DefaultDeadmanShutdownMinutes is the default in-VM dead-man poweroff timeout.
+	DefaultDeadmanShutdownMinutes = 180
+	// MaxDeadmanShutdownMinutes bounds the in-VM dead-man timer to seven days.
+	MaxDeadmanShutdownMinutes = 7 * 24 * 60
+)
+
+// Provider owns cloud runner instances for one compute backend.
+type Provider interface {
+	Provider() string
+	FindRunner(context.Context, string) (*RunnerInstance, bool, error)
+	CreateRunner(context.Context, RunnerParams) (*RunnerInstance, error)
+	DeleteRunner(context.Context, string, string) error
+	CleanupRunner(context.Context, string) error
+	SweepOrphanedRunners(context.Context, map[string]struct{}, time.Time) (int, error)
+}
 
 // ErrOwnershipMismatch marks a provider resource that the configured
 // controller cannot safely mutate.
@@ -32,15 +51,18 @@ func ValidControllerID(value string) bool {
 	return controllerIDRegex.MatchString(value)
 }
 
-// RunnerParams contains the non-secret values rendered into runner user data.
+// RunnerParams contains the non-secret values rendered into runner user data
+// and per-job provisioning overrides.
 type RunnerParams struct {
-	JobKey              string
-	ProvisionEpoch      int
-	RunnerName          string
-	RunnerJITConfig     string
-	RunnerVersion       string
-	RunnerSHA256        string
-	ChefInstallerSHA256 string
+	JobKey                 string
+	ProvisionEpoch         int
+	RunnerName             string
+	RunnerJITConfig        string
+	RunnerVersion          string
+	RunnerSHA256           string
+	ChefInstallerSHA256    string
+	InstanceSize           string
+	DeadmanShutdownMinutes int
 }
 
 // RunnerInstance is a provider-neutral resource identity.
@@ -53,6 +75,9 @@ type RunnerInstance struct {
 func RenderCloudInit(tmpl *template.Template, params RunnerParams) (string, error) {
 	if tmpl == nil {
 		return "", fmt.Errorf("cloud-init template is not configured")
+	}
+	if params.DeadmanShutdownMinutes < 0 || params.DeadmanShutdownMinutes > MaxDeadmanShutdownMinutes {
+		return "", fmt.Errorf("dead-man shutdown minutes %d must be between 0 and %d", params.DeadmanShutdownMinutes, MaxDeadmanShutdownMinutes)
 	}
 	var userData bytes.Buffer
 	if err := tmpl.Execute(&userData, params); err != nil {

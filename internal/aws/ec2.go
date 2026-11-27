@@ -66,6 +66,8 @@ type Client struct {
 	externalIP         bool
 }
 
+var _ compute.Provider = (*Client)(nil)
+
 func (c *Client) Provider() string { return "aws" }
 
 // NewClient creates a client using AWS's standard environment, shared config,
@@ -73,6 +75,9 @@ func (c *Client) Provider() string { return "aws" }
 func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.Region == "" || cfg.AMI == "" || cfg.InstanceType == "" || cfg.SubnetID == "" || len(cfg.SecurityGroupIDs) == 0 {
 		return nil, fmt.Errorf("AWS region, AMI, instance type, subnet ID, and at least one security group are required")
+	}
+	if !compute.ValidInstanceSize(cfg.InstanceType) {
+		return nil, fmt.Errorf("invalid AWS instance type %q", cfg.InstanceType)
 	}
 	if !compute.ValidControllerID(cfg.ControllerID) {
 		return nil, fmt.Errorf("controller ID must contain only letters, numbers, underscores, and hyphens")
@@ -146,12 +151,19 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 	if existing, found, err := c.FindRunner(ctx, params.JobKey); err != nil || found {
 		return existing, err
 	}
+	instanceType := c.instanceType
+	if params.InstanceSize != "" {
+		if !compute.ValidInstanceSize(params.InstanceSize) {
+			return nil, fmt.Errorf("invalid AWS instance type %q", params.InstanceSize)
+		}
+		instanceType = types.InstanceType(params.InstanceSize)
+	}
 	userData, err := compute.RenderCloudInit(c.tmpl, params)
 	if err != nil {
 		return nil, err
 	}
 	input := &ec2.RunInstancesInput{
-		ImageId: aws.String(c.ami), InstanceType: c.instanceType, MinCount: aws.Int32(1), MaxCount: aws.Int32(1),
+		ImageId: aws.String(c.ami), InstanceType: instanceType, MinCount: aws.Int32(1), MaxCount: aws.Int32(1),
 		NetworkInterfaces: []types.InstanceNetworkInterfaceSpecification{{
 			AssociatePublicIpAddress: aws.Bool(c.externalIP), DeviceIndex: aws.Int32(0),
 			SubnetId: aws.String(c.subnetID), Groups: append([]string(nil), c.securityGroupIDs...),

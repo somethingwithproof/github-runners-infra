@@ -116,11 +116,16 @@ type Client struct {
 	externalIP          bool
 }
 
+var _ compute.Provider = (*Client)(nil)
+
 func (c *Client) Provider() string { return "gcp" }
 
 func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.ProjectID == "" || cfg.Zone == "" || cfg.MachineType == "" || cfg.SourceImage == "" || cfg.Subnetwork == "" || cfg.ServiceAccountEmail == "" {
 		return nil, fmt.Errorf("GCP project, zone, machine type, source image, subnetwork, and runner service account are required")
+	}
+	if !compute.ValidInstanceSize(cfg.MachineType) {
+		return nil, fmt.Errorf("invalid GCP machine type %q", cfg.MachineType)
 	}
 	if !compute.ValidControllerID(cfg.ControllerID) {
 		return nil, fmt.Errorf("controller ID must contain only letters, numbers, underscores, and hyphens")
@@ -163,12 +168,19 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 	if existing, found, err := c.FindRunner(ctx, params.JobKey); err != nil || found {
 		return existing, err
 	}
+	machineType := c.machineType
+	if params.InstanceSize != "" {
+		if !compute.ValidInstanceSize(params.InstanceSize) {
+			return nil, fmt.Errorf("invalid GCP machine type %q", params.InstanceSize)
+		}
+		machineType = params.InstanceSize
+	}
 	userData, err := compute.RenderCloudInit(c.tmpl, params)
 	if err != nil {
 		return nil, err
 	}
 	name := resourceName(params.JobKey)
-	instance := c.instanceSpec(params.JobKey, userData)
+	instance := c.instanceSpec(params.JobKey, machineType, userData)
 	op, err := c.instances.Insert(ctx, &computepb.InsertInstanceRequest{
 		Project: c.projectID, Zone: c.zone, InstanceResource: instance,
 		RequestId: stringPtr(requestID(params.JobKey, params.ProvisionEpoch)),
@@ -182,7 +194,7 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 	return &compute.RunnerInstance{ID: name, Name: name}, nil
 }
 
-func (c *Client) instanceSpec(jobKey, userData string) *computepb.Instance {
+func (c *Client) instanceSpec(jobKey, machineType, userData string) *computepb.Instance {
 	name := resourceName(jobKey)
 	boot, autoDelete := true, true
 	network := &computepb.NetworkInterface{Subnetwork: stringPtr(c.subnetwork)}
@@ -192,7 +204,7 @@ func (c *Client) instanceSpec(jobKey, userData string) *computepb.Instance {
 		}}
 	}
 	instance := &computepb.Instance{
-		Name: stringPtr(name), MachineType: stringPtr("zones/" + c.zone + "/machineTypes/" + c.machineType),
+		Name: stringPtr(name), MachineType: stringPtr("zones/" + c.zone + "/machineTypes/" + machineType),
 		Labels: map[string]string{controllerLabel: c.controllerHash, jobLabel: shortHash(jobKey)},
 		Disks: []*computepb.AttachedDisk{{Boot: &boot, AutoDelete: &autoDelete, InitializeParams: &computepb.AttachedDiskInitializeParams{
 			SourceImage: stringPtr(c.sourceImage),

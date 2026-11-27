@@ -181,12 +181,17 @@ type Client struct {
 	spot          bool
 }
 
+var _ compute.Provider = (*Client)(nil)
+
 func (c *Client) Provider() string { return "azure" }
 
 func NewClient(cfg Config) (*Client, error) {
 	if cfg.SubscriptionID == "" || cfg.ResourceGroup == "" || cfg.Location == "" || cfg.VMSize == "" ||
 		cfg.SubnetID == "" || cfg.AdminUsername == "" || cfg.SSHPublicKey == "" {
 		return nil, fmt.Errorf("azure subscription, resource group, location, VM size, subnet, admin username, and SSH public key are required")
+	}
+	if !compute.ValidInstanceSize(cfg.VMSize) {
+		return nil, fmt.Errorf("invalid Azure VM size %q", cfg.VMSize)
 	}
 	if !compute.ValidControllerID(cfg.ControllerID) {
 		return nil, fmt.Errorf("controller ID must contain only letters, numbers, underscores, and hyphens")
@@ -242,6 +247,13 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 	if existing, found, err := c.FindRunner(ctx, params.JobKey); err != nil || found {
 		return existing, err
 	}
+	vmSize := c.vmSize
+	if params.InstanceSize != "" {
+		if !compute.ValidInstanceSize(params.InstanceSize) {
+			return nil, fmt.Errorf("invalid Azure VM size %q", params.InstanceSize)
+		}
+		vmSize = armcompute.VirtualMachineSizeTypes(params.InstanceSize)
+	}
 	userData, err := compute.RenderCloudInit(c.tmpl, params)
 	if err != nil {
 		return nil, err
@@ -251,7 +263,7 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 	if err != nil {
 		return nil, err
 	}
-	vm := c.vmSpec(params.JobKey, name, nicID, userData)
+	vm := c.vmSpec(params.JobKey, name, nicID, vmSize, userData)
 	op, err := c.vms.CreateOrUpdate(ctx, c.resourceGroup, name, vm)
 	if err != nil {
 		return nil, c.cleanupNICAfterVMFailure(ctx, name, params.JobKey, fmt.Errorf("create Azure runner: %w", err))
@@ -262,13 +274,13 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 	return &compute.RunnerInstance{ID: name, Name: name}, nil
 }
 
-func (c *Client) vmSpec(jobKey, name, nicID, userData string) armcompute.VirtualMachine {
+func (c *Client) vmSpec(jobKey, name, nicID string, vmSize armcompute.VirtualMachineSizeTypes, userData string) armcompute.VirtualMachine {
 	disablePassword, primary := true, true
 	deleteDisk, deleteNIC := armcompute.DiskDeleteOptionTypesDelete, armcompute.DeleteOptionsDelete
 	vm := armcompute.VirtualMachine{
 		Location: stringPtr(c.location), Tags: ownershipTags(c.controllerID, jobKey),
 		Properties: &armcompute.VirtualMachineProperties{
-			HardwareProfile: &armcompute.HardwareProfile{VMSize: &c.vmSize},
+			HardwareProfile: &armcompute.HardwareProfile{VMSize: &vmSize},
 			StorageProfile: &armcompute.StorageProfile{
 				ImageReference: &armcompute.ImageReference{Publisher: &c.image[0], Offer: &c.image[1], SKU: &c.image[2], Version: &c.image[3]},
 				OSDisk:         &armcompute.OSDisk{CreateOption: enumPtr(armcompute.DiskCreateOptionTypesFromImage), DeleteOption: &deleteDisk},

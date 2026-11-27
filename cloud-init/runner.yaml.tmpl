@@ -28,6 +28,14 @@ packages:
 runcmd:
   - |
     set -eu
+    {{- if gt .DeadmanShutdownMinutes 0}}
+    # Secret-free in-VM dead-man shutdown fuse: guarantees compute stops even
+    # if the runner hangs or loses GitHub connectivity. No cloud API token is
+    # placed in user data; on providers that bill powered-off VMs (such as
+    # DigitalOcean, Vultr, and Linode), the controller's age-gated sweep still
+    # destroys the stopped instance after MAX_RUNNER_AGE.
+    systemd-run --unit=runner-deadman-shutdown --on-active={{.DeadmanShutdownMinutes}}m /sbin/shutdown --poweroff now
+    {{- end}}
     systemctl enable --now docker
 
     # Template sources and controller validation restrict these single-quoted

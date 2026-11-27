@@ -269,3 +269,25 @@ func TestConcurrentSweepFindAndCreatePreserveFreshRunner(t *testing.T) {
 		t.Fatalf("concurrent sweep terminated fresh runner: %v", api.terminated)
 	}
 }
+
+func TestCreateRunnerAppliesInstanceSizeOverride(t *testing.T) {
+	api := &fakeEC2{}
+	tmpl := template.Must(template.New("cloud-init").Parse("#cloud-config\n{{.RunnerJITConfig}}"))
+	client := newClient(api, tmpl, Config{
+		AMI: "ami-pinned", InstanceType: "m7i.xlarge", SubnetID: "subnet-private",
+		SecurityGroupIDs: []string{"sg-egress-only"}, ControllerID: "primary",
+	})
+	if _, err := client.CreateRunner(context.Background(), compute.RunnerParams{
+		JobKey: "org/repo:99", RunnerJITConfig: "jit", InstanceSize: "c7i.4xlarge",
+	}); err != nil {
+		t.Fatalf("CreateRunner override error = %v", err)
+	}
+	if api.runInput == nil || api.runInput.InstanceType != types.InstanceType("c7i.4xlarge") {
+		t.Fatalf("instance type = %q, want c7i.4xlarge", api.runInput.InstanceType)
+	}
+	if _, err := client.CreateRunner(context.Background(), compute.RunnerParams{
+		JobKey: "org/repo:100", RunnerJITConfig: "jit", InstanceSize: "bad/type",
+	}); err == nil {
+		t.Fatal("CreateRunner accepted invalid AWS instance type override")
+	}
+}
