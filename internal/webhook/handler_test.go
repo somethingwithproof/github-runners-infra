@@ -935,7 +935,7 @@ func TestFoundOfflineRunnerClearsStaleProviderMisses(t *testing.T) {
 	if err := store.MarkProvisioned(context.Background(), record.Key, "instance-817", 817, "runner-817"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RecordRunnerSeen(context.Background(), record.Key); err != nil {
+	if err := store.RecordRunnerSeen(context.Background(), record.Key, state.RunnerGuard{InstanceID: "instance-817", GitHubRunnerID: 817}); err != nil {
 		t.Fatal(err)
 	}
 	handler.livenessCheckInterval = 0
@@ -1016,7 +1016,7 @@ func TestMissingGitHubJITRunnerIsScheduledForDeletion(t *testing.T) {
 	if err := store.MarkProvisioned(context.Background(), record.Key, "instance-813", 813, "runner-813"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RecordRunnerSeen(context.Background(), record.Key); err != nil {
+	if err := store.RecordRunnerSeen(context.Background(), record.Key, state.RunnerGuard{InstanceID: "instance-813", GitHubRunnerID: 813}); err != nil {
 		t.Fatal(err)
 	}
 	githubClient.runnerStatus = map[int64]gh.RunnerStatus{813: gh.RunnerMissing}

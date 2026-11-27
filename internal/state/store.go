@@ -64,6 +64,9 @@ type Record struct {
 	JobCompleted bool `json:"job_completed,omitempty"`
 	// RecheckDemand survives owned runner cleanup after cross-job assignment.
 	RecheckDemand bool `json:"recheck_demand,omitempty"`
+	// ReassignedRunID records the workflow run ID of a different job completed
+	// on this runner so public-repo replenishment can verify its origin.
+	ReassignedRunID int64 `json:"reassigned_run_id,omitempty"`
 	// DeletionAcceptedID records a successful, ownership-verified provider delete.
 	// Bind it to an exact ID so it can never authorize deletion of a replacement.
 	DeletionAcceptedID string `json:"deletion_accepted_id,omitempty"`
@@ -75,6 +78,7 @@ type Record struct {
 	Attempts            int       `json:"attempts"`
 	ProvisionEpoch      int       `json:"provision_epoch,omitempty"`
 	DeleteAttempts      int       `json:"delete_attempts"`
+	ConfirmAttempts     int       `json:"confirm_attempts,omitempty"`
 	ReconcileFailures   int       `json:"reconcile_failures,omitempty"`
 	ThrottleFailures    int       `json:"throttle_failures,omitempty"`
 	LastError           string    `json:"last_error,omitempty"`
@@ -90,6 +94,31 @@ type Record struct {
 	UpdatedAt           time.Time `json:"updated_at"`
 }
 
+// RunnerGuard binds a reaper or cleanup state transition to a snapshotted
+// runner identity so stale snapshots become safe no-ops after replacement.
+type RunnerGuard struct {
+	ProvisionEpoch int
+	InstanceID     string
+	GitHubRunnerID int64
+}
+
+// Guard returns the current identity guard for a record snapshot.
+func (r Record) Guard() RunnerGuard {
+	return RunnerGuard{
+		ProvisionEpoch: r.ProvisionEpoch,
+		InstanceID:     r.InstanceID,
+		GitHubRunnerID: r.GitHubRunnerID,
+	}
+}
+
+// DeferPolicy bounds retries and total age for deferred lifecycle checks.
+type DeferPolicy struct {
+	MaxAttempts   int
+	CountFailure  bool
+	CountThrottle bool
+	MaxAge        time.Duration
+}
+
 // Store defines the durable lifecycle operations used by the controller.
 type Store interface {
 	Create(context.Context, Record) (bool, error)
@@ -99,19 +128,19 @@ type Store interface {
 	ClaimNext(context.Context, time.Time, int) (*Record, WorkKind, error)
 	SetMaxLiveRunners(int) error
 	ReleaseClaim(context.Context, string, WorkKind) error
-	DeferProvisioningDemand(context.Context, string, string, time.Time) error
+	DeferProvisioningDemand(context.Context, string, string, time.Time, DeferPolicy) error
 	DeferRateLimitedWork(context.Context, string, WorkKind, string, time.Time, int) error
 	MarkJITCreated(context.Context, string, int64, string) error
-	ClearJIT(context.Context, string) error
+	ClearJIT(context.Context, string, RunnerGuard) error
 	MarkProvisioned(context.Context, string, string, int64, string) error
 	MarkProvisionFailed(context.Context, string, string, time.Time, int) error
 	MarkCompleted(context.Context, string) error
-	ScheduleDeletion(context.Context, string) error
+	ScheduleDeletion(context.Context, string, RunnerGuard) error
 	MarkDeleted(context.Context, string) error
 	FinishDeletedRunner(context.Context, string, bool) (bool, error)
-	DeferReassignmentDemand(context.Context, string, string, time.Time) error
+	DeferReassignmentDemand(context.Context, string, string, time.Time, DeferPolicy) (bool, error)
 	MarkDeletionAccepted(context.Context, string, string) error
-	DeferDeletionConfirmation(context.Context, string, string, time.Time) error
+	DeferDeletionConfirmation(context.Context, string, string, time.Time, DeferPolicy) error
 	BeginCleanupAttempt(context.Context, string, int) (int, bool, error)
 	MarkDeleteFailed(context.Context, string, string, time.Time, int) error
 	MarkOrphaned(context.Context, string, string) error
@@ -120,17 +149,17 @@ type Store interface {
 	ListOrphaned(context.Context) ([]Record, error)
 	ReleaseAbsentOrphan(context.Context, string, string) error
 	KnownInstanceIDs(context.Context) (map[string]struct{}, error)
-	ReleaseSweptOrphans(context.Context, string, time.Time) (int, error)
-	ObserveRunnerMissing(context.Context, string, time.Time, time.Duration, int) (bool, error)
-	ObserveGitHubRunnerMissing(context.Context, string, time.Time, time.Duration, int) (bool, error)
-	ClearProviderMissing(context.Context, string) error
-	ClearGitHubMissing(context.Context, string) error
-	RecordRunnerSeen(context.Context, string) error
-	ClearRunnerMissing(context.Context, string) error
-	DeferReconciliation(context.Context, string, string, time.Time, int, bool, bool) error
+	ReleaseSweptOrphans(context.Context, string, time.Time, map[string]struct{}, map[string]string) (int, error)
+	ObserveRunnerMissing(context.Context, string, RunnerGuard, time.Time, time.Duration, int) (bool, error)
+	ObserveGitHubRunnerMissing(context.Context, string, RunnerGuard, time.Time, time.Duration, int) (bool, error)
+	ClearProviderMissing(context.Context, string, RunnerGuard) error
+	ClearGitHubMissing(context.Context, string, RunnerGuard) error
+	RecordRunnerSeen(context.Context, string, RunnerGuard) error
+	ClearRunnerMissing(context.Context, string, RunnerGuard) error
+	DeferReconciliation(context.Context, string, RunnerGuard, string, time.Time, DeferPolicy) error
 	DeferRateLimitedCleanup(context.Context, string, string, time.Time, int, bool) error
 	DeferOrphanCleanup(context.Context, string, string, time.Time) error
-	RequeueMissingRunner(context.Context, string, int) error
+	RequeueMissingRunner(context.Context, string, RunnerGuard, int) (bool, error)
 	PruneDeleted(context.Context) (int, error)
 }
 
@@ -456,6 +485,9 @@ func (s *FileStore) reconcileRunnerCompletion(completion Record, now time.Time, 
 				record.JobCompleted = true
 			}
 			record.RecheckDemand = record.JobID != completion.JobID && !record.JobCompleted
+			if record.JobID != completion.JobID {
+				record.ReassignedRunID = completion.ReassignedRunID
+			}
 			if record.ClaimedWork != WorkDelete {
 				record.Status = StatusCompleted
 				record.NextAttemptAt = time.Time{}
@@ -526,7 +558,7 @@ func (s *FileStore) reconcileEventCompletion(completion Record, matchedKey strin
 	existing.UpdatedAt = now
 	s.records[completion.Key] = existing
 	s.markDirty(completion.Key)
-	if completion.GitHubRunnerID != 0 || existing.Status == StatusDeleted || existing.Status == StatusOrphaned {
+	if completion.GitHubRunnerID != 0 || existing.Status == StatusDeleted || existing.Status == StatusOrphaned || existing.ClaimedWork == WorkDelete {
 		return
 	}
 	existing.Status = StatusCompleted
@@ -723,19 +755,41 @@ func (s *FileStore) DeferRateLimitedWork(_ context.Context, key string, kind Wor
 }
 
 // DeferProvisioningDemand refunds a provision claim while GitHub demand or
-// safe deregistration cannot be confirmed. It never deletes provider resources.
-func (s *FileStore) DeferProvisioningDemand(_ context.Context, key, message string, retryAt time.Time) error {
+// safe deregistration cannot be confirmed. Persistent client errors, throttles,
+// and total record age are bounded so invalid or expired jobs cannot hold
+// admission slots forever. It never deletes provider resources.
+func (s *FileStore) DeferProvisioningDemand(_ context.Context, key, message string, retryAt time.Time, policy DeferPolicy) error {
 	return s.update(key, func(record *Record) {
 		if record.Status == StatusDeleted || record.Status == StatusOrphaned || record.ClaimedWork != WorkProvision {
 			return
 		}
 		record.ClaimedWork = ""
 		releaseProvisionClaim(record)
-		if record.Status != StatusCompleted {
-			record.NextAttemptAt = retryAt.UTC()
-			record.DeferDeletion = true
-		}
 		record.LastError = message
+		if record.Status == StatusCompleted {
+			record.NextAttemptAt = time.Time{}
+			return
+		}
+		if policy.CountFailure {
+			record.ReconcileFailures++
+		}
+		if policy.CountThrottle {
+			record.ThrottleFailures++
+		} else {
+			record.ThrottleFailures = 0
+		}
+		ageExpired := policy.MaxAge > 0 && !record.CreatedAt.IsZero() && time.Now().UTC().Sub(record.CreatedAt) >= policy.MaxAge
+		budgetExhausted := policy.MaxAttempts > 0 && (record.ReconcileFailures >= policy.MaxAttempts || record.ThrottleFailures >= policy.MaxAttempts)
+		if budgetExhausted || ageExpired {
+			if record.InstanceID != "" || (record.GitHubRunnerOwned && record.GitHubRunnerID != 0) {
+				record.Status = StatusOrphaned
+			} else {
+				record.Status = StatusFailed
+			}
+			record.NextAttemptAt = time.Time{}
+			return
+		}
+		record.NextAttemptAt = retryAt.UTC()
 	})
 }
 
@@ -784,6 +838,9 @@ func (s *FileStore) MarkJITCreated(_ context.Context, key string, runnerID int64
 			record.JobCompleted = true
 		}
 		record.RecheckDemand = record.JobID != marker.JobID && !record.JobCompleted
+		if record.JobID != marker.JobID {
+			record.ReassignedRunID = marker.ReassignedRunID
+		}
 		record.DeferDeletion = false
 		record.NextAttemptAt = time.Time{}
 		marker.Status = StatusDeleted
@@ -806,9 +863,12 @@ func (s *FileStore) MarkJITCreated(_ context.Context, key string, runnerID int64
 	return nil
 }
 
-func (s *FileStore) ClearJIT(_ context.Context, key string) error {
+func (s *FileStore) ClearJIT(_ context.Context, key string, guard RunnerGuard) error {
 	return s.update(key, func(record *Record) {
 		if record.Status == StatusDeleted {
+			return
+		}
+		if record.ProvisionEpoch != guard.ProvisionEpoch || record.GitHubRunnerID != guard.GitHubRunnerID {
 			return
 		}
 		record.GitHubRunnerID = 0
@@ -817,60 +877,67 @@ func (s *FileStore) ClearJIT(_ context.Context, key string) error {
 }
 
 func (s *FileStore) MarkProvisioned(_ context.Context, key, instanceID string, runnerID int64, runnerName string) error {
-	// MarkJITCreated was the only writer of s.runnerKeys, so an identity first
-	// seen here stayed unindexed until a restart rebuilt it. indexed captures
-	// whether this call established one worth recording.
-	var indexed *Record
-	err := s.update(key, func(record *Record) {
-		if record.Status == StatusDeleted || record.Status == StatusOrphaned {
-			return
-		}
-		record.InstanceID = instanceID
-		if record.DeletionAcceptedID != instanceID {
-			record.DeletionAcceptedID = ""
-		}
-		record.DropletID = 0
-		record.GitHubRunnerID = runnerID
-		record.GitHubRunnerOwned = true
-		record.RunnerName = runnerName
-		record.LastError = ""
-		record.ThrottleFailures = 0
-		if record.ProvisionedAt.IsZero() {
-			record.ProvisionedAt = time.Now().UTC()
-		}
-		record.ClaimedWork = ""
-		record.MissingSince = time.Time{}
-		record.MissingChecks = 0
-		if record.Status != StatusCompleted {
-			record.Status = StatusProvisioned
-		}
-		if runnerID != 0 {
-			snapshot := clone(*record)
-			indexed = &snapshot
-		}
-	})
-	if err != nil || indexed == nil {
-		return err
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	identity := runnerIdentityKey(indexed.Owner, indexed.Repository, indexed.GitHubRunnerID)
-	if key != completionMarkerKey(indexed.Owner, indexed.Repository, indexed.GitHubRunnerID) {
-		s.runnerKeys[identity] = key
+	record, ok := s.records[key]
+	if !ok {
+		return fmt.Errorf("state record %q not found", key)
+	}
+	if record.Status == StatusDeleted || record.Status == StatusOrphaned {
+		return nil
+	}
+	before := clone(record)
+	now := time.Now().UTC()
+	record.InstanceID = instanceID
+	if record.DeletionAcceptedID != instanceID {
+		record.DeletionAcceptedID = ""
+	}
+	record.DropletID = 0
+	record.GitHubRunnerID = runnerID
+	record.GitHubRunnerOwned = true
+	record.RunnerName = runnerName
+	record.LastError = ""
+	record.ConfirmAttempts = 0
+	record.ThrottleFailures = 0
+	if record.ProvisionedAt.IsZero() {
+		record.ProvisionedAt = now
+	}
+	record.ClaimedWork = ""
+	record.MissingSince = time.Time{}
+	record.MissingChecks = 0
+	if record.Status != StatusCompleted {
+		record.Status = StatusProvisioned
+		record.DeferDeletion = false
+	}
+	record.UpdatedAt = now
+	s.records[key] = record
+	s.markDirty(key)
+	if err := s.saveLocked(); err != nil {
+		s.records[key] = before
+		return err
+	}
+	if before.GitHubRunnerID != 0 && before.GitHubRunnerID != runnerID {
+		s.evictRunnerKeyLocked(key, before)
+	}
+	if runnerID != 0 {
+		identity := runnerIdentityKey(record.Owner, record.Repository, runnerID)
+		if key != completionMarkerKey(record.Owner, record.Repository, runnerID) {
+			s.runnerKeys[identity] = key
+		}
 	}
 	return nil
 }
 
 // ObserveRunnerMissing requires repeated observations across a settle window
 // before provider absence is treated as authoritative.
-func (s *FileStore) ObserveRunnerMissing(_ context.Context, key string, now time.Time, settle time.Duration, confirmations int) (bool, error) {
+func (s *FileStore) ObserveRunnerMissing(_ context.Context, key string, guard RunnerGuard, now time.Time, settle time.Duration, confirmations int) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	record, ok := s.records[key]
 	if !ok {
 		return false, fmt.Errorf("state record %q not found", key)
 	}
-	if record.Status != StatusProvisioned {
+	if record.Status != StatusProvisioned || record.ProvisionEpoch != guard.ProvisionEpoch || record.InstanceID != guard.InstanceID {
 		return false, nil
 	}
 	before := clone(record)
@@ -892,14 +959,14 @@ func (s *FileStore) ObserveRunnerMissing(_ context.Context, key string, now time
 
 // ObserveGitHubRunnerMissing debounces GitHub absence independently from
 // provider inventory absence.
-func (s *FileStore) ObserveGitHubRunnerMissing(_ context.Context, key string, now time.Time, settle time.Duration, confirmations int) (bool, error) {
+func (s *FileStore) ObserveGitHubRunnerMissing(_ context.Context, key string, guard RunnerGuard, now time.Time, settle time.Duration, confirmations int) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	record, ok := s.records[key]
 	if !ok {
 		return false, fmt.Errorf("state record %q not found", key)
 	}
-	if record.Status != StatusProvisioned {
+	if record.Status != StatusProvisioned || record.ProvisionEpoch != guard.ProvisionEpoch || record.InstanceID != guard.InstanceID || record.GitHubRunnerID != guard.GitHubRunnerID {
 		return false, nil
 	}
 	before := clone(record)
@@ -919,15 +986,21 @@ func (s *FileStore) ObserveGitHubRunnerMissing(_ context.Context, key string, no
 	return record.GitHubMissingChecks >= confirmations && !record.GitHubMissingSince.Add(settle).After(now), nil
 }
 
-func (s *FileStore) ClearProviderMissing(_ context.Context, key string) error {
+func (s *FileStore) ClearProviderMissing(_ context.Context, key string, guard RunnerGuard) error {
 	return s.update(key, func(record *Record) {
+		if record.ProvisionEpoch != guard.ProvisionEpoch || record.InstanceID != guard.InstanceID {
+			return
+		}
 		record.MissingSince = time.Time{}
 		record.MissingChecks = 0
 	})
 }
 
-func (s *FileStore) ClearGitHubMissing(_ context.Context, key string) error {
+func (s *FileStore) ClearGitHubMissing(_ context.Context, key string, guard RunnerGuard) error {
 	return s.update(key, func(record *Record) {
+		if record.ProvisionEpoch != guard.ProvisionEpoch || record.InstanceID != guard.InstanceID {
+			return
+		}
 		record.GitHubMissingSince = time.Time{}
 		record.GitHubMissingChecks = 0
 	})
@@ -935,60 +1008,65 @@ func (s *FileStore) ClearGitHubMissing(_ context.Context, key string) error {
 
 // RecordRunnerSeen durably records successful GitHub registration and clears a
 // partial sequence of provider misses.
-func (s *FileStore) RecordRunnerSeen(_ context.Context, key string) error {
+func (s *FileStore) RecordRunnerSeen(_ context.Context, key string, guard RunnerGuard) error {
 	return s.update(key, func(record *Record) {
-		if record.Status == StatusProvisioned {
-			if record.RegisteredAt.IsZero() {
-				record.RegisteredAt = time.Now().UTC()
-			}
-			record.ReconciledAt = time.Now().UTC()
-			record.MissingSince = time.Time{}
-			record.MissingChecks = 0
-			record.GitHubMissingSince = time.Time{}
-			record.GitHubMissingChecks = 0
+		if record.Status != StatusProvisioned || record.ProvisionEpoch != guard.ProvisionEpoch || record.InstanceID != guard.InstanceID || record.GitHubRunnerID != guard.GitHubRunnerID {
+			return
 		}
+		if record.RegisteredAt.IsZero() {
+			record.RegisteredAt = time.Now().UTC()
+		}
+		record.ReconciledAt = time.Now().UTC()
+		record.MissingSince = time.Time{}
+		record.MissingChecks = 0
+		record.GitHubMissingSince = time.Time{}
+		record.GitHubMissingChecks = 0
 	})
 }
 
 // ClearRunnerMissing resets provider-liveness debounce state without claiming
 // that GitHub has observed the JIT runner online.
-func (s *FileStore) ClearRunnerMissing(_ context.Context, key string) error {
+func (s *FileStore) ClearRunnerMissing(_ context.Context, key string, guard RunnerGuard) error {
 	return s.update(key, func(record *Record) {
-		if record.Status == StatusProvisioned {
-			record.ReconciledAt = time.Now().UTC()
-			record.MissingSince = time.Time{}
-			record.MissingChecks = 0
-			record.GitHubMissingSince = time.Time{}
-			record.GitHubMissingChecks = 0
-			record.DeleteAttempts = 0
-			record.ReconcileFailures = 0
-			record.ThrottleFailures = 0
-			record.LastError = ""
-			record.NextAttemptAt = time.Time{}
+		if record.Status != StatusProvisioned || record.ProvisionEpoch != guard.ProvisionEpoch || record.InstanceID != guard.InstanceID {
+			return
 		}
+		record.ReconciledAt = time.Now().UTC()
+		record.MissingSince = time.Time{}
+		record.MissingChecks = 0
+		record.GitHubMissingSince = time.Time{}
+		record.GitHubMissingChecks = 0
+		record.DeleteAttempts = 0
+		record.ReconcileFailures = 0
+		record.ThrottleFailures = 0
+		record.LastError = ""
+		record.NextAttemptAt = time.Time{}
 	})
 }
 
 // DeferReconciliation persists reaper backoff. Persistent client-policy
 // failures and consecutive throttles have independent terminal budgets;
 // infrastructure failures remain retryable.
-func (s *FileStore) DeferReconciliation(_ context.Context, key, message string, retryAt time.Time, maxAttempts int, countFailure, countThrottle bool) error {
+func (s *FileStore) DeferReconciliation(_ context.Context, key string, guard RunnerGuard, message string, retryAt time.Time, policy DeferPolicy) error {
 	return s.update(key, func(record *Record) {
 		if record.Status == StatusDeleted || record.Status == StatusOrphaned {
 			return
 		}
-		if countFailure {
+		if record.ProvisionEpoch != guard.ProvisionEpoch || record.InstanceID != guard.InstanceID {
+			return
+		}
+		if policy.CountFailure {
 			record.ReconcileFailures++
-			if record.ReconcileFailures >= maxAttempts {
+			if policy.MaxAttempts > 0 && record.ReconcileFailures >= policy.MaxAttempts {
 				record.Status = StatusOrphaned
 				record.LastError = message
 				record.NextAttemptAt = time.Time{}
 				return
 			}
 		}
-		if countThrottle {
+		if policy.CountThrottle {
 			record.ThrottleFailures++
-			if record.ThrottleFailures >= maxAttempts {
+			if policy.MaxAttempts > 0 && record.ThrottleFailures >= policy.MaxAttempts {
 				record.Status = StatusOrphaned
 				record.LastError = message
 				record.NextAttemptAt = time.Time{}
@@ -1071,9 +1149,12 @@ func (s *FileStore) MarkCompleted(_ context.Context, key string) error {
 
 // ScheduleDeletion re-enables deletion after retry exhaustion. It is used only
 // by TTL reconciliation, which has independently determined the runner is stale.
-func (s *FileStore) ScheduleDeletion(_ context.Context, key string) error {
+func (s *FileStore) ScheduleDeletion(_ context.Context, key string, guard RunnerGuard) error {
 	return s.update(key, func(record *Record) {
 		if record.Status == StatusDeleted || record.Status == StatusOrphaned || record.ClaimedWork != "" {
+			return
+		}
+		if record.ProvisionEpoch != guard.ProvisionEpoch || record.InstanceID != guard.InstanceID {
 			return
 		}
 		record.Status = StatusCompleted
@@ -1092,6 +1173,7 @@ func (s *FileStore) MarkDeletionAccepted(_ context.Context, key, instanceID stri
 	}
 	before := clone(record)
 	record.DeletionAcceptedID = instanceID
+	record.ConfirmAttempts = 0
 	record.UpdatedAt = time.Now().UTC()
 	s.records[key] = record
 	s.markDirty(key)
@@ -1103,8 +1185,9 @@ func (s *FileStore) MarkDeletionAccepted(_ context.Context, key, instanceID stri
 }
 
 // Confirmation is a read-only wait, not another deletion attempt. Keep the
-// instance reserved until authoritative absence, without exhausting retry budget.
-func (s *FileStore) DeferDeletionConfirmation(_ context.Context, key, message string, retryAt time.Time) error {
+// instance reserved until authoritative absence, bounding confirmation retries
+// and total age so stuck provider deletions escalate to StatusOrphaned.
+func (s *FileStore) DeferDeletionConfirmation(_ context.Context, key, message string, retryAt time.Time, policy DeferPolicy) error {
 	return s.update(key, func(record *Record) {
 		if record.Status != StatusDeleting || record.ClaimedWork != WorkDelete || record.DeletionAcceptedID == "" || record.DeletionAcceptedID != record.InstanceID {
 			return
@@ -1112,6 +1195,18 @@ func (s *FileStore) DeferDeletionConfirmation(_ context.Context, key, message st
 		releaseDeleteClaim(record)
 		record.ClaimedWork = ""
 		record.LastError = message
+		record.ConfirmAttempts++
+		baseTime := record.ProvisionedAt
+		if baseTime.IsZero() {
+			baseTime = record.CreatedAt
+		}
+		ageExpired := policy.MaxAge > 0 && !baseTime.IsZero() && time.Now().UTC().Sub(baseTime) >= policy.MaxAge
+		budgetExhausted := policy.MaxAttempts > 0 && record.ConfirmAttempts >= policy.MaxAttempts
+		if budgetExhausted || ageExpired {
+			record.Status = StatusOrphaned
+			record.NextAttemptAt = time.Time{}
+			return
+		}
 		record.NextAttemptAt = retryAt.UTC()
 	})
 }
@@ -1142,6 +1237,8 @@ func (s *FileStore) FinishDeletedRunner(_ context.Context, key string, queued bo
 		record.LastError = ""
 		record.NextAttemptAt = time.Time{}
 		record.RecheckDemand = false
+		record.ReassignedRunID = 0
+		record.ConfirmAttempts = 0
 		if !restore {
 			return
 		}
@@ -1173,16 +1270,44 @@ func (s *FileStore) FinishDeletedRunner(_ context.Context, key string, queued bo
 
 // DeferReassignmentDemand retains original demand after resource cleanup while
 // a GitHub job-status observation is unavailable, without burning delete retries.
-func (s *FileStore) DeferReassignmentDemand(_ context.Context, key, message string, retryAt time.Time) error {
-	return s.update(key, func(record *Record) {
+// Persistent client errors, throttles, and age exhaustion terminate the record
+// as StatusDeleted (resources were already cleaned up) so admission slots are
+// not leaked indefinitely.
+func (s *FileStore) DeferReassignmentDemand(_ context.Context, key, message string, retryAt time.Time, policy DeferPolicy) (bool, error) {
+	terminated := false
+	err := s.update(key, func(record *Record) {
 		if record.ClaimedWork != WorkDelete {
 			return
 		}
 		record.ClaimedWork = ""
 		releaseDeleteClaim(record)
 		record.LastError = message
+		if policy.CountFailure {
+			record.ReconcileFailures++
+		}
+		if policy.CountThrottle {
+			record.ThrottleFailures++
+		} else {
+			record.ThrottleFailures = 0
+		}
+		ageExpired := policy.MaxAge > 0 && !record.CreatedAt.IsZero() && time.Now().UTC().Sub(record.CreatedAt) >= policy.MaxAge
+		budgetExhausted := policy.MaxAttempts > 0 && (record.ReconcileFailures >= policy.MaxAttempts || record.ThrottleFailures >= policy.MaxAttempts)
+		if budgetExhausted || ageExpired {
+			record.Status = StatusDeleted
+			record.RecheckDemand = false
+			record.ReassignedRunID = 0
+			record.DeferDeletion = false
+			record.ConfirmAttempts = 0
+			record.NextAttemptAt = time.Time{}
+			terminated = true
+			return
+		}
 		record.NextAttemptAt = retryAt.UTC()
 	})
+	if err != nil {
+		return false, err
+	}
+	return terminated, nil
 }
 
 // BeginCleanupAttempt atomically consumes retry budget for reaper-owned cleanup.
@@ -1309,8 +1434,10 @@ func (s *FileStore) KnownInstanceIDs(_ context.Context) (map[string]struct{}, er
 
 // ReleaseSweptOrphans clears admission-bearing instance identities only after
 // a successful provider sweep has confirmed every old untracked resource is
-// absent or deleted.
-func (s *FileStore) ReleaseSweptOrphans(_ context.Context, provider string, cutoff time.Time) (int, error) {
+// absent or deleted. Instances protected by knownInstances, orphans created
+// after the pre-sweep snapshot, and ownership-mismatch orphans (whose mutable
+// controller tags may be missing) are never released blindly.
+func (s *FileStore) ReleaseSweptOrphans(_ context.Context, provider string, cutoff time.Time, knownInstances map[string]struct{}, eligibleOrphans map[string]string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	before := make(map[string]Record)
@@ -1321,6 +1448,18 @@ func (s *FileStore) ReleaseSweptOrphans(_ context.Context, provider string, cuto
 		}
 		if record.Status != StatusOrphaned || record.Provider != provider || record.InstanceID == "" || !instanceCreatedAt.Before(cutoff) {
 			continue
+		}
+		if isOwnershipMismatchError(record.LastError) {
+			continue
+		}
+		if _, protected := knownInstances[record.InstanceID]; protected {
+			continue
+		}
+		if eligibleOrphans != nil {
+			expectedID, ok := eligibleOrphans[key]
+			if !ok || expectedID != record.InstanceID {
+				continue
+			}
 		}
 		before[key] = clone(record)
 		record.InstanceID = ""
@@ -1340,11 +1479,16 @@ func (s *FileStore) ReleaseSweptOrphans(_ context.Context, provider string, cuto
 	return len(before), nil
 }
 
+func isOwnershipMismatchError(message string) bool {
+	return strings.Contains(strings.ToLower(message), "ownership mismatch")
+}
+
 // RequeueMissingRunner clears stale provider and JIT identity after liveness
 // reconciliation proves the instance no longer exists.
-func (s *FileStore) RequeueMissingRunner(_ context.Context, key string, maxAttempts int) error {
-	return s.update(key, func(record *Record) {
-		if record.Status != StatusProvisioned {
+func (s *FileStore) RequeueMissingRunner(_ context.Context, key string, guard RunnerGuard, maxAttempts int) (bool, error) {
+	requeued := false
+	err := s.update(key, func(record *Record) {
+		if record.Status != StatusProvisioned || record.ProvisionEpoch != guard.ProvisionEpoch || record.InstanceID != guard.InstanceID || record.GitHubRunnerID != guard.GitHubRunnerID {
 			return
 		}
 		record.InstanceID = ""
@@ -1356,6 +1500,8 @@ func (s *FileStore) RequeueMissingRunner(_ context.Context, key string, maxAttem
 		record.GitHubRunnerID = 0
 		record.GitHubRunnerOwned = false
 		record.RunnerName = ""
+		record.ReassignedRunID = 0
+		record.ConfirmAttempts = 0
 		record.MissingSince = time.Time{}
 		record.MissingChecks = 0
 		record.GitHubMissingSince = time.Time{}
@@ -1367,7 +1513,12 @@ func (s *FileStore) RequeueMissingRunner(_ context.Context, key string, maxAttem
 		}
 		record.Status = StatusPending
 		record.NextAttemptAt = time.Time{}
+		requeued = true
 	})
+	if err != nil {
+		return false, err
+	}
+	return requeued, nil
 }
 
 func (s *FileStore) ListExpired(_ context.Context, cutoff time.Time) ([]Record, error) {
@@ -1421,6 +1572,9 @@ func (s *FileStore) PruneDeleted(_ context.Context) (int, error) {
 		s.keysDirty = true
 		return 0, err
 	}
+	for key, record := range removed {
+		s.evictRunnerKeyLocked(key, record)
+	}
 	return len(removed), nil
 }
 
@@ -1461,6 +1615,9 @@ func (s *FileStore) update(key string, mutate func(*Record)) error {
 	}
 	before := clone(record)
 	mutate(&record)
+	if reflect.DeepEqual(record, before) {
+		return nil
+	}
 	record.UpdatedAt = time.Now().UTC()
 	s.records[key] = record
 	s.markDirty(key)
@@ -1468,7 +1625,21 @@ func (s *FileStore) update(key string, mutate func(*Record)) error {
 		s.records[key] = before
 		return err
 	}
+	if before.GitHubRunnerID != 0 &&
+		(record.Status == StatusDeleted || !record.GitHubRunnerOwned || record.GitHubRunnerID != before.GitHubRunnerID) {
+		s.evictRunnerKeyLocked(key, before)
+	}
 	return nil
+}
+
+func (s *FileStore) evictRunnerKeyLocked(key string, record Record) {
+	if record.GitHubRunnerID == 0 {
+		return
+	}
+	identity := runnerIdentityKey(record.Owner, record.Repository, record.GitHubRunnerID)
+	if existingKey, ok := s.runnerKeys[identity]; ok && existingKey == key {
+		delete(s.runnerKeys, identity)
+	}
 }
 
 func (s *FileStore) saveLocked() error {

@@ -289,7 +289,7 @@ func (c *Client) DeleteRunner(ctx context.Context, instanceID, jobKey string) er
 		}
 		return fmt.Errorf("delete owned GCP runner %s: %w", instanceID, err)
 	}
-	if err := op.Wait(ctx); err != nil && status.Code(err) != codes.NotFound {
+	if err := op.Wait(ctx); err != nil && !isNotFound(err) {
 		return fmt.Errorf("wait for GCP runner deletion: %w", err)
 	}
 	return nil
@@ -377,7 +377,7 @@ func (c *Client) SweepOrphanedRunners(ctx context.Context, known map[string]stru
 			}
 			return deleted, fmt.Errorf("delete orphaned controller GCP instance %s: %w", name, err)
 		}
-		if err := op.Wait(ctx); err != nil && status.Code(err) != codes.NotFound {
+		if err := op.Wait(ctx); err != nil && !isNotFound(err) {
 			return deleted, fmt.Errorf("wait for orphaned GCP instance deletion: %w", err)
 		}
 		deleted++
