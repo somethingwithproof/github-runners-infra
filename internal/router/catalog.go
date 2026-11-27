@@ -240,7 +240,7 @@ func normalizeRateKey(raw string) (string, error) {
 		isSpot = true
 		size = strings.TrimSpace(rest[:len(rest)-len(":spot")])
 	}
-	if !compute.ValidInstanceSize(size) && !(provider == "oci" && compute.ValidSizeSpec(size)) {
+	if !compute.ValidInstanceSize(size) && (provider != "oci" || !compute.ValidSizeSpec(size)) {
 		return "", fmt.Errorf("invalid instance size %q in hourly rate override %q", size, raw)
 	}
 	if isSpot {

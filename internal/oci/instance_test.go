@@ -193,7 +193,7 @@ func TestOCISignatureFlexPreemptibleLifecycleAndPagination(t *testing.T) {
 		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, instancesBasePath):
 			id := strings.TrimPrefix(r.URL.Path, instancesBasePath)
 			if r.Header.Get("If-Match") != "current" {
-				http.Error(w, "stale", 412)
+				http.Error(w, "stale", http.StatusPreconditionFailed)
 				return
 			}
 			deletedPaths = append(deletedPaths, r.URL.RequestURI())
@@ -390,7 +390,7 @@ func TestOCISweepPaginationOwnershipAndAmbiguousRecovery(t *testing.T) {
 			}
 			if r.Method == http.MethodDelete {
 				if r.Header.Get("If-Match") != strings.TrimPrefix(r.URL.Path, instancesBasePath) {
-					http.Error(w, "stale", 412)
+					http.Error(w, "stale", http.StatusPreconditionFailed)
 					return
 				}
 				mu.Lock()
