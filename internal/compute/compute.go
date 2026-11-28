@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"text/template"
 	"time"
 )
@@ -54,15 +55,21 @@ func ValidControllerID(value string) bool {
 // RunnerParams contains the non-secret values rendered into runner user data
 // and per-job provisioning overrides.
 type RunnerParams struct {
-	JobKey                 string
-	ProvisionEpoch         int
-	RunnerName             string
-	RunnerJITConfig        string
-	RunnerVersion          string
-	RunnerSHA256           string
-	ChefInstallerSHA256    string
-	InstanceSize           string
-	DeadmanShutdownMinutes int
+	AuthorizeLaunch         func(provider, size string, spot bool) error
+	JobKey                  string
+	ProvisionEpoch          int
+	RunnerName              string
+	RunnerJITConfig         string
+	RunnerRegistrationToken string
+	RunnerRepoURL           string
+	RegistrationLabels      []string
+	RunnerVersion           string
+	RunnerSHA256            string
+	ChefInstallerSHA256     string
+	InstanceSize            string
+	DeadmanShutdownMinutes  int
+	PrebakedImage           bool
+	EgressAllowlist         []string
 }
 
 // RunnerInstance is a provider-neutral resource identity.
@@ -71,6 +78,11 @@ type RunnerInstance struct {
 	Name string
 }
 
+var safeRepoURLRegex = regexp.MustCompile(`^https://github\.com/[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}/(\.github|[a-zA-Z0-9][a-zA-Z0-9._-]{0,99})$`)
+
+// LabelList returns the comma-separated labels expected by config.sh.
+func (p RunnerParams) LabelList() string { return strings.Join(p.RegistrationLabels, ",") }
+
 // RenderCloudInit renders the shared, provider-neutral cloud-init template.
 func RenderCloudInit(tmpl *template.Template, params RunnerParams) (string, error) {
 	if tmpl == nil {
@@ -78,6 +90,19 @@ func RenderCloudInit(tmpl *template.Template, params RunnerParams) (string, erro
 	}
 	if params.DeadmanShutdownMinutes < 0 || params.DeadmanShutdownMinutes > MaxDeadmanShutdownMinutes {
 		return "", fmt.Errorf("dead-man shutdown minutes %d must be between 0 and %d", params.DeadmanShutdownMinutes, MaxDeadmanShutdownMinutes)
+	}
+	if params.RunnerRepoURL != "" && !safeRepoURLRegex.MatchString(params.RunnerRepoURL) {
+		return "", fmt.Errorf("invalid runner repository URL %q", params.RunnerRepoURL)
+	}
+	for _, label := range params.RegistrationLabels {
+		if !ValidLabel(label) {
+			return "", fmt.Errorf("invalid registration label %q", label)
+		}
+	}
+	for _, entry := range params.EgressAllowlist {
+		if !ValidEgressEntry(entry) {
+			return "", fmt.Errorf("invalid egress allowlist entry %q", entry)
+		}
 	}
 	var userData bytes.Buffer
 	if err := tmpl.Execute(&userData, params); err != nil {

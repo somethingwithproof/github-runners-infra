@@ -552,12 +552,15 @@ func setValidRuntimeEnvironment(t *testing.T) {
 	// in the developer's or runner's environment would change what the tests
 	// observe. Clear them so every test starts from the documented defaults.
 	for _, key := range []string{
-		"AZURE_ADMIN_USERNAME", "CANCELLED_RUNNER_TTL", "CLOUD_INIT_PATH", "COMPUTE_PROVIDER",
-		"DELETED_RECORD_RETENTION", "DO_IMAGE", "DO_LABEL_SIZE_MAP", "DO_REGION", "DO_SIZE",
-		"LABEL_SIZE_MAP", "LINODE_API_URL", "LINODE_FIREWALL_ID", "LINODE_IMAGE",
-		"LINODE_INSTANCE_TYPE", "LINODE_REGION", "LINODE_SSH_PUBLIC_KEY_FILE", "LINODE_VPC_SUBNET_ID",
-		"LISTEN_ADDR", "LIVENESS_CONFIRMATIONS", "LIVENESS_SETTLE_WINDOW", "MAX_ATTEMPTS",
-		"MAX_LIVE_RUNNERS", "MAX_RUNNER_AGE", "REQUIRED_LABEL", "RUNNER_DEADMAN_MINUTES",
+		"AZURE_ADMIN_USERNAME", "BUDGET_DAILY_USD", "BUDGET_MONTHLY_USD", "BUDGET_REPO_DAILY_USD",
+		"BUDGET_STATE_FILE", "CANCELLED_RUNNER_TTL", "CLOUD_INIT_PATH", "CLOUD_PROVIDERS",
+		"COMPUTE_PROVIDER", "DELETED_RECORD_RETENTION", "DO_IMAGE", "DO_LABEL_SIZE_MAP",
+		"DO_REGION", "DO_SIZE", "GITHUB_USE_JIT_CONFIG", "LABEL_SIZE_MAP", "LINODE_API_URL",
+		"LINODE_FIREWALL_ID", "LINODE_IMAGE", "LINODE_INSTANCE_TYPE", "LINODE_REGION",
+		"LINODE_SSH_PUBLIC_KEY_FILE", "LINODE_VPC_SUBNET_ID", "LISTEN_ADDR",
+		"LIVENESS_CONFIRMATIONS", "LIVENESS_SETTLE_WINDOW", "MAX_ATTEMPTS", "MAX_LIVE_RUNNERS",
+		"MAX_RUNNER_AGE", "REQUIRED_LABEL", "ROUTER_HOURLY_RATES", "ROUTER_STRATEGY",
+		"RUNNER_DEADMAN_MINUTES", "RUNNER_EGRESS_ALLOWLIST", "RUNNER_PREBAKED",
 		"RUNNER_REGISTRATION_TIMEOUT", "STATE_FILE", "VULTR_API_URL", "VULTR_FIREWALL_GROUP_ID",
 		"VULTR_OS_ID", "VULTR_PLAN", "VULTR_REGION", "VULTR_SNAPSHOT_ID", "VULTR_SSH_KEY_IDS",
 		"VULTR_VPC_ID", "WORKER_COUNT",
@@ -621,4 +624,39 @@ func TestLoadRuntimeConfigLabelSizeMapAndDeadman(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestNewComputeClientMultiCloudRouterAndBudgetRuntimeConfig(t *testing.T) {
+	t.Setenv("CONTROLLER_ID", "controller-1")
+	t.Setenv("CLOUD_INIT_PATH", writeRunnerTemplate(t))
+	t.Setenv("CLOUD_PROVIDERS", "vultr,linode")
+	t.Setenv("ROUTER_STRATEGY", "cheapest")
+	t.Setenv("ROUTER_HOURLY_RATES", "vultr:vc2-4c-8gb=0.05")
+	t.Setenv("VULTR_API_KEY", "test-vultr-key")
+	t.Setenv("LINODE_TOKEN", "test-linode-token")
+
+	client, closeFn, err := newComputeClient(context.Background(), context.Background())
+	if err != nil {
+		t.Fatalf("newComputeClient(CLOUD_PROVIDERS) error = %v", err)
+	}
+	defer closeFn()
+	if client.Provider() != "multi" {
+		t.Fatalf("provider = %q, want multi", client.Provider())
+	}
+
+	setValidRuntimeEnvironment(t)
+	t.Setenv("BUDGET_DAILY_USD", "25.5")
+	t.Setenv("BUDGET_MONTHLY_USD", "500")
+	t.Setenv("BUDGET_REPO_DAILY_USD", "10")
+	t.Setenv("GITHUB_USE_JIT_CONFIG", "true")
+	t.Setenv("RUNNER_PREBAKED", "true")
+	t.Setenv("RUNNER_EGRESS_ALLOWLIST", "api.github.com,140.82.112.0/20")
+
+	cfg, err := loadRuntimeConfig()
+	if err != nil {
+		t.Fatalf("loadRuntimeConfig error = %v", err)
+	}
+	if cfg.budgetDailyUSD != 25.5 || cfg.budgetMonthlyUSD != 500 || cfg.budgetRepoDailyUSD != 10 || !cfg.useJITConfig || !cfg.prebakedImage || len(cfg.egressAllowlist) != 2 {
+		t.Fatalf("unexpected runtime config: %#v", cfg)
+	}
 }

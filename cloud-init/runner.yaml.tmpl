@@ -11,6 +11,7 @@ users:
     shell: /bin/bash
     groups: docker
 
+{{- if not .PrebakedImage}}
 apt:
   primary:
     - arches: [default]
@@ -32,6 +33,7 @@ packages:
   - libyaml-dev
   - libssl-dev
   - zlib1g-dev
+{{- end}}
 
 runcmd:
   - |
@@ -53,7 +55,40 @@ runcmd:
     systemctl enable --now runner-deadman-shutdown.timer
     {{- end}}
     systemctl enable --now docker
+    {{- if .EgressAllowlist}}
 
+    # The administrator-controlled network firewall enforces workload isolation.
+    # This optional host policy restricts ordinary host processes on both IP families.
+    for filter in iptables ip6tables; do
+      "$filter" -N RUNNER_HTTPS 2>/dev/null || "$filter" -F RUNNER_HTTPS
+      "$filter" -A RUNNER_HTTPS -o lo -j ACCEPT
+      "$filter" -A RUNNER_HTTPS -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+      "$filter" -A RUNNER_HTTPS -p udp --dport 53 -j ACCEPT
+      "$filter" -A RUNNER_HTTPS -p tcp --dport 53 -j ACCEPT
+    done
+    # IPv6 neighbor discovery is required on the link.
+    for kind in neighbor-solicitation neighbor-advertisement router-solicitation; do
+      ip6tables -A RUNNER_HTTPS -p ipv6-icmp --icmpv6-type "$kind" -m hl --hl-eq 255 -j ACCEPT
+    done
+    {{- range .EgressAllowlist}}
+    dest='{{.}}'
+    case "$dest" in
+      *:*) ip6tables -A RUNNER_HTTPS -p tcp --dport 443 -d "$dest" -j ACCEPT ;;
+      */*) iptables -A RUNNER_HTTPS -p tcp --dport 443 -d "$dest" -j ACCEPT ;;
+      *)
+        for ip in $(getent ahosts "$dest" | awk '{print $1}' | sort -u); do
+          case "$ip" in *:*) filter=ip6tables ;; *) filter=iptables ;; esac
+          "$filter" -A RUNNER_HTTPS -p tcp --dport 443 -d "$ip" -j ACCEPT
+        done ;;
+    esac
+    {{- end}}
+    for filter in iptables ip6tables; do
+      "$filter" -A RUNNER_HTTPS -j REJECT
+      "$filter" -C OUTPUT -j RUNNER_HTTPS 2>/dev/null || "$filter" -I OUTPUT 1 -j RUNNER_HTTPS
+    done
+    {{- end}}
+
+    {{- if not .PrebakedImage}}
     # Template sources and controller validation restrict these single-quoted
     # values to URLs, hex digests, versions, and base64 without apostrophes.
     # Revisit shell quoting before changing those sources or validators.
@@ -85,17 +120,38 @@ runcmd:
     tar --extract --gzip --file "$RUNNER_TARBALL"
     shred --remove "$RUNNER_TARBALL"
     chown -R runner:runner /home/runner/actions-runner
+    {{- else}}
+    install -d -o runner -g runner /opt/hostedtoolcache
+    cd /home/runner/actions-runner
+    {{- end}}
 
+    RUNNER_EXIT=0
+    {{- if .RunnerJITConfig}}
     install -m 0600 -o runner -g runner /dev/null /home/runner/.jit-config
     printf '%s' '{{.RunnerJITConfig}}' > /home/runner/.jit-config
     JIT_CONFIG=$(cat /home/runner/.jit-config)
     shred --remove /home/runner/.jit-config
 
-    RUNNER_EXIT=0
     runuser -u runner -- ./run.sh --jitconfig "$JIT_CONFIG" || RUNNER_EXIT=$?
     unset JIT_CONFIG
+    {{- else if .RunnerRegistrationToken}}
+    install -m 0600 -o runner -g runner /dev/null /home/runner/.reg-token
+    printf '%s' '{{.RunnerRegistrationToken}}' > /home/runner/.reg-token
+    REG_TOKEN=$(cat /home/runner/.reg-token)
+    shred --remove /home/runner/.reg-token
 
-    # The trusted controller deletes the droplet after the workflow_job
+    runuser -u runner -- ./config.sh --ephemeral --unattended \
+      --url '{{.RunnerRepoURL}}' \
+      --name '{{.RunnerName}}' \
+      {{if .RegistrationLabels}}--labels '{{.LabelList}}' {{end}}--token "$REG_TOKEN"
+    unset REG_TOKEN
+    runuser -u runner -- ./run.sh || RUNNER_EXIT=$?
+    {{- else}}
+    echo "ERROR: neither JIT config nor registration token was provided" >&2
+    RUNNER_EXIT=1
+    {{- end}}
+
+    # The trusted controller deletes the instance after the workflow_job
     # completion event. Power off immediately to stop workload execution while
     # waiting for that control-plane deletion or TTL reconciliation.
     shutdown --poweroff now
