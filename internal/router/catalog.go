@@ -67,7 +67,55 @@ var defaultProviderFallbackRates = map[string]float64{
 	"aws":          0.205,
 }
 
+// DefaultSpotDiscountFactors maps spot-capable providers to representative
+// spot-to-on-demand cost ratios used when estimating hourly spend and ranking
+// cheapest backends.
+var DefaultSpotDiscountFactors = map[string]float64{
+	"aws":   0.35,
+	"gcp":   0.30,
+	"azure": 0.35,
+}
+
 const unknownProviderFallbackRate = 0.250
+
+// ProviderSupportsSpot reports whether provider offers spot/preemptible VMs.
+func ProviderSupportsSpot(provider string) bool {
+	_, ok := DefaultSpotDiscountFactors[strings.ToLower(strings.TrimSpace(provider))]
+	return ok
+}
+
+// SpotDiscountFactor returns the spot-to-on-demand price multiplier for
+// provider (1.0 when provider does not offer spot instances).
+func SpotDiscountFactor(provider string) float64 {
+	if factor, ok := DefaultSpotDiscountFactors[strings.ToLower(strings.TrimSpace(provider))]; ok && factor > 0 {
+		return factor
+	}
+	return 1.0
+}
+
+// HourlyRateForMode returns the USD/hour estimate for (provider, size) in
+// either on-demand or spot mode. Explicit ":spot" overrides take precedence
+// when spot is true; otherwise the on-demand rate is multiplied by
+// SpotDiscountFactor(provider).
+func HourlyRateForMode(provider, size string, spot bool, overrides map[string]float64) float64 {
+	if !spot {
+		return HourlyRate(provider, size, overrides)
+	}
+	p := strings.ToLower(strings.TrimSpace(provider))
+	s := strings.TrimSpace(size)
+	if overrides != nil {
+		if rate, ok := overrides[p+":"+s+":spot"]; ok {
+			return rate
+		}
+		if rate, ok := overrides[p+":"+strings.ToLower(s)+":spot"]; ok {
+			return rate
+		}
+		if rate, ok := overrides[p+":spot"]; ok {
+			return rate
+		}
+	}
+	return HourlyRate(provider, size, overrides) * SpotDiscountFactor(p)
+}
 
 // HourlyRate returns the USD/hour estimate for (provider, size), honoring
 // explicit overrides first, then DefaultHourlyRates, then provider defaults.
@@ -133,17 +181,28 @@ func ParseHourlyRateOverrides(raw string) (map[string]float64, error) {
 
 func normalizeRateKey(raw string) (string, error) {
 	trimmed := strings.TrimSpace(raw)
-	provider, size, hasSize := strings.Cut(trimmed, ":")
+	provider, rest, hasRest := strings.Cut(trimmed, ":")
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	if !compute.ValidLabel(provider) {
 		return "", fmt.Errorf("invalid provider %q in hourly rate override", raw)
 	}
-	if !hasSize {
+	if !hasRest {
 		return provider, nil
 	}
+	rest = strings.TrimSpace(rest)
+	if strings.EqualFold(rest, "spot") {
+		return provider + ":spot", nil
+	}
+	size, suffix, hasSuffix := strings.Cut(rest, ":")
 	size = strings.TrimSpace(size)
 	if !compute.ValidInstanceSize(size) {
 		return "", fmt.Errorf("invalid instance size %q in hourly rate override %q", size, raw)
 	}
-	return provider + ":" + size, nil
+	if !hasSuffix {
+		return provider + ":" + size, nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(suffix), "spot") {
+		return "", fmt.Errorf("invalid rate suffix %q in hourly rate override %q", suffix, raw)
+	}
+	return provider + ":" + size + ":spot", nil
 }

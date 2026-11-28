@@ -66,6 +66,9 @@ runcmd:
       "$filter" -A RUNNER_HTTPS -p udp --dport 53 -j ACCEPT
       "$filter" -A RUNNER_HTTPS -p tcp --dport 53 -j ACCEPT
     done
+    {{- if .SpotActive}}
+    iptables -A RUNNER_HTTPS -p tcp --dport 80 -d 169.254.169.254 -m owner --uid-owner 0 -j ACCEPT
+    {{- end}}
     # IPv6 neighbor discovery is required on the link.
     for kind in neighbor-solicitation neighbor-advertisement router-solicitation; do
       ip6tables -A RUNNER_HTTPS -p ipv6-icmp --icmpv6-type "$kind" -m hl --hl-eq 255 -j ACCEPT
@@ -125,6 +128,49 @@ runcmd:
     cd /home/runner/actions-runner
     {{- end}}
 
+    {{- if .SpotActive}}
+    # Secret-free cloud metadata preemption watcher for spot/preemptible VMs.
+    # Polls AWS IMDSv2 (2-min notice), GCP (30s notice), and Azure Scheduled
+    # Events (30s notice), sending SIGTERM to Runner.Listener so the runner
+    # exits cleanly and deregisters before host termination.
+    spot_preemption_detected() {
+      AWS_TOKEN=$(curl -fsS --max-time 2 -X PUT \
+        -H "X-aws-ec2-metadata-token-ttl-seconds: 60" \
+        http://169.254.169.254/latest/api/token 2>/dev/null || true)
+      if [ -n "$AWS_TOKEN" ]; then
+        if curl -fsS --max-time 2 -H "X-aws-ec2-metadata-token: $AWS_TOKEN" \
+          http://169.254.169.254/latest/meta-data/spot/instance-action >/dev/null 2>&1; then
+          return 0
+        fi
+        return 1
+      fi
+      GCP_PREEMPT=$(curl -fsS --max-time 2 -H "Metadata-Flavor: Google" \
+        http://169.254.169.254/computeMetadata/v1/instance/preempted 2>/dev/null || true)
+      if [ "$GCP_PREEMPT" = "TRUE" ]; then
+        return 0
+      fi
+      AZURE_EVENTS=$(curl -fsS --max-time 2 -H "Metadata: true" \
+        "http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01" 2>/dev/null || true)
+      if printf '%s' "$AZURE_EVENTS" | grep -q '"EventType"[[:space:]]*:[[:space:]]*"Preempt"'; then
+        return 0
+      fi
+      return 1
+    }
+    (
+      while true; do
+        if spot_preemption_detected; then
+          logger -t runner-preemption "Spot preemption notice detected; sending SIGTERM to Runner.Listener" 2>/dev/null || true
+          until pkill -TERM -x Runner.Listener 2>/dev/null; do
+            sleep 5
+          done
+          break
+        fi
+        sleep 5
+      done
+    ) &
+    PREEMPT_WATCH_PID=$!
+    {{- end}}
+
     RUNNER_EXIT=0
     {{- if .RunnerJITConfig}}
     install -m 0600 -o runner -g runner /dev/null /home/runner/.jit-config
@@ -149,6 +195,9 @@ runcmd:
     {{- else}}
     echo "ERROR: neither JIT config nor registration token was provided" >&2
     RUNNER_EXIT=1
+    {{- end}}
+    {{- if .SpotActive}}
+    kill "$PREEMPT_WATCH_PID" 2>/dev/null || true
     {{- end}}
 
     # The trusted controller deletes the instance after the workflow_job

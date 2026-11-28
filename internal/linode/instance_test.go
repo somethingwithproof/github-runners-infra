@@ -353,6 +353,25 @@ func TestLinodeAmbiguousCreateAndOwnershipGuards(t *testing.T) {
 	}
 }
 
+func TestLinodeRejectsSpotConfigAndRequest(t *testing.T) {
+	if _, err := NewClient(Config{
+		Token: "tok", ControllerID: "primary", CloudInitPath: writeLinodeTemplate(t, "#cloud-config\n"), Spot: true,
+	}); !compute.IsSpotUnsupported(err) {
+		t.Fatalf("NewClient(Spot=true) error = %v, want ErrSpotUnsupported", err)
+	}
+	client, err := NewClient(Config{
+		Token: "tok", ControllerID: "primary", CloudInitPath: writeLinodeTemplate(t, "#cloud-config\n"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.CreateRunner(context.Background(), compute.RunnerParams{
+		JobKey: "org/repo:spot", Spot: compute.BoolPtr(true),
+	}); !compute.IsSpotUnsupported(err) {
+		t.Fatalf("CreateRunner(Spot=true) error = %v, want ErrSpotUnsupported", err)
+	}
+}
+
 func TestFirewallWithoutSubnetUsesLegacyInterfaces(t *testing.T) {
 	c := Client{firewallID: 55}
 	req := c.buildCreateRequest("runner", "g6-standard-4", "org/repo:1", "fixture", "")

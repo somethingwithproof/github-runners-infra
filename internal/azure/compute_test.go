@@ -7,6 +7,12 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/fake"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 	"text/template"
 	"time"
@@ -31,15 +37,18 @@ func (f fakeNICCreateOperation) Wait(context.Context) (armnetwork.Interface, err
 }
 
 type fakeVMs struct {
-	vm        armcompute.VirtualMachine
-	createdVM armcompute.VirtualMachine
-	getErr    error
-	createErr error
-	createOp  operation
-	deleteErr error
-	deleteOp  operation
-	vms       []*armcompute.VirtualMachine
-	deletes   int
+	vm         armcompute.VirtualMachine
+	createdVM  armcompute.VirtualMachine
+	createdVMs []armcompute.VirtualMachine
+	getErr     error
+	createErr  error
+	createErrs []error
+	createOp   operation
+	createOps  []operation
+	deleteErr  error
+	deleteOp   operation
+	vms        []*armcompute.VirtualMachine
+	deletes    int
 }
 
 func (f *fakeVMs) Get(context.Context, string, string) (armcompute.VirtualMachine, error) {
@@ -52,6 +61,19 @@ func (f *fakeVMs) List(context.Context, string) ([]*armcompute.VirtualMachine, e
 
 func (f *fakeVMs) CreateOrUpdate(_ context.Context, _, _ string, vm armcompute.VirtualMachine) (operation, error) {
 	f.createdVM = vm
+	f.createdVMs = append(f.createdVMs, vm)
+	if len(f.createErrs) > 0 {
+		err := f.createErrs[0]
+		f.createErrs = f.createErrs[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(f.createOps) > 0 {
+		op := f.createOps[0]
+		f.createOps = f.createOps[1:]
+		return op, nil
+	}
 	return f.createOp, f.createErr
 }
 
@@ -296,5 +318,111 @@ func TestCreateRunnerAppliesVMSizeOverride(t *testing.T) {
 		JobKey: "org/repo:89", RunnerJITConfig: "jit", InstanceSize: "bad size",
 	}); err == nil {
 		t.Fatal("CreateRunner accepted invalid Azure VM size override")
+	}
+}
+
+func TestAzureSpotFallbackReusesNIC(t *testing.T) {
+	nicID := "/subscriptions/test/nics/runner"
+	nics := &fakeNICs{
+		getErr:   notFoundError(),
+		createOp: fakeNICCreateOperation{nic: armnetwork.Interface{ID: &nicID}},
+		deleteOp: fakeOperation{},
+	}
+	vms := &fakeVMs{
+		getErr: notFoundError(),
+		createErrs: []error{
+			&azcore.ResponseError{StatusCode: 409, ErrorCode: "SkuNotAvailable"},
+			nil,
+		},
+		createOps: []operation{fakeOperation{}},
+	}
+	client := testAzureClient(vms, nics)
+	client.spot = true
+	client.spotFallbackOnDemand = true
+	inst, err := client.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:az-fb", RunnerJITConfig: "jit"})
+	if err != nil || inst == nil {
+		t.Fatalf("CreateRunner fallback = %#v, %v", inst, err)
+	}
+	if len(vms.createdVMs) != 2 {
+		t.Fatalf("VM create calls = %d, want 2", len(vms.createdVMs))
+	}
+	if vms.createdVMs[0].Properties.Priority == nil || *vms.createdVMs[0].Properties.Priority != armcompute.VirtualMachinePriorityTypesSpot {
+		t.Fatal("first attempt did not request Spot")
+	}
+	if vms.createdVMs[1].Properties.Priority != nil {
+		t.Fatal("on-demand fallback still requested Spot priority")
+	}
+	if nics.deleteCalls != 0 {
+		t.Fatalf("NIC unexpectedly deleted during successful fallback: %d", nics.deleteCalls)
+	}
+}
+
+func TestAzureAllocationFailureCleansNIC(t *testing.T) {
+	nicID := "/subscriptions/test/nics/runner"
+	nics := &fakeNICs{
+		getErr:   notFoundError(),
+		createOp: fakeNICCreateOperation{nic: armnetwork.Interface{ID: &nicID}},
+		deleteOp: fakeOperation{},
+	}
+	vms := &fakeVMs{
+		getErr:    notFoundError(),
+		createErr: &azcore.ResponseError{StatusCode: 409, ErrorCode: "AllocationFailed"},
+	}
+	client := testAzureClient(vms, nics)
+	client.spot = true
+	_, err := client.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:az-cap"})
+	if !compute.IsCapacityError(err) || nics.deleteCalls != 1 {
+		t.Fatalf("error=%v (isCap=%v), nicDeletes=%d", err, compute.IsCapacityError(err), nics.deleteCalls)
+	}
+}
+
+func TestAzureEvictedVMIsAbsent(t *testing.T) {
+	deallocated := "PowerState/deallocated"
+	name := resourceName("org/repo:az-evict")
+	vms := &fakeVMs{
+		vm: armcompute.VirtualMachine{
+			Name: &name,
+			Tags: ownershipTags("primary", "org/repo:az-evict"),
+			Properties: &armcompute.VirtualMachineProperties{
+				InstanceView: &armcompute.VirtualMachineInstanceView{
+					Statuses: []*armcompute.InstanceViewStatus{{Code: &deallocated}},
+				},
+			},
+		},
+	}
+	client := testAzureClient(vms, &fakeNICs{})
+	if _, found, err := client.FindRunner(context.Background(), "org/repo:az-evict"); err != nil || found {
+		t.Fatalf("FindRunner(deallocated) = found=%v err=%v, want absent", found, err)
+	}
+	if absent, err := client.RunnerAbsent(context.Background(), name); err != nil || !absent {
+		t.Fatalf("RunnerAbsent(deallocated) = absent=%v err=%v, want true", absent, err)
+	}
+	deleting := "Deleting"
+	vms.vm.Properties = &armcompute.VirtualMachineProperties{ProvisioningState: &deleting}
+	if absent, err := client.RunnerAbsent(context.Background(), name); err != nil || !absent {
+		t.Fatalf("RunnerAbsent(Deleting) = absent=%v err=%v, want true", absent, err)
+	}
+}
+
+type vmTransport func(*http.Request) (*http.Response, error)
+
+func (f vmTransport) Do(req *http.Request) (*http.Response, error) { return f(req) }
+
+func TestVMGetRequestsPowerState(t *testing.T) {
+	response := vmTransport(func(req *http.Request) (*http.Response, error) {
+		if got := req.URL.Query().Get("$expand"); got != "instanceView" {
+			t.Errorf("$expand = %q", got)
+		}
+		body := `{"properties":{"provisioningState":"Succeeded","instanceView":{"statuses":[{"code":"PowerState/deallocated"}]}}}`
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+	})
+	sdk, err := armcompute.NewVirtualMachinesClient("subscription", &fake.TokenCredential{}, &arm.ClientOptions{ClientOptions: policy.ClientOptions{Transport: response}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := virtualMachinesClient{client: sdk}
+	vm, err := client.Get(context.Background(), "group", "runner")
+	if err != nil || !isAbsentVM(vm) {
+		t.Fatalf("deallocated VM not detected: %v, %v", vm, err)
 	}
 }

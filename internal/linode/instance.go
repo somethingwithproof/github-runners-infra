@@ -45,6 +45,7 @@ type Config struct {
 	ControllerID   string
 	BaseURL        string
 	HTTPClient     *http.Client
+	Spot           bool
 }
 
 // Client manages Linode instances created for one controller.
@@ -117,6 +118,9 @@ func (c *Client) Provider() string { return "linode" }
 
 // NewClient constructs a Linode API v4 compute client.
 func NewClient(cfg Config) (*Client, error) {
+	if err := compute.RejectSpotUnsupported("Linode", cfg.Spot); err != nil {
+		return nil, err
+	}
 	base, err := compute.InitRESTBase(compute.RESTBaseConfig{
 		Provider:       "linode",
 		TokenName:      "API token",
@@ -191,6 +195,9 @@ func (c *Client) FindRunner(ctx context.Context, jobKey string) (*compute.Runner
 
 // CreateRunner provisions an ephemeral Linode instance with ownership tags and cloud-init metadata.
 func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) (*compute.RunnerInstance, error) {
+	if err := compute.RejectSpotUnsupported("Linode", compute.ResolveSpot(false, params.Spot)); err != nil {
+		return nil, err
+	}
 	desiredName := compute.DeterministicName("linode", params.JobKey, params.ProvisionEpoch)
 	if existing, found, err := c.FindRunner(ctx, params.JobKey); err != nil || found {
 		return existing, err

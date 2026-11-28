@@ -5,7 +5,9 @@ package aws
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"strings"
 	"testing"
 	"text/template"
 	"time"
@@ -19,6 +21,8 @@ import (
 
 type fakeEC2 struct {
 	runInput       *ec2.RunInstancesInput
+	runInputs      []*ec2.RunInstancesInput
+	runErrs        []error
 	describeOutput *ec2.DescribeInstancesOutput
 	describePages  []*ec2.DescribeInstancesOutput
 	describeTokens []string
@@ -49,6 +53,14 @@ func (f *fakeEC2) DescribeInstances(_ context.Context, input *ec2.DescribeInstan
 
 func (f *fakeEC2) RunInstances(_ context.Context, input *ec2.RunInstancesInput, _ ...func(*ec2.Options)) (*ec2.RunInstancesOutput, error) {
 	f.runInput = input
+	f.runInputs = append(f.runInputs, input)
+	if len(f.runErrs) > 0 {
+		err := f.runErrs[0]
+		f.runErrs = f.runErrs[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
 	return &ec2.RunInstancesOutput{Instances: []types.Instance{{InstanceId: awssdk.String("i-123")}}}, nil
 }
 
@@ -289,5 +301,128 @@ func TestCreateRunnerAppliesInstanceSizeOverride(t *testing.T) {
 		JobKey: "org/repo:100", RunnerJITConfig: "jit", InstanceSize: "bad/type",
 	}); err == nil {
 		t.Fatal("CreateRunner accepted invalid AWS instance type override")
+	}
+}
+
+func spotCapacityError(code string) error {
+	return &smithy.OperationError{
+		ServiceID: "EC2", OperationName: "RunInstances",
+		Err: &smithy.GenericAPIError{Code: code, Message: "capacity error", Fault: smithy.FaultClient},
+	}
+}
+
+func spotTestTemplate() *template.Template {
+	return template.Must(template.New("cloud-init").Parse("#cloud-config\nspot={{.SpotActive}}"))
+}
+
+func TestAWSSpotCapacityErrors(t *testing.T) {
+	for _, code := range []string{"InsufficientInstanceCapacity", "SpotMaxPriceTooLow", "InstanceLimitExceeded"} {
+		api := &fakeEC2{runErrs: []error{spotCapacityError(code)}}
+		client := newClient(api, spotTestTemplate(), Config{
+			AMI: "ami-1", InstanceType: "m7i.large", SubnetID: "subnet-a",
+			SecurityGroupIDs: []string{"sg-1"}, ControllerID: "primary", Spot: true,
+		})
+		_, err := client.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:cap-" + code})
+		if !compute.IsCapacityError(err) {
+			t.Fatalf("code %s error = %v, want ErrCapacityUnavailable", code, err)
+		}
+	}
+}
+
+func TestAWSAlternateSubnetBeforeOnDemand(t *testing.T) {
+	api := &fakeEC2{
+		runErrs: []error{
+			spotCapacityError("InsufficientInstanceCapacity"),
+			spotCapacityError("SpotMaxPriceTooLow"),
+			nil,
+		},
+	}
+	client := newClient(api, spotTestTemplate(), Config{
+		AMI: "ami-1", InstanceType: "m7i.large",
+		SubnetID: "subnet-a", AlternateSubnetIDs: []string{"subnet-b"},
+		SecurityGroupIDs: []string{"sg-1"}, ControllerID: "primary",
+		Spot: true, SpotFallbackOnDemand: true,
+	})
+	inst, err := client.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:fb"})
+	if err != nil || inst.ID != "i-123" {
+		t.Fatalf("CreateRunner fallback = %#v, %v", inst, err)
+	}
+	if len(api.runInputs) != 3 {
+		t.Fatalf("RunInstances calls = %d, want 3", len(api.runInputs))
+	}
+	if *api.runInputs[0].NetworkInterfaces[0].SubnetId != "subnet-a" || api.runInputs[0].InstanceMarketOptions == nil {
+		t.Fatalf("attempt 0 unexpected: %#v", api.runInputs[0])
+	}
+	if *api.runInputs[1].NetworkInterfaces[0].SubnetId != "subnet-b" || api.runInputs[1].InstanceMarketOptions == nil {
+		t.Fatalf("attempt 1 unexpected: %#v", api.runInputs[1])
+	}
+	if api.runInputs[2].InstanceMarketOptions != nil {
+		t.Fatal("on-demand fallback still requested Spot market options")
+	}
+	if *api.runInputs[0].ClientToken == *api.runInputs[1].ClientToken || *api.runInputs[0].ClientToken == *api.runInputs[2].ClientToken {
+		t.Fatal("fallback attempts reused primary ClientToken")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(*api.runInputs[2].UserData)
+	if err != nil || !strings.Contains(string(decoded), "spot=false") {
+		t.Fatalf("on-demand fallback user-data = %q, %v", decoded, err)
+	}
+}
+
+func TestAWSRequestOverridesDefaultSpot(t *testing.T) {
+	api := &fakeEC2{}
+	client := newClient(api, spotTestTemplate(), Config{
+		AMI: "ami-1", InstanceType: "m7i.large", SubnetID: "subnet-a",
+		SecurityGroupIDs: []string{"sg-1"}, ControllerID: "primary", Spot: true,
+	})
+	if _, err := client.CreateRunner(context.Background(), compute.RunnerParams{
+		JobKey: "org/repo:od", Spot: compute.BoolPtr(false),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if api.runInput.InstanceMarketOptions != nil {
+		t.Fatal("per-request Spot=false still set Spot options")
+	}
+}
+
+func TestAWSRunnerAbsentAndFindRunnerTreatPreemptedTerminatedAsAbsent(t *testing.T) {
+	tags := []types.Tag{
+		{Key: awssdk.String(controllerTagKey), Value: awssdk.String("primary")},
+		{Key: awssdk.String(jobTagKey), Value: awssdk.String(jobTag("org/repo:preempt"))},
+	}
+	for _, stateName := range []types.InstanceStateName{types.InstanceStateNameTerminated, types.InstanceStateNameShuttingDown} {
+		api := &fakeEC2{describeOutput: &ec2.DescribeInstancesOutput{Reservations: []types.Reservation{{
+			Instances: []types.Instance{{
+				InstanceId: awssdk.String("i-preempt"),
+				Tags:       tags,
+				State:      &types.InstanceState{Name: stateName},
+			}},
+		}}}}
+		client := newClient(api, nil, Config{ControllerID: "primary"})
+		if _, found, err := client.FindRunner(context.Background(), "org/repo:preempt"); err != nil || found {
+			t.Fatalf("FindRunner(%s) = found=%v err=%v, want absent", stateName, found, err)
+		}
+		if absent, err := client.RunnerAbsent(context.Background(), "i-preempt"); err != nil || !absent {
+			t.Fatalf("RunnerAbsent(%s) = absent=%v err=%v, want true", stateName, absent, err)
+		}
+	}
+
+	runningAPI := &fakeEC2{describeOutput: &ec2.DescribeInstancesOutput{Reservations: []types.Reservation{{
+		Instances: []types.Instance{{
+			InstanceId: awssdk.String("i-live"),
+			State:      &types.InstanceState{Name: types.InstanceStateNameRunning},
+		}},
+	}}}}
+	client := newClient(runningAPI, nil, Config{ControllerID: "primary"})
+	if absent, err := client.RunnerAbsent(context.Background(), "i-live"); err != nil || absent {
+		t.Fatalf("RunnerAbsent(running) = absent=%v err=%v, want false", absent, err)
+	}
+}
+
+func TestCreateRunnerRejectsBlankSubnets(t *testing.T) {
+	api := &fakeEC2{}
+	client := newClient(api, nil, Config{SubnetID: " ", AlternateSubnetIDs: []string{"", "  "}})
+	instance, err := client.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:42"})
+	if err == nil || instance != nil || len(api.runInputs) != 0 {
+		t.Fatalf("blank subnets: instance=%v, err=%v, launch attempts=%d", instance, err, len(api.runInputs))
 	}
 }

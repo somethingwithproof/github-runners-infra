@@ -5,6 +5,7 @@ package webhook
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 	"text/template"
@@ -172,5 +173,69 @@ func TestHandlerPrebakedEgressAndRegistrationTokenFallback(t *testing.T) {
 	// Verify RenderCloudInit renders prebaked + egress + fallback cleanly.
 	if _, err := compute.RenderCloudInit(nil, comp.lastParams); err == nil {
 		t.Fatal("expected nil template error")
+	}
+}
+
+func TestHandlerLabelBasedSpotAndOnDemandPrecedenceWithSizeAndBudget(t *testing.T) {
+	cases := []struct {
+		name     string
+		labels   []string
+		wantSpot *bool
+		wantSize string
+	}{
+		{name: "force spot with size", labels: []string{"self-hosted", "large", "spot"}, wantSpot: compute.BoolPtr(true), wantSize: "m7i.2xlarge"},
+		{name: "force on-demand with size", labels: []string{"self-hosted", "large", "on-demand"}, wantSpot: compute.BoolPtr(false), wantSize: "m7i.2xlarge"},
+		{name: "both labels on-demand wins", labels: []string{"self-hosted", "spot", "on-demand", "large"}, wantSpot: compute.BoolPtr(false), wantSize: "m7i.2xlarge"},
+		{name: "neither label uses default", labels: []string{"self-hosted", "large"}, wantSpot: nil, wantSize: "m7i.2xlarge"},
+	}
+	for idx, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openTestStateStore(t)
+			comp := &captureCompute{fakeCompute: &fakeCompute{}}
+			tracker, err := budget.NewTracker(budget.Config{DailyCapUSD: 100, ReservationDuration: time.Hour})
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler, err := NewHandler(Config{
+				WebhookSecret:       []byte(testWebhookSecret),
+				GitHubClient:        &fakeGitHub{},
+				ComputeClient:       comp,
+				BudgetTracker:       tracker,
+				DefaultInstanceSize: "m7i.xlarge",
+				DefaultSpot:         true,
+				Store:               store,
+				RequiredLabel:       "self-hosted",
+				AllowedLabels:       []string{"self-hosted", "large", "spot", "on-demand"},
+				LabelSizeMap:        map[string]string{"large": "m7i.2xlarge"},
+				AllowedRepositories: []string{"trusted/private-repo"},
+				RunnerVersion:       "2.336.0",
+				RunnerSHA256:        strings.Repeat("a", 64),
+				ChefInstallerSHA256: strings.Repeat("b", 64),
+				InstallationID:      42,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			jobID := int64(800 + idx)
+			key := jobKey("trusted/private-repo", jobID)
+			if _, err := store.Create(ctx, state.Record{
+				Key: key, DeliveryID: "del-spot", JobID: jobID,
+				Owner: "trusted", Repository: "private-repo", Labels: tc.labels, Provider: "test",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			record, _, err := store.ClaimNext(ctx, time.Now(), 3)
+			if err != nil || record == nil {
+				t.Fatalf("ClaimNext = %#v %v", record, err)
+			}
+			handler.provision(ctx, *record)
+			if comp.lastParams.InstanceSize != tc.wantSize {
+				t.Fatalf("InstanceSize = %q, want %q", comp.lastParams.InstanceSize, tc.wantSize)
+			}
+			if !reflect.DeepEqual(comp.lastParams.Spot, tc.wantSpot) {
+				t.Fatalf("Spot = %v, want %v", comp.lastParams.Spot, tc.wantSpot)
+			}
+		})
 	}
 }

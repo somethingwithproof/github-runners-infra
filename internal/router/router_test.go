@@ -20,6 +20,8 @@ type stubProvider struct {
 	mu            sync.Mutex
 	instances     map[string]*compute.RunnerInstance
 	createErr     error
+	createErrFn   func(compute.RunnerParams) error
+	createParams  []compute.RunnerParams
 	createCalls   int
 	deletedIDs    []string
 	cleanedJobs   []string
@@ -55,6 +57,12 @@ func (s *stubProvider) CreateRunner(_ context.Context, params compute.RunnerPara
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.createCalls++
+	s.createParams = append(s.createParams, params)
+	if s.createErrFn != nil {
+		if err := s.createErrFn(params); err != nil {
+			return nil, err
+		}
+	}
 	if s.createErr != nil {
 		return nil, s.createErr
 	}
@@ -296,11 +304,133 @@ func TestParseHourlyRateOverridesValidation(t *testing.T) {
 		"vultr:vc2-4c-8gb=NaN",
 		"vultr:vc2-4c-8gb=Inf",
 		"vultr:bad/size=0.05",
+		"aws:m7i.xlarge:invalid=0.05",
 		",vultr=0.05",
 	} {
 		if _, err := ParseHourlyRateOverrides(bad); err == nil {
 			t.Fatalf("ParseHourlyRateOverrides(%q) unexpectedly succeeded", bad)
 		}
+	}
+}
+
+func TestRouterRanksSpotByDiscountedPrice(t *testing.T) {
+	vultrProv := newStubProvider("vultr")
+	vultrProv.createErrFn = func(p compute.RunnerParams) error {
+		return compute.RejectSpotUnsupported("Vultr", compute.ResolveSpot(false, p.Spot))
+	}
+	gcpProv := newStubProvider("gcp")
+
+	r, err := New(Config{
+		Strategy:    StrategyCheapest,
+		DefaultSpot: true,
+		Backends: []Backend{
+			{Name: "vultr", DefaultSize: "vc2-4c-8gb", Provider: vultrProv},
+			{Name: "gcp", DefaultSize: "n2-standard-4", Provider: gcpProv},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provName, _, spotRate := r.EstimateHourlyRateForMode("", compute.BoolPtr(true))
+	if provName != "gcp" || spotRate >= HourlyRate("vultr", "vc2-4c-8gb", nil) {
+		t.Fatalf("expected gcp spot cheapest, got %s %.4f", provName, spotRate)
+	}
+	inst, err := r.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:spot-cheap"})
+	if err != nil || !strings.HasPrefix(inst.ID, "gcp:") {
+		t.Fatalf("CreateRunner = %#v, %v", inst, err)
+	}
+	if gcpProv.createCalls != 1 || gcpProv.createParams[0].Spot == nil || !*gcpProv.createParams[0].Spot {
+		t.Fatalf("gcp createParams = %#v", gcpProv.createParams)
+	}
+}
+
+func TestRouterRetriesOnDemandAfterSpotFailover(t *testing.T) {
+	awsProv := newStubProvider("aws")
+	awsProv.createErrFn = func(p compute.RunnerParams) error {
+		if compute.ResolveSpot(false, p.Spot) {
+			return fmt.Errorf("%w: aws spot full", compute.ErrCapacityUnavailable)
+		}
+		return nil
+	}
+	vultrProv := newStubProvider("vultr")
+	vultrProv.createErrFn = func(p compute.RunnerParams) error {
+		return compute.RejectSpotUnsupported("Vultr", compute.ResolveSpot(false, p.Spot))
+	}
+
+	r, err := New(Config{
+		Strategy:             StrategyPriority,
+		DefaultSpot:          true,
+		SpotFallbackOnDemand: true,
+		Backends: []Backend{
+			{Name: "aws", DefaultSize: "m7i.xlarge", Provider: awsProv},
+			{Name: "vultr", DefaultSize: "vc2-4c-8gb", Provider: vultrProv},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst, err := r.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:spot-fb"})
+	if err != nil || !strings.HasPrefix(inst.ID, "aws:") {
+		t.Fatalf("fallback CreateRunner = %#v, %v", inst, err)
+	}
+	// Pass 1: aws(spot)->capErr, vultr(spot)->spotUnsupported; Pass 2: aws(on-demand)->ok
+	if awsProv.createCalls != 2 || vultrProv.createCalls != 1 {
+		t.Fatalf("calls aws=%d vultr=%d", awsProv.createCalls, vultrProv.createCalls)
+	}
+	if awsProv.createParams[1].Spot == nil || *awsProv.createParams[1].Spot {
+		t.Fatalf("second aws call was not forced on-demand: %#v", awsProv.createParams[1])
+	}
+}
+
+func TestRouterPreventsOverBudgetFallback(t *testing.T) {
+	aws := newStubProvider("aws")
+	aws.createErr = compute.ErrCapacityUnavailable
+	r, err := New(Config{DefaultSpot: true, SpotFallbackOnDemand: true, Backends: []Backend{{Name: "aws", DefaultSize: "m7i.xlarge", Provider: aws}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	denied := errors.New("budget exhausted")
+	_, err = r.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:cap", AuthorizeLaunch: func(provider, size string, spot bool) error {
+		if provider != "aws" || size != "m7i.xlarge" {
+			t.Fatalf("unexpected quote %s/%s", provider, size)
+		}
+		if !spot {
+			return denied
+		}
+		return nil
+	}})
+	if !errors.Is(err, denied) || aws.createCalls != 1 {
+		t.Fatalf("create calls = %d, error = %v", aws.createCalls, err)
+	}
+}
+
+func TestRouterDisablesOnDemandFallback(t *testing.T) {
+	awsProv := newStubProvider("aws")
+	awsProv.createErr = fmt.Errorf("%w: aws spot full", compute.ErrCapacityUnavailable)
+	r, err := New(Config{
+		DefaultSpot:          true,
+		SpotFallbackOnDemand: false,
+		Backends:             []Backend{{Name: "aws", Provider: awsProv}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = r.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:spot-nofb"})
+	if !errors.Is(err, ErrAllProvidersExhausted) || !compute.IsCapacityError(err) || awsProv.createCalls != 1 {
+		t.Fatalf("err=%v calls=%d", err, awsProv.createCalls)
+	}
+}
+
+func TestRouterHonorsSpotRateOverride(t *testing.T) {
+	overrides, err := ParseHourlyRateOverrides("aws:m7i.xlarge:spot=0.055, gcp:spot=0.045")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := HourlyRateForMode("aws", "m7i.xlarge", true, overrides); got != 0.055 {
+		t.Fatalf("aws spot override = %v, want 0.055", got)
+	}
+	if got := HourlyRateForMode("gcp", "n2-standard-4", true, overrides); got != 0.045 {
+		t.Fatalf("gcp spot override = %v, want 0.045", got)
 	}
 }
 

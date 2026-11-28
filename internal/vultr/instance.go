@@ -48,6 +48,7 @@ type Config struct {
 	ControllerID    string
 	BaseURL         string
 	HTTPClient      *http.Client
+	Spot            bool
 }
 
 // Client manages Vultr instances created for one controller.
@@ -114,6 +115,9 @@ func (c *Client) Provider() string { return "vultr" }
 
 // NewClient constructs a Vultr API v2 compute client.
 func NewClient(cfg Config) (*Client, error) {
+	if err := compute.RejectSpotUnsupported("Vultr", cfg.Spot); err != nil {
+		return nil, err
+	}
 	base, err := compute.InitRESTBase(compute.RESTBaseConfig{
 		Provider:       "vultr",
 		TokenName:      "API key",
@@ -184,6 +188,9 @@ func (c *Client) FindRunner(ctx context.Context, jobKey string) (*compute.Runner
 
 // CreateRunner provisions an ephemeral Vultr instance with ownership tags.
 func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) (*compute.RunnerInstance, error) {
+	if err := compute.RejectSpotUnsupported("Vultr", compute.ResolveSpot(false, params.Spot)); err != nil {
+		return nil, err
+	}
 	desiredName := compute.DeterministicName("vultr", params.JobKey, params.ProvisionEpoch)
 	if existing, found, err := c.FindRunner(ctx, params.JobKey); err != nil || found {
 		return existing, err

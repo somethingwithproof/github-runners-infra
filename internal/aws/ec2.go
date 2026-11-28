@@ -11,6 +11,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
 	"text/template"
 	"time"
 
@@ -36,34 +38,38 @@ type ec2API interface {
 // Config configures the EC2 runner pool. The SDK default credential chain is
 // used; static cloud credentials are intentionally not accepted here.
 type Config struct {
-	Region       string
-	AMI          string
-	InstanceType string
-	SubnetID     string
+	Region             string
+	AMI                string
+	InstanceType       string
+	SubnetID           string
+	AlternateSubnetIDs []string
 	// SecurityGroupIDs are operator/IaC-managed. This adapter defaults to no
 	// public IP but cannot infer intended private-network ingress policy.
-	SecurityGroupIDs   []string
-	InstanceProfileARN string
-	KeyName            string
-	CloudInitPath      string
-	ControllerID       string
-	Spot               bool
-	ExternalIP         bool
+	SecurityGroupIDs     []string
+	InstanceProfileARN   string
+	KeyName              string
+	CloudInitPath        string
+	ControllerID         string
+	Spot                 bool
+	SpotFallbackOnDemand bool
+	ExternalIP           bool
 }
 
 // Client owns EC2 resources created for one controller.
 type Client struct {
-	api                ec2API
-	tmpl               *template.Template
-	ami                string
-	instanceType       types.InstanceType
-	subnetID           string
-	securityGroupIDs   []string
-	instanceProfileARN string
-	keyName            string
-	controllerID       string
-	spot               bool
-	externalIP         bool
+	api                  ec2API
+	tmpl                 *template.Template
+	ami                  string
+	instanceType         types.InstanceType
+	subnetID             string
+	alternateSubnetIDs   []string
+	securityGroupIDs     []string
+	instanceProfileARN   string
+	keyName              string
+	controllerID         string
+	spot                 bool
+	spotFallbackOnDemand bool
+	externalIP           bool
 }
 
 var _ compute.Provider = (*Client)(nil)
@@ -96,9 +102,10 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 func newClient(api ec2API, tmpl *template.Template, cfg Config) *Client {
 	return &Client{
 		api: api, tmpl: tmpl, ami: cfg.AMI, instanceType: types.InstanceType(cfg.InstanceType),
-		subnetID: cfg.SubnetID, securityGroupIDs: cfg.SecurityGroupIDs,
-		instanceProfileARN: cfg.InstanceProfileARN, keyName: cfg.KeyName,
-		controllerID: cfg.ControllerID, spot: cfg.Spot, externalIP: cfg.ExternalIP,
+		subnetID: cfg.SubnetID, alternateSubnetIDs: append([]string(nil), cfg.AlternateSubnetIDs...),
+		securityGroupIDs: cfg.SecurityGroupIDs, instanceProfileARN: cfg.InstanceProfileARN,
+		keyName: cfg.KeyName, controllerID: cfg.ControllerID,
+		spot: cfg.Spot, spotFallbackOnDemand: cfg.SpotFallbackOnDemand, externalIP: cfg.ExternalIP,
 	}
 }
 
@@ -134,6 +141,9 @@ func (c *Client) listJobInstances(ctx context.Context, jobKey string) ([]types.I
 				if instance.InstanceId == nil {
 					continue
 				}
+				if instance.State != nil && isAbsentState(instance.State.Name) {
+					continue
+				}
 				if tagValue(instance.Tags, controllerTagKey) != c.controllerID || tagValue(instance.Tags, jobTagKey) != jobTag(jobKey) {
 					return nil, fmt.Errorf("%w: EC2 instance %s lacks controller or job ownership tags", compute.ErrOwnershipMismatch, *instance.InstanceId)
 				}
@@ -158,18 +168,92 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 		}
 		instanceType = types.InstanceType(params.InstanceSize)
 	}
-	userData, err := compute.RenderCloudInit(c.tmpl, params)
+	useSpot := compute.ResolveSpot(c.spot, params.Spot)
+	subnets := c.candidateSubnets()
+	if len(subnets) == 0 {
+		return nil, fmt.Errorf("AWS runner requires at least one nonempty subnet ID")
+	}
+
+	inst, err := c.runAcrossSubnets(ctx, params, instanceType, subnets, useSpot, false)
+	if err == nil {
+		return inst, nil
+	}
+	if useSpot && c.spotFallbackOnDemand && compute.IsCapacityError(err) {
+		if err := params.CheckLaunchBudget(c.Provider(), string(instanceType), false); err != nil {
+			return nil, err
+		}
+		log.Printf("WARN: AWS spot capacity unavailable for %s (%v); falling back to on-demand", params.JobKey, err)
+		return c.runAcrossSubnets(ctx, params, instanceType, subnets, false, true)
+	}
+	return nil, err
+}
+
+func (c *Client) candidateSubnets() []string {
+	subnets := make([]string, 0, 1+len(c.alternateSubnetIDs))
+	seen := make(map[string]struct{}, 1+len(c.alternateSubnetIDs))
+	for _, raw := range append([]string{c.subnetID}, c.alternateSubnetIDs...) {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		subnets = append(subnets, id)
+	}
+	return subnets
+}
+
+func (c *Client) runAcrossSubnets(
+	ctx context.Context,
+	params compute.RunnerParams,
+	instanceType types.InstanceType,
+	subnets []string,
+	useSpot, isFallback bool,
+) (*compute.RunnerInstance, error) {
+	userData, err := compute.RenderCloudInit(c.tmpl, params.WithSpot(useSpot))
 	if err != nil {
 		return nil, err
 	}
+	var lastErr error
+	for idx, subnetID := range subnets {
+		input := c.buildRunInput(params, instanceType, subnetID, userData, useSpot, idx, isFallback)
+		out, runErr := c.api.RunInstances(ctx, input)
+		if runErr == nil {
+			if len(out.Instances) != 1 || out.Instances[0].InstanceId == nil {
+				return nil, fmt.Errorf("create EC2 runner: API returned no instance identity")
+			}
+			return &compute.RunnerInstance{ID: *out.Instances[0].InstanceId, Name: params.RunnerName}, nil
+		}
+		lastErr = classifyCreateError(runErr)
+		if !compute.IsCapacityError(lastErr) {
+			return nil, lastErr
+		}
+		if idx+1 < len(subnets) {
+			log.Printf("WARN: AWS subnet %s capacity unavailable for %s (%v); trying alternate subnet %s", subnetID, params.JobKey, runErr, subnets[idx+1])
+		}
+	}
+	return nil, lastErr
+}
+
+func (c *Client) buildRunInput(
+	params compute.RunnerParams,
+	instanceType types.InstanceType,
+	subnetID, userData string,
+	useSpot bool,
+	subnetIdx int,
+	isFallback bool,
+) *ec2.RunInstancesInput {
+	token := clientTokenForAttempt(params.JobKey, params.ProvisionEpoch, subnetIdx, useSpot, isFallback)
 	input := &ec2.RunInstancesInput{
 		ImageId: aws.String(c.ami), InstanceType: instanceType, MinCount: aws.Int32(1), MaxCount: aws.Int32(1),
 		NetworkInterfaces: []types.InstanceNetworkInterfaceSpecification{{
 			AssociatePublicIpAddress: aws.Bool(c.externalIP), DeviceIndex: aws.Int32(0),
-			SubnetId: aws.String(c.subnetID), Groups: append([]string(nil), c.securityGroupIDs...),
+			SubnetId: aws.String(subnetID), Groups: append([]string(nil), c.securityGroupIDs...),
 		}},
 		UserData:    aws.String(base64.StdEncoding.EncodeToString([]byte(userData))),
-		ClientToken: aws.String(clientToken(params.JobKey, params.ProvisionEpoch)),
+		ClientToken: aws.String(token),
 		MetadataOptions: &types.InstanceMetadataOptionsRequest{
 			HttpEndpoint: types.InstanceMetadataEndpointStateEnabled, HttpTokens: types.HttpTokensStateRequired,
 			HttpPutResponseHopLimit: aws.Int32(1), InstanceMetadataTags: types.InstanceMetadataTagsStateDisabled,
@@ -186,7 +270,7 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 	if c.keyName != "" {
 		input.KeyName = aws.String(c.keyName)
 	}
-	if c.spot {
+	if useSpot {
 		input.InstanceMarketOptions = &types.InstanceMarketOptionsRequest{
 			MarketType: types.MarketTypeSpot,
 			SpotOptions: &types.SpotMarketOptions{
@@ -195,14 +279,30 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 			},
 		}
 	}
-	out, err := c.api.RunInstances(ctx, input)
+	return input
+}
+
+// RunnerAbsent checks authoritative absence by EC2 instance ID, treating
+// missing, shutting-down, and terminated/preempted instances as absent.
+func (c *Client) RunnerAbsent(ctx context.Context, instanceID string) (bool, error) {
+	out, err := c.api.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{instanceID}})
 	if err != nil {
-		return nil, fmt.Errorf("create EC2 runner: %w", err)
+		if isNotFound(err) {
+			return true, nil
+		}
+		return false, fmt.Errorf("confirm EC2 runner %s absence: %w", instanceID, err)
 	}
-	if len(out.Instances) != 1 || out.Instances[0].InstanceId == nil {
-		return nil, fmt.Errorf("create EC2 runner: API returned no instance identity")
+	for i := range out.Reservations {
+		if len(out.Reservations[i].Instances) == 0 {
+			continue
+		}
+		inst := out.Reservations[i].Instances[0]
+		if inst.State != nil && isAbsentState(inst.State.Name) {
+			return true, nil
+		}
+		return false, nil
 	}
-	return &compute.RunnerInstance{ID: *out.Instances[0].InstanceId, Name: params.RunnerName}, nil
+	return true, nil
 }
 
 func (c *Client) DeleteRunner(ctx context.Context, instanceID, jobKey string) error {
@@ -242,6 +342,21 @@ func (c *Client) DeleteRunner(ctx context.Context, instanceID, jobKey string) er
 func isNotFound(err error) bool {
 	var apiErr smithy.APIError
 	return errors.As(err, &apiErr) && apiErr.ErrorCode() == "InvalidInstanceID.NotFound"
+}
+
+func isAbsentState(state types.InstanceStateName) bool {
+	return state == types.InstanceStateNameShuttingDown || state == types.InstanceStateNameTerminated
+}
+
+func classifyCreateError(err error) error {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "InsufficientInstanceCapacity", "SpotMaxPriceTooLow", "InstanceLimitExceeded", "MaxSpotInstanceCountExceeded":
+			return fmt.Errorf("%w: create EC2 runner: %w", compute.ErrCapacityUnavailable, err)
+		}
+	}
+	return fmt.Errorf("create EC2 runner: %w", err)
 }
 
 func (c *Client) CleanupRunner(ctx context.Context, jobKey string) error {
@@ -315,5 +430,13 @@ func jobTag(jobKey string) string {
 
 func clientToken(jobKey string, epoch int) string {
 	hash := sha256.Sum256([]byte(fmt.Sprintf("aws:%s:%d", jobKey, epoch)))
+	return "github-runner-" + hex.EncodeToString(hash[:16])
+}
+
+func clientTokenForAttempt(jobKey string, epoch, subnetIdx int, useSpot, isFallback bool) string {
+	if subnetIdx == 0 && !isFallback {
+		return clientToken(jobKey, epoch)
+	}
+	hash := sha256.Sum256([]byte(fmt.Sprintf("aws:%s:%d:subnet:%d:spot:%t:fb:%t", jobKey, epoch, subnetIdx, useSpot, isFallback)))
 	return "github-runner-" + hex.EncodeToString(hash[:16])
 }

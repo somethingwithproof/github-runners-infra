@@ -39,9 +39,11 @@ type Backend struct {
 
 // Config configures a MultiCloudRouter.
 type Config struct {
-	Strategy    Strategy
-	Backends    []Backend
-	HourlyRates map[string]float64
+	Strategy             Strategy
+	Backends             []Backend
+	HourlyRates          map[string]float64
+	DefaultSpot          bool
+	SpotFallbackOnDemand bool
 }
 
 type absenceChecker interface {
@@ -58,10 +60,12 @@ var _ compute.Provider = (*MultiCloudRouter)(nil)
 // cloud backends with cost-aware ordering, automatic failover, and per-provider
 // resource ownership tracking via composite "<provider>:<id>" instance IDs.
 type MultiCloudRouter struct {
-	strategy    Strategy
-	backends    []Backend
-	byName      map[string]Backend
-	hourlyRates map[string]float64
+	strategy             Strategy
+	backends             []Backend
+	byName               map[string]Backend
+	hourlyRates          map[string]float64
+	defaultSpot          bool
+	spotFallbackOnDemand bool
 }
 
 // New constructs a validated MultiCloudRouter.
@@ -108,10 +112,12 @@ func New(cfg Config) (*MultiCloudRouter, error) {
 	}
 
 	return &MultiCloudRouter{
-		strategy:    strategy,
-		backends:    backends,
-		byName:      byName,
-		hourlyRates: rates,
+		strategy:             strategy,
+		backends:             backends,
+		byName:               byName,
+		hourlyRates:          rates,
+		defaultSpot:          cfg.DefaultSpot,
+		spotFallbackOnDemand: cfg.SpotFallbackOnDemand,
 	}, nil
 }
 
@@ -119,19 +125,35 @@ func New(cfg Config) (*MultiCloudRouter, error) {
 func (r *MultiCloudRouter) Provider() string { return "multi" }
 
 // EstimateHourlyRate returns the estimated USD/hour rate of the highest-ranked
-// candidate backend for the given optional size override.
+// candidate backend for the given optional size override using the router's
+// default provisioning mode.
 func (r *MultiCloudRouter) EstimateHourlyRate(sizeOverride string) (providerName, size string, hourlyUSD float64) {
-	ordered := r.OrderedBackends(sizeOverride)
+	return r.EstimateHourlyRateForMode(sizeOverride, nil)
+}
+
+// EstimateHourlyRateForMode returns the estimated USD/hour rate of the
+// highest-ranked candidate backend for the given optional size override and
+// per-request spot preference.
+func (r *MultiCloudRouter) EstimateHourlyRateForMode(sizeOverride string, spot *bool) (providerName, size string, hourlyUSD float64) {
+	useSpot := compute.ResolveSpot(r.defaultSpot, spot)
+	ordered := r.OrderedBackendsForMode(sizeOverride, useSpot)
 	top := ordered[0]
 	effectiveSize := sizeOverride
 	if effectiveSize == "" {
 		effectiveSize = top.DefaultSize
 	}
-	return top.Name, effectiveSize, HourlyRate(top.Name, effectiveSize, r.hourlyRates)
+	return top.Name, effectiveSize, HourlyRateForMode(top.Name, effectiveSize, useSpot, r.hourlyRates)
 }
 
-// OrderedBackends returns backends ordered by the configured routing strategy.
+// OrderedBackends returns backends ordered by the configured routing strategy
+// using the router's default spot setting.
 func (r *MultiCloudRouter) OrderedBackends(sizeOverride string) []Backend {
+	return r.OrderedBackendsForMode(sizeOverride, r.defaultSpot)
+}
+
+// OrderedBackendsForMode returns backends ordered by the configured routing
+// strategy for the effective spot mode.
+func (r *MultiCloudRouter) OrderedBackendsForMode(sizeOverride string, spot bool) []Backend {
 	ordered := make([]Backend, len(r.backends))
 	copy(ordered, r.backends)
 	if r.strategy != StrategyCheapest {
@@ -142,7 +164,7 @@ func (r *MultiCloudRouter) OrderedBackends(sizeOverride string) []Backend {
 		if size == "" {
 			size = b.DefaultSize
 		}
-		return HourlyRate(b.Name, size, r.hourlyRates)
+		return HourlyRateForMode(b.Name, size, spot, r.hourlyRates)
 	}
 	sort.SliceStable(ordered, func(i, j int) bool {
 		return rateOf(ordered[i]) < rateOf(ordered[j])
@@ -175,45 +197,80 @@ func (r *MultiCloudRouter) FindRunner(ctx context.Context, jobKey string) (*comp
 }
 
 // CreateRunner provisions a runner on the highest-ranked backend, failing over
-// to subsequent backends on capacity, quota, or transient provider errors.
+// to subsequent backends on capacity, spot-unsupported, quota, or transient
+// provider errors. When SpotFallbackOnDemand is enabled and all spot candidates
+// fail with capacity or spot-unsupported errors, CreateRunner retries across
+// backends with on-demand mode.
 func (r *MultiCloudRouter) CreateRunner(ctx context.Context, params compute.RunnerParams) (*compute.RunnerInstance, error) {
 	if existing, found, err := r.FindRunner(ctx, params.JobKey); err != nil || found {
 		return existing, err
 	}
 
-	candidates := r.OrderedBackends(params.InstanceSize)
-	var attemptErrs []error
+	useSpot := compute.ResolveSpot(r.defaultSpot, params.Spot)
+	firstParams := params
+	if useSpot {
+		firstParams.Spot = compute.BoolPtr(true)
+	} else if params.Spot != nil {
+		firstParams.Spot = compute.BoolPtr(false)
+	}
+
+	inst, sawSpotOrCapacityErr, attemptErrs, terminalErr := r.tryBackends(ctx, firstParams, useSpot)
+	if inst != nil || terminalErr != nil {
+		return inst, terminalErr
+	}
+
+	if useSpot && r.spotFallbackOnDemand && sawSpotOrCapacityErr {
+		log.Printf("WARN: all spot candidates failed capacity/support for %s; falling back to on-demand", params.JobKey)
+		onDemandParams := params
+		onDemandParams.Spot = compute.BoolPtr(false)
+		fbInst, _, fbErrs, fbTerminal := r.tryBackends(ctx, onDemandParams, false)
+		if fbInst != nil || fbTerminal != nil {
+			return fbInst, fbTerminal
+		}
+		attemptErrs = append(attemptErrs, fbErrs...)
+	}
+
+	return nil, fmt.Errorf("%w: %w", ErrAllProvidersExhausted, errors.Join(attemptErrs...))
+}
+
+func (r *MultiCloudRouter) tryBackends(
+	ctx context.Context,
+	params compute.RunnerParams,
+	useSpot bool,
+) (inst *compute.RunnerInstance, sawSpotOrCapacity bool, attemptErrs []error, terminalErr error) {
+	candidates := r.OrderedBackendsForMode(params.InstanceSize, useSpot)
 	for i, b := range candidates {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, sawSpotOrCapacity, attemptErrs, ctx.Err()
 		}
-		if params.AuthorizeLaunch != nil {
-			size := params.InstanceSize
-			if size == "" {
-				size = b.DefaultSize
-			}
-			if err := params.AuthorizeLaunch(b.Name, size, false); err != nil {
-				return nil, err
-			}
+		size := params.InstanceSize
+		if size == "" {
+			size = b.DefaultSize
 		}
-		inst, err := b.Provider.CreateRunner(ctx, params)
+		if err := params.CheckLaunchBudget(b.Name, size, useSpot); err != nil {
+			return nil, sawSpotOrCapacity, attemptErrs, err
+		}
+		created, err := b.Provider.CreateRunner(ctx, params)
 		if err == nil {
 			return &compute.RunnerInstance{
-				ID:   EncodeCompositeID(b.Name, inst.ID),
-				Name: inst.Name,
-			}, nil
+				ID:   EncodeCompositeID(b.Name, created.ID),
+				Name: created.Name,
+			}, sawSpotOrCapacity, attemptErrs, nil
 		}
 		// Never fail over on cancellation, ownership mismatch, or ambiguous
 		// create outcomes where retrying on another cloud risks duplicate VMs.
 		if !shouldFailover(ctx, err) {
-			return nil, fmt.Errorf("provider %s create failed (no failover): %w", b.Name, err)
+			return nil, sawSpotOrCapacity, attemptErrs, fmt.Errorf("provider %s create failed (no failover): %w", b.Name, err)
+		}
+		if compute.IsCapacityError(err) || compute.IsSpotUnsupported(err) {
+			sawSpotOrCapacity = true
 		}
 		attemptErrs = append(attemptErrs, fmt.Errorf("%s: %w", b.Name, err))
 		if i+1 < len(candidates) {
 			log.Printf("WARN: provider %s failed for %s (%v); failing over to %s", b.Name, params.JobKey, err, candidates[i+1].Name)
 		}
 	}
-	return nil, fmt.Errorf("%w: %w", ErrAllProvidersExhausted, errors.Join(attemptErrs...))
+	return nil, sawSpotOrCapacity, attemptErrs, nil
 }
 
 // DeleteRunner routes deletion to the backend encoded in compositeID.

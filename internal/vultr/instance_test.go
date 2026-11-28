@@ -321,3 +321,22 @@ func TestVultrAmbiguousCreateAndOwnershipGuards(t *testing.T) {
 		})
 	}
 }
+
+func TestVultrRejectsSpotConfigAndRequest(t *testing.T) {
+	if _, err := NewClient(Config{
+		APIKey: "k", ControllerID: "primary", CloudInitPath: writeVultrTemplate(t, "#cloud-config\n"), Spot: true,
+	}); !compute.IsSpotUnsupported(err) {
+		t.Fatalf("NewClient(Spot=true) error = %v, want ErrSpotUnsupported", err)
+	}
+	client, err := NewClient(Config{
+		APIKey: "k", ControllerID: "primary", CloudInitPath: writeVultrTemplate(t, "#cloud-config\n"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.CreateRunner(context.Background(), compute.RunnerParams{
+		JobKey: "org/repo:spot", Spot: compute.BoolPtr(true),
+	}); !compute.IsSpotUnsupported(err) {
+		t.Fatalf("CreateRunner(Spot=true) error = %v, want ErrSpotUnsupported", err)
+	}
+}
