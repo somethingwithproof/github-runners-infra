@@ -94,7 +94,11 @@ func TestUTCDayAndMonthRolloverAndPersistence(t *testing.T) {
 	if err := tracker.Reserve(Reservation{Key: "org/r:1", Repository: "org/r", HourlyRateUSD: 1.00}); err != nil {
 		t.Fatal(err)
 	}
-	now = now.Add(time.Hour) // 2026-12-01 00:00:00Z -> next day AND next month!
+	now = now.Add(time.Hour)
+	if atBoundary := tracker.Snapshot(); atBoundary.DailySpendUSD != 0 || atBoundary.MonthlySpendUSD != 0 {
+		t.Fatalf("prior window charged again: %#v", atBoundary)
+	}
+	now = now.Add(30 * time.Minute)
 	tracker.Release("org/r:1")
 
 	// Reload from disk on the new day/month; persisted state restores cleanly.
@@ -114,10 +118,10 @@ func TestUTCDayAndMonthRolloverAndPersistence(t *testing.T) {
 
 	// Advance to next UTC day inside same month: daily resets, monthly persists.
 	now = now.Add(24 * time.Hour)
-	if snap := reloaded.Snapshot(); snap.Day != "2026-12-02" || snap.DailySpendUSD != 0 || snap.MonthlySpendUSD < 0.99 {
+	if snap := reloaded.Snapshot(); snap.Day != "2026-12-02" || snap.DailySpendUSD != 0 || snap.MonthlySpendUSD != 0.5 {
 		t.Fatalf("next-day snapshot = %#v", snap)
 	}
-	if err := reloaded.Reserve(Reservation{Key: "org/r:2", Repository: "org/r", HourlyRateUSD: 0.50}); !errors.Is(err, ErrBudgetExceeded) {
+	if err := reloaded.Reserve(Reservation{Key: "org/r:2", Repository: "org/r", HourlyRateUSD: 0.80}); !errors.Is(err, ErrBudgetExceeded) {
 		t.Fatalf("monthly cap after day rollover = %v, want ErrBudgetExceeded", err)
 	}
 }

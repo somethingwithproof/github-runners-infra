@@ -676,7 +676,7 @@ func (h *Handler) reconcileLiveness(ctx context.Context, cutoff time.Time) []err
 		// reconcileOrphanedInstances; tag-based sweeps cannot prove absence of
 		// an instance whose ownership tags were stripped.
 		if !confirmsAbsence && eligibleErr == nil {
-			if released, releaseErr := h.store.ReleaseSweptOrphans(ctx, h.provider, cutoff, knownInstances, eligibleOrphans); releaseErr != nil {
+			if released, releaseErr := h.store.ReleaseSweptOrphans(ctx, h.provider, cutoff, knownInstances, eligibleOrphans, h.budgetTracker.Settle); releaseErr != nil {
 				reconciliationErrors = append(reconciliationErrors, fmt.Errorf("release swept orphan admission: %w", releaseErr))
 			} else if released != 0 {
 				log.Printf("WARN: released %d swept orphan records from fleet admission", released)
@@ -859,6 +859,9 @@ func (h *Handler) reconcileProviderFoundRunner(ctx context.Context, record state
 			return false, fmt.Errorf("clear provider-missing observations for %s: %w", record.Key, err)
 		}
 	}
+	if record.GitHubRunnerID == 0 {
+		return false, nil
+	}
 	runnerStatus, err := h.githubClient.RepoRunnerStatus(ctx, record.Owner, record.Repository, record.GitHubRunnerID)
 	if err != nil {
 		wrapped := fmt.Errorf("check GitHub registration for %s: %w", record.Key, err)
@@ -1039,6 +1042,10 @@ func (h *Handler) deleteUntrackedExpiredRunner(ctx context.Context, record state
 	if err := h.computeClient.CleanupRunner(ctx, record.Key); err != nil {
 		return h.untrackedCleanupFailed(ctx, record, attempt, fmt.Errorf("clean up untracked provider resources for %s: %w", record.Key, err))
 	}
+	if err := h.budgetTracker.Settle(record.Key); err != nil {
+		deferErr := h.store.DeferRateLimitedCleanup(context.WithoutCancel(ctx), record.Key, err.Error(), time.Now().Add(retryDelay(attempt)), h.maxAttempts, false)
+		return errors.Join(fmt.Errorf("settle cleaned up runner %s: %w", record.Key, err), deferErr)
+	}
 	return h.store.MarkDeleted(ctx, record.Key)
 }
 
@@ -1115,7 +1122,7 @@ func (h *Handler) provision(ctx context.Context, record state.Record) {
 		return
 	}
 	if found {
-		if record.GitHubRunnerID == 0 {
+		if record.GitHubRunnerID == 0 && !h.disableJITConfig {
 			if deleteErr := h.computeClient.DeleteRunner(ctx, existing.ID, record.Key); deleteErr != nil {
 				h.provisionFailed(ctx, record, fmt.Errorf("delete runner with missing JIT identity: %w", deleteErr))
 				return

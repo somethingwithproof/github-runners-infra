@@ -7,6 +7,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"text/template"
@@ -156,6 +157,13 @@ func TestHandlerPrebakedEgressAndRegistrationTokenFallback(t *testing.T) {
 		t.Fatalf("unexpected fallback auth params: %#v", comp.lastParams)
 	}
 
+	provisioned, _, err := store.Get(ctx, key)
+	if err != nil || provisioned.GitHubRunnerID != 0 || provisioned.GitHubRunnerOwned {
+		t.Fatalf("unknown registration identity: %#v, %v", provisioned, err)
+	}
+	if deleted, err := handler.reconcileProviderFoundRunner(ctx, provisioned); err != nil || deleted || ghClient.statusChecks != 0 {
+		t.Fatalf("fallback runner liveness: deleted=%v checks=%d err=%v", deleted, ghClient.statusChecks, err)
+	}
 	tmpl, err := template.ParseFiles("../../cloud-init/runner.yaml.tmpl")
 	if err != nil {
 		t.Fatal(err)
@@ -227,7 +235,7 @@ func TestHandlerLabelBasedSpotAndOnDemandPrecedenceWithSizeAndBudget(t *testing.
 			if comp.lastParams.InstanceSize != tc.wantSize {
 				t.Fatalf("InstanceSize = %q, want %q", comp.lastParams.InstanceSize, tc.wantSize)
 			}
-			if (comp.lastParams.Spot == nil) != (tc.wantSpot == nil) || (tc.wantSpot != nil && *comp.lastParams.Spot != *tc.wantSpot) {
+			if !reflect.DeepEqual(comp.lastParams.Spot, tc.wantSpot) {
 				t.Fatalf("Spot = %v, want %v", comp.lastParams.Spot, tc.wantSpot)
 			}
 		})

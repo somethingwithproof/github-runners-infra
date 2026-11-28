@@ -170,6 +170,9 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 	}
 	useSpot := compute.ResolveSpot(c.spot, params.Spot)
 	subnets := c.candidateSubnets()
+	if len(subnets) == 0 {
+		return nil, fmt.Errorf("AWS runner requires at least one nonempty subnet ID")
+	}
 
 	inst, err := c.runAcrossSubnets(ctx, params, instanceType, subnets, useSpot, false)
 	if err == nil {

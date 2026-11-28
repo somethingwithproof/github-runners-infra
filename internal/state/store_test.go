@@ -695,7 +695,7 @@ func TestOrphanedInstanceHoldsAdmissionUntilProviderSweep(t *testing.T) {
 	if err != nil || claimed != nil {
 		t.Fatalf("orphaned live instance released admission: %#v, %q, %v", claimed, kind, err)
 	}
-	if released, err := store.ReleaseSweptOrphans(context.Background(), "test", time.Now().Add(time.Hour), nil, nil); err != nil || released != 1 {
+	if released, err := store.ReleaseSweptOrphans(context.Background(), "test", time.Now().Add(time.Hour), nil, nil, nil); err != nil || released != 1 {
 		t.Fatalf("release swept orphan = %d, %v", released, err)
 	}
 	claimed, kind, err = store.ClaimNext(context.Background(), time.Now(), 1)
@@ -1367,5 +1367,26 @@ func TestCompletionMarkerDoesNotConsumeAdmission(t *testing.T) {
 	store.mu.Unlock()
 	if live != 0 {
 		t.Fatalf("liveRunnerCountLocked = %d after only a completion; want 0", live)
+	}
+}
+
+func TestRouterStartupRequiresDrainedSingleProviderState(t *testing.T) {
+	store := openTestStore(t)
+	record := Record{Key: "org/repo:17", Provider: "digitalocean", Owner: "org", Repository: "repo", JobID: 17}
+	ctx := context.Background()
+	if _, err := store.Create(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkProvisioned(ctx, record.Key, "123", 45, "runner"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ValidateRoutedState(); err == nil {
+		t.Fatal("router accepted a live provider-native ID")
+	}
+	if err := store.MarkDeleted(context.Background(), record.Key); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ValidateRoutedState(); err != nil {
+		t.Fatalf("drained state: %v", err)
 	}
 }

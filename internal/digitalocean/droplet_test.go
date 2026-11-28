@@ -98,7 +98,7 @@ func TestCloudInitContainsOnlyJITBootstrapMaterial(t *testing.T) {
 		out, err := compute.RenderCloudInit(tmpl, compute.RunnerParams{
 			RunnerJITConfig:        "encoded-jit-config",
 			PrebakedImage:          true,
-			EgressAllowlist:        []string{"api.github.com", "140.82.112.0/20"},
+			EgressAllowlist:        []string{"api.github.com", "140.82.112.0/20", "2001:db8::/32"},
 			DeadmanShutdownMinutes: 180,
 		})
 		if err != nil {
@@ -107,8 +107,10 @@ func TestCloudInitContainsOnlyJITBootstrapMaterial(t *testing.T) {
 		if strings.Contains(out, "package_update: true") || strings.Contains(out, "omnitruck.chef.io") {
 			t.Fatalf("prebaked cloud-init should skip package install and tarball download:\n%s", out)
 		}
-		if !strings.Contains(out, "iptables -A OUTPUT -j REJECT") || !strings.Contains(out, "'api.github.com'") {
-			t.Fatalf("egress allowlist rules missing:\n%s", out)
+		for _, expected := range []string{"for filter in iptables ip6tables", `"$filter" -A RUNNER_HTTPS -j REJECT`, `"$filter" -I OUTPUT 1 -j RUNNER_HTTPS`, "'api.github.com'", "'2001:db8::/32'"} {
+			if !strings.Contains(out, expected) {
+				t.Errorf("missing egress rule %q", expected)
+			}
 		}
 	})
 }

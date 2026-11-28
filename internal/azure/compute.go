@@ -68,7 +68,7 @@ type virtualMachinesClient struct {
 }
 
 func (c *virtualMachinesClient) Get(ctx context.Context, group, name string) (armcompute.VirtualMachine, error) {
-	response, err := c.client.Get(ctx, group, name, nil)
+	response, err := c.client.Get(ctx, group, name, &armcompute.VirtualMachinesClientGetOptions{Expand: enumPtr(armcompute.InstanceViewTypesInstanceView)})
 	return response.VirtualMachine, err
 }
 

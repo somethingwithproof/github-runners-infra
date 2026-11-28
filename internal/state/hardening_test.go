@@ -123,7 +123,7 @@ func TestReleaseSweptOrphansProtectsOwnershipMismatchAndTOCTOU(t *testing.T) {
 		"org/repo:eligible":  "inst-eligible",
 	}
 
-	released, err := store.ReleaseSweptOrphans(ctx, "test", cutoff, known, eligible)
+	released, err := store.ReleaseSweptOrphans(ctx, "test", cutoff, known, eligible, nil)
 	if err != nil || released != 1 {
 		t.Fatalf("ReleaseSweptOrphans = %d, %v, want 1", released, err)
 	}

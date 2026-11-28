@@ -156,39 +156,66 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 // Close releases transports owned by the Google client.
 func (c *Client) Close() error { return c.instances.Close() }
 
-func (c *Client) FindRunner(ctx context.Context, jobKey string) (*compute.RunnerInstance, bool, error) {
+func (c *Client) ownedInstance(ctx context.Context, jobKey string) (*computepb.Instance, error) {
 	name := resourceName(jobKey)
-	instance, err := c.instances.Get(ctx, &computepb.GetInstanceRequest{Project: c.projectID, Zone: c.zone, Instance: name})
+	vm, err := c.instances.Get(ctx, &computepb.GetInstanceRequest{Project: c.projectID, Zone: c.zone, Instance: name})
+	if isNotFound(err) {
+		return nil, nil
+	}
 	if err != nil {
-		if isNotFound(err) {
-			return nil, false, nil
-		}
-		return nil, false, fmt.Errorf("find GCP runner: %w", err)
+		return nil, fmt.Errorf("find GCP runner: %w", err)
 	}
-	if instance.Labels[controllerLabel] != c.controllerHash || instance.Labels[jobLabel] != shortHash(jobKey) {
-		return nil, false, fmt.Errorf("%w: GCP instance %s exists without expected ownership labels", compute.ErrOwnershipMismatch, name)
+	if vm == nil || vm.Labels[controllerLabel] != c.controllerHash || vm.Labels[jobLabel] != shortHash(jobKey) {
+		return nil, fmt.Errorf("%w: GCP instance %s exists without expected ownership labels", compute.ErrOwnershipMismatch, name)
 	}
-	if isAbsentStatus(instance.GetStatus()) {
-		return nil, false, nil
+	return vm, nil
+}
+
+func (c *Client) FindRunner(ctx context.Context, jobKey string) (*compute.RunnerInstance, bool, error) {
+	vm, err := c.ownedInstance(ctx, jobKey)
+	if err != nil || vm == nil || isStopped(vm.GetStatus()) {
+		return nil, false, err
 	}
+	name := resourceName(jobKey)
 	return &compute.RunnerInstance{ID: name, Name: name}, true, nil
 }
 
-// RunnerAbsent checks authoritative absence by GCP instance name, treating
-// missing or TERMINATED/preempted instances as absent.
+// RunnerAbsent checks that the instance has been deleted, including its reserved name.
 func (c *Client) RunnerAbsent(ctx context.Context, instanceID string) (bool, error) {
-	instance, err := c.instances.Get(ctx, &computepb.GetInstanceRequest{Project: c.projectID, Zone: c.zone, Instance: instanceID})
+	_, err := c.instances.Get(ctx, &computepb.GetInstanceRequest{Project: c.projectID, Zone: c.zone, Instance: instanceID})
+	if isNotFound(err) {
+		return true, nil
+	}
 	if err != nil {
-		if isNotFound(err) {
-			return true, nil
-		}
 		return false, fmt.Errorf("confirm GCP runner %s absence: %w", instanceID, err)
 	}
-	return isAbsentStatus(instance.GetStatus()), nil
+	return false, nil
+}
+
+func (c *Client) reuseOrRemoveStopped(ctx context.Context, jobKey string) (*compute.RunnerInstance, error) {
+	vm, err := c.ownedInstance(ctx, jobKey)
+	if err != nil || vm == nil {
+		return nil, err
+	}
+	name := resourceName(jobKey)
+	if !isStopped(vm.GetStatus()) {
+		return &compute.RunnerInstance{ID: name, Name: name}, nil
+	}
+	if err := c.DeleteRunner(ctx, name, jobKey); err != nil {
+		return nil, err
+	}
+	absent, err := c.RunnerAbsent(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	if !absent {
+		return nil, fmt.Errorf("stopped GCP instance %s is still being deleted", name)
+	}
+	return nil, nil
 }
 
 func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) (*compute.RunnerInstance, error) {
-	if existing, found, err := c.FindRunner(ctx, params.JobKey); err != nil || found {
+	if existing, err := c.reuseOrRemoveStopped(ctx, params.JobKey); err != nil || existing != nil {
 		return existing, err
 	}
 	machineType := c.machineType
@@ -306,7 +333,7 @@ func isNotFound(err error) bool {
 	return errors.As(err, &apiErr) && apiErr.Code == 404
 }
 
-func isAbsentStatus(instanceStatus string) bool {
+func isStopped(instanceStatus string) bool {
 	return strings.EqualFold(strings.TrimSpace(instanceStatus), "TERMINATED")
 }
 
@@ -338,11 +365,7 @@ func isCapacityError(err error) bool {
 }
 
 func (c *Client) CleanupRunner(ctx context.Context, jobKey string) error {
-	instance, found, err := c.FindRunner(ctx, jobKey)
-	if err != nil || !found {
-		return err
-	}
-	return c.DeleteRunner(ctx, instance.ID, jobKey)
+	return c.DeleteRunner(ctx, resourceName(jobKey), jobKey)
 }
 
 // SweepOrphanedRunners reclaims old controller-owned instances that are absent

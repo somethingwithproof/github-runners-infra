@@ -79,12 +79,18 @@ func run() error {
 		return i18n.Wrap(err, "webhook.err.create_compute", err)
 	}
 	defer closeCompute()
+	if _, routed := computeClient.(*router.MultiCloudRouter); routed {
+		if err := stateStore.ValidateRoutedState(); err != nil {
+			return err
+		}
+	}
 
 	budgetTracker, err := budget.NewTracker(budget.Config{
-		DailyCapUSD:     cfg.budgetDailyUSD,
-		MonthlyCapUSD:   cfg.budgetMonthlyUSD,
-		RepoDailyCapUSD: cfg.budgetRepoDailyUSD,
-		StatePath:       cfg.budgetStateFile,
+		DailyCapUSD:         cfg.budgetDailyUSD,
+		MonthlyCapUSD:       cfg.budgetMonthlyUSD,
+		RepoDailyCapUSD:     cfg.budgetRepoDailyUSD,
+		StatePath:           cfg.budgetStateFile,
+		ReservationDuration: cfg.maxRunnerAge,
 	})
 	if err != nil {
 		return i18n.Wrap(err, "webhook.err.invalid_config", err)
@@ -317,10 +323,7 @@ func newMultiCloudRouter(
 
 	for _, rawProvider := range providers {
 		name := strings.ToLower(strings.TrimSpace(rawProvider))
-		backendSpot := spot
-		if backendSpot && spotFallbackOnDemand && !router.ProviderSupportsSpot(name) {
-			backendSpot = false
-		}
+		backendSpot := spot && router.ProviderSupportsSpot(name)
 		// Disable per-backend on-demand fallback so the router exhausts spot
 		// capacity across all configured clouds before falling back to on-demand.
 		client, closeFn, err := newSingleComputeClient(startupCtx, lifetimeCtx, name, controllerID, cloudInitPath, backendSpot, false)
