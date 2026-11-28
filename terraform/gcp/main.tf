@@ -55,7 +55,8 @@ variable "controller_role" {
 }
 
 locals {
-  safe_id = replace(lower(var.controller_id), "_", "-")
+  safe_id       = replace(lower(var.controller_id), "_", "-")
+  firewall_name = "gh-runners-${local.safe_id}-deny-inbound"
 }
 
 resource "google_service_account" "runner" {
@@ -88,7 +89,7 @@ resource "google_project_iam_member" "controller" {
 
 resource "google_compute_firewall" "deny_inbound" {
   project                 = var.project_id
-  name                    = "gh-runners-${local.safe_id}-deny-inbound"
+  name                    = length(local.firewall_name) <= 63 ? local.firewall_name : "${substr(local.firewall_name, 0, 50)}-${substr(sha256(var.controller_id), 0, 12)}"
   network                 = var.network
   direction               = "INGRESS"
   priority                = 1000

@@ -89,8 +89,8 @@ func NormalizeBaseURL(raw, defaultURL, provider string) (string, error) {
 		return defaultURL, nil
 	}
 	parsed, err := url.Parse(trimmed)
-	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
-		return "", fmt.Errorf("invalid %s API base URL %q", provider, raw)
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || strings.Contains(trimmed, "#") {
+		return "", fmt.Errorf("invalid %s API base URL: require HTTPS without credentials, query, or fragment", provider)
 	}
 	return strings.TrimRight(trimmed, "/"), nil
 }
@@ -166,6 +166,14 @@ func DoJSON(ctx context.Context, cfg RESTRequest) error {
 	}
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, MaxRESTResponseBytes+1))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		msg := ""
+		if err == nil && len(raw) <= MaxRESTResponseBytes && cfg.ParseError != nil {
+			msg = strings.TrimSpace(cfg.ParseError(raw))
+		}
+		return &APIError{Provider: cfg.Provider, StatusCode: resp.StatusCode, Message: msg}
+	}
+
 	if err != nil {
 		return fmt.Errorf("read %s response: %w", cfg.Provider, err)
 	}
@@ -173,15 +181,7 @@ func DoJSON(ctx context.Context, cfg RESTRequest) error {
 		return fmt.Errorf("%s response exceeded %d bytes", cfg.Provider, MaxRESTResponseBytes)
 	}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		msg := ""
-		if cfg.ParseError != nil {
-			msg = strings.TrimSpace(cfg.ParseError(raw))
-		}
-		return &APIError{Provider: cfg.Provider, StatusCode: resp.StatusCode, Message: msg}
-	}
-
-	if cfg.Out == nil || len(bytes.TrimSpace(raw)) == 0 {
+	if cfg.Out == nil {
 		return nil
 	}
 	if err := json.Unmarshal(raw, cfg.Out); err != nil {

@@ -154,7 +154,7 @@ func TestLinodeConfigValidation(t *testing.T) {
 
 func newMockLinodeClient(t *testing.T, mock *linodeMock) (*Client, func()) {
 	t.Helper()
-	srv := httptest.NewServer(mock)
+	srv := httptest.NewTLSServer(mock)
 	tmplPath := writeLinodeTemplate(t, "#cloud-config\njit={{.RunnerJITConfig}}\ndeadman={{.DeadmanShutdownMinutes}}\n")
 	client, err := NewClient(Config{
 		Token: mock.token, Region: "us-east", InstanceType: "g6-standard-4",
@@ -242,7 +242,7 @@ func TestLinodePageSweepAndTimestamps(t *testing.T) {
 	freshTS := time.Now().Add(-10 * time.Minute).UTC().Format("2006-01-02T15:04:05")
 	var deleted, pages []string
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete {
 			deleted = append(deleted, strings.TrimPrefix(r.URL.Path, instancesBasePath))
 			_, _ = w.Write([]byte(`{}`))
@@ -288,7 +288,7 @@ func TestLinodeAmbiguousCreateAndOwnershipGuards(t *testing.T) {
 	params := compute.RunnerParams{JobKey: "org/repo:88", ProvisionEpoch: 3}
 	wantName := compute.DeterministicName("linode", params.JobKey, params.ProvisionEpoch)
 	state := "empty"
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			state = "created"
 			w.WriteHeader(http.StatusServiceUnavailable)
