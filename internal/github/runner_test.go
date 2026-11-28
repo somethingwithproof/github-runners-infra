@@ -64,6 +64,20 @@ func TestGenerateRepoJITConfig(t *testing.T) {
 	}
 }
 
+func assertOrgRunnerTokenScope(t *testing.T, request *http.Request) {
+	t.Helper()
+	var scope struct {
+		Repositories []string
+		Permissions  map[string]string
+	}
+	if err := json.NewDecoder(request.Body).Decode(&scope); err != nil {
+		t.Fatal(err)
+	}
+	if scope.Repositories != nil || len(scope.Permissions) != 1 || scope.Permissions["organization_self_hosted_runners"] != "write" {
+		t.Fatalf("organization token scope: %#v", scope)
+	}
+}
+
 func TestGenerateOrgJITConfigAndRegistrationTokenFallback(t *testing.T) {
 	original := HTTPClient
 	t.Cleanup(func() { HTTPClient = original })
@@ -73,16 +87,7 @@ func TestGenerateOrgJITConfigAndRegistrationTokenFallback(t *testing.T) {
 		paths = append(paths, request.Method+" "+request.URL.Path)
 		switch request.URL.Path {
 		case "/app/installations/2/access_tokens":
-			var scope struct {
-				Repositories []string
-				Permissions  map[string]string
-			}
-			if err := json.NewDecoder(request.Body).Decode(&scope); err != nil {
-				t.Fatal(err)
-			}
-			if scope.Repositories != nil || len(scope.Permissions) != 1 || scope.Permissions["organization_self_hosted_runners"] != "write" {
-				t.Fatalf("organization token scope: %#v", scope)
-			}
+			assertOrgRunnerTokenScope(t, request)
 			return &http.Response{StatusCode: 201, Body: io.NopCloser(strings.NewReader(`{"token":"org-token","expires_at":"2099-01-01T00:00:00Z","permissions":{"organization_self_hosted_runners":"write"}}`))}, nil
 		case "/orgs/trusted/actions/runners/generate-jitconfig":
 			if request.Header.Get("Authorization") != "Bearer org-token" {
