@@ -210,6 +210,9 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 
 	reqBody := c.buildCreateRequest(desiredName, instanceType, params.JobKey, rootPass, userData)
 	var created linodeInstance
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := c.doJSON(ctx, http.MethodPost, instancesPath, "", reqBody, &created); err != nil {
 		return c.handleCreateError(ctx, params.JobKey, desiredName, err)
 	}
@@ -235,8 +238,10 @@ func (c *Client) buildCreateRequest(name, instanceType, jobKey, rootPass, userDa
 		BackupsEnabled: false,
 		PrivateIP:      false,
 	}
-	if c.vpcSubnetID > 0 {
+	if c.firewallID > 0 || c.vpcSubnetID > 0 {
 		req.InterfaceGeneration = "legacy_config"
+	}
+	if c.vpcSubnetID > 0 {
 		req.Interfaces = []linodeInterface{{Purpose: "vpc", SubnetID: c.vpcSubnetID, IPv4: &linodeInterfaceIPv4{NAT: "any"}}}
 	}
 	return req

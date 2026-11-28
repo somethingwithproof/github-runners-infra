@@ -352,3 +352,16 @@ func TestLinodeAmbiguousCreateAndOwnershipGuards(t *testing.T) {
 		t.Fatalf("duplicate FindRunner error = %v", err)
 	}
 }
+
+func TestFirewallWithoutSubnetUsesLegacyInterfaces(t *testing.T) {
+	c := Client{firewallID: 55}
+	req := c.buildCreateRequest("runner", "g6-standard-4", "org/repo:1", "fixture", "")
+	if req.FirewallID != 55 || req.InterfaceGeneration != "legacy_config" || len(req.Interfaces) != 0 {
+		t.Fatal("firewall-only request must select legacy interfaces")
+	}
+	c.firewallID = 0
+	req = c.buildCreateRequest("runner", "g6-standard-4", "org/repo:1", "fixture", "")
+	if req.InterfaceGeneration != "" {
+		t.Fatal("unexpected interface override without firewall or VPC")
+	}
+}

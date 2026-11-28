@@ -409,7 +409,7 @@ cryptographically random throwaway root passwords (with root and password SSH
 disabled by cloud-init), controller and job ownership tags, `X-Filter` tag
 queries, ambiguous-create recovery polling, authoritative 404 absence checks,
 and paginated orphan sweeps. Provision the VPC, subnet, and default-DROP Cloud
-Firewall with [`terraform/linode`](terraform/linode). Set `LINODE_REGION` to the module’s `region` output. The VPC subnet option requires an account that permits legacy configuration interfaces. The runner uses 1:1 IPv4 NAT to reach GitHub through the cloud firewall. Powered-off Linode
+Firewall with [`terraform/linode`](terraform/linode). Set `LINODE_REGION` to the module’s `region` output. The firewall and VPC subnet options require an account that permits legacy configuration interfaces. With a VPC subnet configured, the runner uses 1:1 IPv4 NAT to reach GitHub through the cloud firewall. Powered-off Linode
 instances continue billing until destroyed by the controller.
 
 Drain all active records before changing `COMPUTE_PROVIDER`. State is bound to

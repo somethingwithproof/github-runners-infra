@@ -199,6 +199,9 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 
 	reqBody := c.buildCreateRequest(desiredName, plan, params.JobKey, userData)
 	var resp instanceResponse
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := c.doJSON(ctx, http.MethodPost, instancesPath, reqBody, &resp); err != nil {
 		return c.handleCreateError(ctx, params.JobKey, desiredName, err)
 	}

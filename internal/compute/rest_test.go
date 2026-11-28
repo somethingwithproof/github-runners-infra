@@ -35,8 +35,8 @@ func TestRESTHelpers(t *testing.T) {
 	if !IsAmbiguousCreateError(context.DeadlineExceeded) {
 		t.Fatal("a timed-out POST may have created the instance")
 	}
-	if IsAmbiguousCreateError(context.Canceled) {
-		t.Fatal("canceled should not be ambiguous")
+	if !IsAmbiguousCreateError(context.Canceled) {
+		t.Fatal("a canceled POST may have created the instance")
 	}
 
 	if !HasTag([]string{"a", "b"}, "b") || HasTag([]string{"a"}, "c") {
@@ -126,5 +126,20 @@ func TestDoJSONRequiresExpectedBodyAndPreservesErrorStatus(t *testing.T) {
 	}
 	if err := request("/list", &list); err != nil || list == nil {
 		t.Fatalf("empty JSON list = %v %v", list, err)
+	}
+}
+
+func TestRecoverCreateAfterCallerCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	found := RunnerInstance{ID: "existing"}
+	runner, err := RecoverCreateError(ctx, "test", "runner", time.Second, time.Millisecond, context.Canceled, func(poll context.Context) (*RunnerInstance, error) {
+		if err := poll.Err(); err != nil {
+			t.Fatalf("recovery context canceled: %v", err)
+		}
+		return &found, nil
+	}, func(inst *RunnerInstance) *RunnerInstance { return inst })
+	if err != nil || runner != &found {
+		t.Fatalf("recovered instance = %v, %v", runner, err)
 	}
 }
