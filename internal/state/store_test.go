@@ -78,12 +78,13 @@ func TestMissingConfirmationsAreIsolatedBySource(t *testing.T) {
 	if err := store.MarkProvisioned(context.Background(), record.Key, "i-missing", 1, "runner"); err != nil {
 		t.Fatal(err)
 	}
+	guard := RunnerGuard{InstanceID: "i-missing", GitHubRunnerID: 1}
 	for observation := 0; observation < 2; observation++ {
-		if confirmed, err := store.ObserveGitHubRunnerMissing(context.Background(), record.Key, time.Now(), 0, 3); err != nil || confirmed {
+		if confirmed, err := store.ObserveGitHubRunnerMissing(context.Background(), record.Key, guard, time.Now(), 0, 3); err != nil || confirmed {
 			t.Fatalf("GitHub observation %d = %v, %v", observation, confirmed, err)
 		}
 	}
-	if confirmed, err := store.ObserveRunnerMissing(context.Background(), record.Key, time.Now(), 0, 3); err != nil || confirmed {
+	if confirmed, err := store.ObserveRunnerMissing(context.Background(), record.Key, guard, time.Now(), 0, 3); err != nil || confirmed {
 		t.Fatalf("provider observation inherited GitHub confirmations: %v, %v", confirmed, err)
 	}
 	persisted, _, err := store.Get(context.Background(), record.Key)
@@ -357,8 +358,8 @@ func TestMissingRunnerRotatesProvisionEpoch(t *testing.T) {
 	if err := store.MarkProvisioned(context.Background(), record.Key, "instance", 1, "runner"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RequeueMissingRunner(context.Background(), record.Key, 3); err != nil {
-		t.Fatal(err)
+	if requeued, err := store.RequeueMissingRunner(context.Background(), record.Key, RunnerGuard{InstanceID: "instance", GitHubRunnerID: 1}, 3); err != nil || !requeued {
+		t.Fatalf("requeue = %v, %v", requeued, err)
 	}
 	requeued, _, _ := store.Get(context.Background(), record.Key)
 	if requeued.ProvisionEpoch != 1 || requeued.Status != StatusPending {
@@ -674,7 +675,7 @@ func TestOrphanedInstanceHoldsAdmissionUntilProviderSweep(t *testing.T) {
 	if err := store.MarkDeleteFailed(context.Background(), first.Key, "permanent failure", time.Now(), 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ScheduleDeletion(context.Background(), first.Key); err != nil {
+	if err := store.ScheduleDeletion(context.Background(), first.Key, RunnerGuard{InstanceID: "instance"}); err != nil {
 		t.Fatal(err)
 	}
 	orphan, _, _ := store.Get(context.Background(), first.Key)
@@ -724,7 +725,7 @@ func TestDeletedStateRejectsLateWorkerWrites(t *testing.T) {
 	if err := store.MarkDeleteFailed(context.Background(), record.Key, "late delete failure", time.Now(), 3); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ScheduleDeletion(context.Background(), record.Key); err != nil {
+	if err := store.ScheduleDeletion(context.Background(), record.Key, RunnerGuard{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MarkOrphaned(context.Background(), record.Key, "late orphan"); err != nil {
@@ -926,7 +927,7 @@ func TestTTLDoesNotResetExhaustedDeletionAttempts(t *testing.T) {
 		if err := store.MarkDeleteFailed(context.Background(), record.Key, "transient", time.Now(), maxAttempts); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.ScheduleDeletion(context.Background(), record.Key); err != nil {
+		if err := store.ScheduleDeletion(context.Background(), record.Key, RunnerGuard{InstanceID: "i-11"}); err != nil {
 			t.Fatal(err)
 		}
 		if attempt < maxAttempts {
@@ -984,8 +985,8 @@ func TestReconciliationDeferralBudgetsBecomeTerminal(t *testing.T) {
 			}
 			for attempt := 0; attempt < 2; attempt++ {
 				if err := store.DeferReconciliation(
-					context.Background(), record.Key, "reconciliation failed", time.Now(), 2,
-					test.countFailure, test.countThrottle,
+					context.Background(), record.Key, RunnerGuard{}, "reconciliation failed", time.Now(),
+					DeferPolicy{MaxAttempts: 2, CountFailure: test.countFailure, CountThrottle: test.countThrottle},
 				); err != nil {
 					t.Fatal(err)
 				}

@@ -129,7 +129,15 @@ The controller rejects public repositories by default. An explicit
 `ALLOWED_PUBLIC_REPOSITORIES` subset can opt trusted repositories into run-origin
 verification: GitHub's workflow-run record must show a non-fork head with the
 same repository identity, and pull-request head/base repository IDs must match.
-Fork PRs and unverified origins cannot provision runners. See
+Fork PRs and unverified origins cannot provision runners. Every repository in
+`ALLOWED_PUBLIC_REPOSITORIES` MUST also enable GitHub's **Require approval for
+all outside collaborators** Actions policy (under Repository Settings ->
+Actions -> General -> Fork pull request workflows from outside collaborators),
+because repository-scoped JIT runners are not bound to a single job ID and could
+otherwise be claimed by an unapproved fork workflow while online; if a public
+repository runner completes a cross-job reassignment, the controller also
+verifies the completing run's origin and halts capacity replenishment if the run
+is untrusted. See
 [the Kadupul deployment](deploy/kadupul/README.md) for the isolated rollout.
 Self-hosted workflows still execute
 repository code with root-equivalent Docker access on an isolated VM, so permit

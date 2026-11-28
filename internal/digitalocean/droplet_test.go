@@ -359,26 +359,67 @@ func TestDropletNameIsStableAndEpochScoped(t *testing.T) {
 }
 
 func TestAmbiguousCreateErrorClassification(t *testing.T) {
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	expiredCtx, cancelDeadline := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelDeadline()
+
 	for _, test := range []struct {
 		name      string
+		ctx       context.Context
 		err       error
 		ambiguous bool
 	}{
-		{name: "transport", err: errors.New("connection reset"), ambiguous: true},
-		{name: "request timeout", err: doStatusError(http.StatusRequestTimeout), ambiguous: true},
-		{name: "server error", err: doStatusError(http.StatusInternalServerError), ambiguous: true},
-		{name: "service unavailable", err: doStatusError(http.StatusServiceUnavailable), ambiguous: true},
-		{name: "conflict", err: doStatusError(http.StatusConflict), ambiguous: false},
-		{name: "too early", err: doStatusError(http.StatusTooEarly), ambiguous: false},
-		{name: "rate limited", err: doStatusError(http.StatusTooManyRequests), ambiguous: false},
-		{name: "canceled", err: context.Canceled, ambiguous: false},
-		{name: "deadline", err: context.DeadlineExceeded, ambiguous: false},
+		{name: "transport", ctx: context.Background(), err: errors.New("connection reset"), ambiguous: true},
+		{name: "request timeout", ctx: context.Background(), err: doStatusError(http.StatusRequestTimeout), ambiguous: true},
+		{name: "server error", ctx: context.Background(), err: doStatusError(http.StatusInternalServerError), ambiguous: true},
+		{name: "service unavailable", ctx: context.Background(), err: doStatusError(http.StatusServiceUnavailable), ambiguous: true},
+		{name: "http client deadline with live context", ctx: context.Background(), err: context.DeadlineExceeded, ambiguous: true},
+		{name: "conflict", ctx: context.Background(), err: doStatusError(http.StatusConflict), ambiguous: false},
+		{name: "too early", ctx: context.Background(), err: doStatusError(http.StatusTooEarly), ambiguous: false},
+		{name: "rate limited", ctx: context.Background(), err: doStatusError(http.StatusTooManyRequests), ambiguous: false},
+		{name: "parent canceled", ctx: canceledCtx, err: context.Canceled, ambiguous: false},
+		{name: "parent deadline", ctx: expiredCtx, err: context.DeadlineExceeded, ambiguous: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if got := isAmbiguousCreateError(test.err); got != test.ambiguous {
+			if got := isAmbiguousCreateError(test.ctx, test.err); got != test.ambiguous {
 				t.Fatalf("isAmbiguousCreateError() = %v, want %v", got, test.ambiguous)
 			}
 		})
+	}
+}
+
+func TestCreateRunnerRecoversAfterHTTPClientTimeoutWithLiveContext(t *testing.T) {
+	params := compute.RunnerParams{JobKey: "org/repo:timeout-recover", ProvisionEpoch: 1, RunnerName: "display-name"}
+	wantName := dropletName(params.JobKey, params.ProvisionEpoch)
+	listCalls := 0
+	httpClient := &http.Client{Transport: doRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/v2/droplets":
+			listCalls++
+			if listCalls == 1 {
+				return jsonResponse(http.StatusOK, `{"droplets":[]}`), nil
+			}
+			return jsonResponse(http.StatusOK, `{"droplets":[{"id":88,"name":"`+wantName+`","tags":["runner-controller-test"]}]}`), nil
+		case request.Method == http.MethodGet && request.URL.Path == "/v2/firewalls":
+			return jsonResponse(http.StatusOK, `{"firewalls":[{"id":"firewall-id","tags":["runner-controller-test"],"inbound_rules":[]}]}`), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/v2/droplets":
+			// Simulate http.Client.Timeout returning DeadlineExceeded while caller ctx is still live.
+			return nil, context.DeadlineExceeded
+		default:
+			t.Fatalf("unexpected request %s %s", request.Method, request.URL.Path)
+			return nil, nil
+		}
+	})}
+	client := &Client{
+		client: godo.NewClient(httpClient), cloudInitTmpl: template.Must(template.New("cloud-init").Parse("bootstrap")),
+		region: "nyc3", size: "s-1vcpu-1gb", image: "ubuntu", controllerTag: "runner-controller-test",
+		vpcUUID: "vpc-id", firewallID: "firewall-id",
+		recoveryTimeout: 50 * time.Millisecond, recoveryPoll: time.Millisecond,
+	}
+	instance, err := client.CreateRunner(context.Background(), params)
+	if err != nil || instance == nil || instance.ID != "88" {
+		t.Fatalf("CreateRunner after client timeout = %#v, %v", instance, err)
 	}
 }
 

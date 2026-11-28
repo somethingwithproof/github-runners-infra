@@ -34,7 +34,7 @@ func TestDemandDeferralPreservesConcurrentCompletion(t *testing.T) {
 				}
 			}
 			retryAt := time.Now().Add(time.Hour)
-			if err := store.DeferProvisioningDemand(ctx, key, "unconfirmed demand", retryAt); err != nil {
+			if err := store.DeferProvisioningDemand(ctx, key, "unconfirmed demand", retryAt, DeferPolicy{MaxAttempts: 3, MaxAge: time.Hour}); err != nil {
 				t.Fatal(err)
 			}
 			record, _, err := store.Get(ctx, key)
@@ -45,7 +45,7 @@ func TestDemandDeferralPreservesConcurrentCompletion(t *testing.T) {
 				if record.Status != StatusCompleted || !record.NextAttemptAt.IsZero() {
 					t.Fatalf("completion resurrected: %#v", record)
 				}
-			} else if record.Status != StatusPending || !record.NextAttemptAt.Equal(retryAt) || !record.DeferDeletion {
+			} else if record.Status != StatusPending || !record.NextAttemptAt.Equal(retryAt) || record.DeferDeletion {
 				t.Fatalf("retry not safely deferred: %#v", record)
 			}
 		})

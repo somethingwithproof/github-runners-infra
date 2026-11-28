@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -148,5 +149,43 @@ func TestUnacceptedDeletionStillRejectsForeignOwnership(t *testing.T) {
 	}
 	if client.cleanupCalls != 0 {
 		t.Fatal("foreign resource reached duplicate cleanup")
+	}
+}
+
+func TestExhaustedConfirmationRecordsEndOfReassignmentDemand(t *testing.T) {
+	handler, store, _, cloud := newTestHandler(t)
+	record := reassignedCompletion(t, store)
+	checker := &absenceCompute{fakeCompute: cloud}
+	handler.computeClient = checker
+	handler.maxRunnerAge = time.Nanosecond
+	handler.delete(context.Background(), record)
+	current, _, err := store.Get(context.Background(), record.Key)
+	if err != nil || current.Status != state.StatusOrphaned || current.InstanceID != record.InstanceID || current.RecheckDemand || current.ReassignedRunID != 0 || !strings.Contains(current.LastError, "replenishment stopped") {
+		t.Fatalf("terminal confirmation: %#v, %v", current, err)
+	}
+	checker.absent = true
+	if errs := handler.reconcileOrphanedInstances(context.Background()); len(errs) != 0 {
+		t.Fatal(errs)
+	}
+	next, _, err := store.ClaimNext(context.Background(), time.Now().Add(time.Hour), 3)
+	if err != nil || next != nil {
+		t.Fatalf("unexpected replacement after terminal confirmation: %#v, %v", next, err)
+	}
+}
+
+func TestConfirmationDeadlineSchedulesRetry(t *testing.T) {
+	handler, store, _, cloud := newTestHandler(t)
+	record := reassignedCompletion(t, store)
+	handler.computeClient = &absenceCompute{fakeCompute: cloud, err: context.DeadlineExceeded}
+	if err := store.MarkDeletionAccepted(context.Background(), record.Key, record.InstanceID); err != nil {
+		t.Fatal(err)
+	}
+	record.DeletionAcceptedID = record.InstanceID
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	handler.delete(expired, record)
+	current, _, err := store.Get(context.Background(), record.Key)
+	if err != nil || current.ConfirmAttempts != 1 || !current.NextAttemptAt.After(time.Now()) || current.DeleteAttempts != 0 {
+		t.Fatalf("confirmation after work deadline: %#v %v", current, err)
 	}
 }

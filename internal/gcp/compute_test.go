@@ -173,6 +173,29 @@ func TestDeleteRunnerIsIdempotentAndRejectsForeignOwnership(t *testing.T) {
 	}
 }
 
+func TestDeleteAndSweepIgnoreRESTNotFoundOnOperationWait(t *testing.T) {
+	jobKey := "org/repo:rest-404"
+	name := resourceName(jobKey)
+	created := time.Now().Add(-2 * time.Hour).Format(time.RFC3339)
+	instances := &fakeInstances{
+		instance: &computepb.Instance{Name: &name, Labels: map[string]string{
+			controllerLabel: shortHash("primary"), jobLabel: shortHash(jobKey),
+		}},
+		instances: []*computepb.Instance{{
+			Name: &name, CreationTimestamp: &created,
+			Labels: map[string]string{controllerLabel: shortHash("primary")},
+		}},
+		deleteOp: fakeOperation{err: &googleapi.Error{Code: 404}},
+	}
+	client := testClient(instances)
+	if err := client.DeleteRunner(context.Background(), name, jobKey); err != nil {
+		t.Fatalf("DeleteRunner REST 404 wait = %v", err)
+	}
+	if deleted, err := client.SweepOrphanedRunners(context.Background(), nil, time.Now().Add(-time.Hour)); err != nil || deleted != 1 {
+		t.Fatalf("SweepOrphanedRunners REST 404 wait = %d, %v", deleted, err)
+	}
+}
+
 func TestCleanupRunnerDeletesOwnedInstance(t *testing.T) {
 	jobKey := "org/repo:cleanup"
 	name := resourceName(jobKey)

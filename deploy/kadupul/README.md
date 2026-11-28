@@ -23,8 +23,13 @@ workflow-run, and comment events are rejected.
 
 Repository workflows select `[self-hosted, Linux, X64, kadupul-do]` for trusted
 events only when `DO_RUNNERS_ENABLED=true`. External fork PRs keep their
-GitHub-hosted runner selection. These protections operate in the controller as
-well as the workflows: a workflow label alone cannot authorize cloud capacity.
+GitHub-hosted runner selection. Every repository in
+`ALLOWED_PUBLIC_REPOSITORIES` MUST enforce GitHub's **Require approval for all
+outside collaborators** Actions policy so unapproved fork workflows cannot queue
+and race for an online repository-scoped JIT runner. These protections operate
+in the controller as well as the workflows: a workflow label alone cannot
+authorize cloud capacity, and cross-job replenishment halts if a public
+repository runner executes an untrusted workflow run.
 
 Each VM receives a single-job JIT runner configuration, never a cloud token,
 App private key, or controller callback secret. The Kadupul template omits

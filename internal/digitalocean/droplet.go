@@ -175,7 +175,7 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 
 	droplet, _, err := c.client.Droplets.Create(ctx, createReq)
 	if err != nil {
-		if !isAmbiguousCreateError(err) {
+		if !isAmbiguousCreateError(ctx, err) {
 			return nil, fmt.Errorf("create droplet: %w", err)
 		}
 		recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.recoveryTimeout)
@@ -513,8 +513,8 @@ func isNotFound(err error) bool {
 	return errors.As(err, &response) && response.Response != nil && response.Response.StatusCode == http.StatusNotFound
 }
 
-func isAmbiguousCreateError(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+func isAmbiguousCreateError(ctx context.Context, err error) bool {
+	if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && ctx != nil && ctx.Err() != nil {
 		return false
 	}
 	var response *godo.ErrorResponse

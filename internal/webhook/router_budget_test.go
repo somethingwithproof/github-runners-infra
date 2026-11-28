@@ -5,6 +5,8 @@ package webhook
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -237,5 +239,66 @@ func TestHandlerLabelBasedSpotAndOnDemandPrecedenceWithSizeAndBudget(t *testing.
 				t.Fatalf("Spot = %v, want %v", comp.lastParams.Spot, tc.wantSpot)
 			}
 		})
+	}
+}
+
+func openSettlementState(t *testing.T, handler *Handler, storePath, ledgerPath string) (*state.FileStore, *budget.Tracker) {
+	t.Helper()
+	st, err := state.OpenFileStore(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	ledger, err := budget.NewTracker(budget.Config{StatePath: ledgerPath, DailyCapUSD: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.store, handler.budgetTracker = st, ledger
+	return st, ledger
+}
+
+func TestDeletedRunnerSettlementRetriesAcrossRestart(t *testing.T) {
+	handler, _, githubClient, _ := newTestHandler(t)
+	githubClient.jobStates = map[int64]gh.JobStatus{42: gh.JobCompleted}
+	ctx := context.Background()
+	dir := t.TempDir()
+	storePath := filepath.Join(dir, "state.json")
+	ledgerPath := filepath.Join(dir, "budget.json")
+	store, tracker := openSettlementState(t, handler, storePath, ledgerPath)
+	record := reassignedCompletion(t, store)
+	if err := tracker.Reserve(budget.Reservation{Key: record.Key, HourlyRateUSD: 1}); err != nil {
+		t.Fatal(err)
+	}
+	backup := ledgerPath + ".saved"
+	if err := os.Rename(ledgerPath, backup); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(ledgerPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	handler.delete(ctx, record)
+	current, _, err := store.Get(ctx, record.Key)
+	if err != nil || current.Status != state.StatusCompleted || current.ClaimedWork != "" || !current.NextAttemptAt.After(time.Now()) || tracker.Snapshot().InFlightSpendUSD <= 0 {
+		t.Fatalf("failed settlement lost retry: %#v, %v", current, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(ledgerPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(backup, ledgerPath); err != nil {
+		t.Fatal(err)
+	}
+	store, tracker = openSettlementState(t, handler, storePath, ledgerPath)
+	next, kind, err := store.ClaimNext(ctx, time.Now().Add(time.Hour), 3)
+	if err != nil || next == nil || kind != state.WorkDelete {
+		t.Fatalf("settlement retry: %#v %v %v", next, kind, err)
+	}
+	handler.delete(ctx, *next)
+	current, _, err = store.Get(ctx, record.Key)
+	costs := tracker.Snapshot()
+	if err != nil || current.Status != state.StatusDeleted || costs.InFlightSpendUSD != 0 || costs.DailySpendUSD <= 0 {
+		t.Fatalf("retried settlement: %#v, %#v, %v", current, costs, err)
 	}
 }
