@@ -144,7 +144,7 @@ type Store interface {
 	DeferDeletionConfirmation(context.Context, string, string, time.Time, DeferPolicy) error
 	BeginCleanupAttempt(context.Context, string, int) (int, bool, error)
 	MarkDeleteFailed(context.Context, string, string, time.Time, int) error
-	MarkOrphaned(context.Context, string, string) error
+	MarkOrphaned(context.Context, string, string, WorkKind) error
 	ListExpired(context.Context, time.Time) ([]Record, error)
 	ListProvisioned(context.Context) ([]Record, error)
 	ListOrphaned(context.Context) ([]Record, error)
@@ -159,7 +159,7 @@ type Store interface {
 	ClearRunnerMissing(context.Context, string, RunnerGuard) error
 	DeferReconciliation(context.Context, string, RunnerGuard, string, time.Time, DeferPolicy) error
 	DeferRateLimitedCleanup(context.Context, string, string, time.Time, int, bool) error
-	DeferOrphanCleanup(context.Context, string, string, time.Time) error
+	DeferOrphanCleanup(context.Context, string, string, time.Time, bool) error
 	RequeueMissingRunner(context.Context, string, RunnerGuard, int) (bool, error)
 	PruneDeleted(context.Context) (int, error)
 }
@@ -1113,12 +1113,17 @@ func (s *FileStore) DeferRateLimitedCleanup(_ context.Context, key, message stri
 
 // DeferOrphanCleanup records backoff while keeping an orphan terminal and
 // admission-safe.
-func (s *FileStore) DeferOrphanCleanup(_ context.Context, key, message string, retryAt time.Time) error {
+func (s *FileStore) DeferOrphanCleanup(_ context.Context, key, message string, retryAt time.Time, throttled bool) error {
 	return s.update(key, func(record *Record) {
 		if record.Status != StatusOrphaned {
 			return
 		}
 		record.ReconcileFailures++
+		if throttled {
+			record.ThrottleFailures++
+		} else {
+			record.ThrottleFailures = 0
+		}
 		record.LastError = message
 		record.NextAttemptAt = retryAt.UTC()
 	})
@@ -1370,8 +1375,8 @@ func (s *FileStore) MarkDeleteFailed(_ context.Context, key, message string, ret
 
 // MarkOrphaned records an operator-actionable terminal resource without
 // retrying unsafe provider mutation. A live instance still consumes admission.
-func (s *FileStore) MarkOrphaned(_ context.Context, key, message string) error {
-	return s.update(key, func(record *Record) {
+func (s *FileStore) MarkOrphaned(_ context.Context, key, message string, failedWork WorkKind) error {
+	return s.updateWithFailure(key, failedWork, func(record *Record) {
 		// Every other mutator returns early here; without this a late worker
 		// write resurrects a deleted record, and PruneDeleted then never
 		// collects it because GitHubRunnerID is still set.

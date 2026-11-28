@@ -48,6 +48,9 @@ func (s *FileStore) countLifecycleEvents(before, after Record, failure WorkKind)
 	}
 	provider := providerLabel(after.Provider)
 	counts := s.metrics[provider]
+	if before.Status == StatusOrphaned {
+		failure = ""
+	}
 	switch failure {
 	case WorkProvision:
 		counts.ProvisionFailures++

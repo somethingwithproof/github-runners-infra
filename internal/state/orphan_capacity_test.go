@@ -29,7 +29,7 @@ func TestReleaseAbsentOrphanRequiresMatchingInstanceAndTerminalState(t *testing.
 	if current.InstanceID != "123" {
 		t.Fatal("released active runner")
 	}
-	if err := store.MarkOrphaned(ctx, record.Key, "ownership mismatch"); err != nil {
+	if err := store.MarkOrphaned(ctx, record.Key, "ownership mismatch", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.ReleaseAbsentOrphan(ctx, record.Key, "456"); err != nil {

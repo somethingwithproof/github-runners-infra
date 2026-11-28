@@ -22,7 +22,7 @@ func TestMetricsListenerIsOptIn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if srv := newMetricsServer(cfg.metricsAddr, nil, nil, 20, "aws", nil); srv != nil {
+	if newMetricsServer(cfg.metricsAddr, nil, nil, 20, "aws", nil) != nil {
 		t.Fatal("unexpected metrics listener")
 	}
 	t.Setenv("METRICS_ADDR", "127.0.0.1:9090")

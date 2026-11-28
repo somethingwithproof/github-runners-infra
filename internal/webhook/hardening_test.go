@@ -145,7 +145,7 @@ func TestAbsenceCheckerProviderNeverUsesBlindAgeReleaseForLiveOrphans(t *testing
 
 	key := "trusted/private-repo:tag-stripped"
 	provisionWebhookRunner(t, store, key, "inst-live", 101)
-	if err := store.MarkOrphaned(ctx, key, compute.ErrOwnershipMismatch.Error()); err != nil {
+	if err := store.MarkOrphaned(ctx, key, compute.ErrOwnershipMismatch.Error(), ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -188,7 +188,7 @@ func TestNonCheckerSweepProtectsOwnershipMismatchAndTOCTOUOrphans(t *testing.T) 
 	toctouKey := "trusted/private-repo:toctou"
 	provisionWebhookRunner(t, store, ownershipKey, "inst-own", 10)
 	provisionWebhookRunner(t, store, toctouKey, "inst-toctou", 11)
-	if err := store.MarkOrphaned(ctx, ownershipKey, compute.ErrOwnershipMismatch.Error()); err != nil {
+	if err := store.MarkOrphaned(ctx, ownershipKey, compute.ErrOwnershipMismatch.Error(), ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.MarkCompleted(ctx, toctouKey); err != nil {
@@ -200,7 +200,7 @@ func TestNonCheckerSweepProtectsOwnershipMismatchAndTOCTOUOrphans(t *testing.T) 
 		fakeCompute: client,
 		onSweep: func() {
 			// Concurrent transition to orphaned while instance was in knownInstances.
-			_ = store.MarkOrphaned(ctx, toctouKey, "deletion retry budget exhausted")
+			_ = store.MarkOrphaned(ctx, toctouKey, "deletion retry budget exhausted", "")
 		},
 	}
 

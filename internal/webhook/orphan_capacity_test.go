@@ -55,7 +55,7 @@ func TestOrphanCapacityReleasedOnlyAfterExactProviderAbsence(t *testing.T) {
 			if err := store.MarkProvisioned(ctx, record.Key, "123", 101, "runner"); err != nil {
 				t.Fatal(err)
 			}
-			if err := store.MarkOrphaned(ctx, record.Key, "ownership mismatch"); err != nil {
+			if err := store.MarkOrphaned(ctx, record.Key, "ownership mismatch", ""); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := store.Create(ctx, state.Record{Key: "trusted/private-repo:2", DeliveryID: "delivery-2", Provider: "test"}); err != nil {
