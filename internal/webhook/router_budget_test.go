@@ -5,6 +5,7 @@ package webhook
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 	"text/template"
@@ -232,7 +233,7 @@ func TestHandlerLabelBasedSpotAndOnDemandPrecedenceWithSizeAndBudget(t *testing.
 			if comp.lastParams.InstanceSize != tc.wantSize {
 				t.Fatalf("InstanceSize = %q, want %q", comp.lastParams.InstanceSize, tc.wantSize)
 			}
-			if (comp.lastParams.Spot == nil) != (tc.wantSpot == nil) || (tc.wantSpot != nil && *comp.lastParams.Spot != *tc.wantSpot) {
+			if !reflect.DeepEqual(comp.lastParams.Spot, tc.wantSpot) {
 				t.Fatalf("Spot = %v, want %v", comp.lastParams.Spot, tc.wantSpot)
 			}
 		})
