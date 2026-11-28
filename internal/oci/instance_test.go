@@ -227,7 +227,6 @@ func assertPreemptibleLaunch(t *testing.T, launch launchInstanceRequest, token s
 	if err != nil || !strings.Contains(string(decodedUD), "spot=true") {
 		t.Fatalf("decoded user_data = %q, %v", decodedUD, err)
 	}
-
 }
 
 func TestOCISignatureFlexPreemptibleLifecycleAndPagination(t *testing.T) {
@@ -263,41 +262,50 @@ func TestOCISignatureFlexPreemptibleLifecycleAndPagination(t *testing.T) {
 	api.mu.Unlock()
 	assertPreemptibleLaunch(t, launch, token)
 
+	api.checkVisibility(client, params.JobKey, created.ID)
+	api.checkDeletion(client, params.JobKey, created.ID)
+}
+
+func (api *lifecycleAPI) setState(id, state string) {
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	instance := api.instances[id]
+	instance.LifecycleState = state
+	api.instances[id] = instance
+}
+
+func (api *lifecycleAPI) checkVisibility(client *Client, jobKey, instanceID string) {
+	t := api.t
+	t.Helper()
 	// FindRunner returns the created instance; RunnerAbsent reports false while RUNNING.
-	found, ok, err := client.FindRunner(context.Background(), params.JobKey)
-	if err != nil || !ok || found.ID != created.ID {
+	found, ok, err := client.FindRunner(context.Background(), jobKey)
+	if err != nil || !ok || found.ID != instanceID {
 		t.Fatalf("FindRunner = %#v, %v, %v", found, ok, err)
 	}
-	if absent, err := client.RunnerAbsent(context.Background(), created.ID); err != nil || absent {
+	if absent, err := client.RunnerAbsent(context.Background(), instanceID); err != nil || absent {
 		t.Fatalf("RunnerAbsent(RUNNING) = %v, %v", absent, err)
 	}
 
 	// Terminated state is treated as absent cleanly.
-	api.mu.Lock()
-	termInst := api.instances[created.ID]
-	termInst.LifecycleState = "TERMINATING"
-	api.instances[created.ID] = termInst
-	api.mu.Unlock()
-	if absent, err := client.RunnerAbsent(context.Background(), created.ID); err != nil || absent {
+	api.setState(instanceID, "TERMINATING")
+	if absent, err := client.RunnerAbsent(context.Background(), instanceID); err != nil || absent {
 		t.Fatalf("RunnerAbsent(TERMINATING) = %v, %v", absent, err)
 	}
-	api.mu.Lock()
-	termInst.LifecycleState = "TERMINATED"
-	api.instances[created.ID] = termInst
-	api.mu.Unlock()
-	if _, ok, err := client.FindRunner(context.Background(), params.JobKey); err != nil || ok {
+	api.setState(instanceID, "TERMINATED")
+	if _, ok, err := client.FindRunner(context.Background(), jobKey); err != nil || ok {
 		t.Fatalf("FindRunner(TERMINATED) = ok=%v err=%v, want absent", ok, err)
 	}
-	if absent, err := client.RunnerAbsent(context.Background(), created.ID); err != nil || !absent {
+	if absent, err := client.RunnerAbsent(context.Background(), instanceID); err != nil || !absent {
 		t.Fatalf("RunnerAbsent(TERMINATED) = %v, %v, want true", absent, err)
 	}
+}
 
+func (api *lifecycleAPI) checkDeletion(client *Client, jobKey, instanceID string) {
+	t := api.t
+	t.Helper()
 	// Restore RUNNING and verify DeleteRunner terminates with preserveBootVolume=false.
-	api.mu.Lock()
-	termInst.LifecycleState = "RUNNING"
-	api.instances[created.ID] = termInst
-	api.mu.Unlock()
-	if err := client.DeleteRunner(context.Background(), created.ID, params.JobKey); err != nil {
+	api.setState(instanceID, "RUNNING")
+	if err := client.DeleteRunner(context.Background(), instanceID, jobKey); err != nil {
 		t.Fatalf("DeleteRunner() error = %v", err)
 	}
 	api.mu.Lock()
@@ -306,7 +314,7 @@ func TestOCISignatureFlexPreemptibleLifecycleAndPagination(t *testing.T) {
 	if len(paths) != 1 || !strings.Contains(paths[0], "preserveBootVolume=false") {
 		t.Fatalf("paths = %v", paths)
 	}
-	if absent, err := client.RunnerAbsent(context.Background(), created.ID); err == nil || absent {
+	if absent, err := client.RunnerAbsent(context.Background(), instanceID); err == nil || absent {
 		t.Fatalf("RunnerAbsent(404) = %v, %v, want indeterminate", absent, err)
 	}
 }
