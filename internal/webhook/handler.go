@@ -649,6 +649,15 @@ func (h *Handler) reconcileLiveness(ctx context.Context, cutoff time.Time) []err
 	var reconciliationErrors []error
 	reconciliationErrors = append(reconciliationErrors, h.reconcileOrphanedInstances(ctx)...)
 	reconciliationErrors = append(reconciliationErrors, h.reconcileOrphanedGitHubRunners(ctx)...)
+	_, confirmsAbsence := h.computeClient.(instanceAbsenceChecker)
+	var eligibleOrphans map[string]string
+	var eligibleErr error
+	if !confirmsAbsence {
+		eligibleOrphans, eligibleErr = h.snapshotSweptOrphanCandidates(ctx, cutoff)
+		if eligibleErr != nil {
+			reconciliationErrors = append(reconciliationErrors, fmt.Errorf("snapshot orphaned provider instances: %w", eligibleErr))
+		}
+	}
 	knownInstances, err := h.store.KnownInstanceIDs(ctx)
 	if err != nil {
 		reconciliationErrors = append(reconciliationErrors, fmt.Errorf("list known provider instances: %w", err))
@@ -658,14 +667,37 @@ func (h *Handler) reconcileLiveness(ctx context.Context, cutoff time.Time) []err
 		if deleted != 0 {
 			log.Printf("WARN: reclaimed %d controller-owned provider resources absent from durable state", deleted)
 		}
-		if released, releaseErr := h.store.ReleaseSweptOrphans(ctx, h.provider, cutoff); releaseErr != nil {
-			reconciliationErrors = append(reconciliationErrors, fmt.Errorf("release swept orphan admission: %w", releaseErr))
-		} else if released != 0 {
-			log.Printf("WARN: released %d swept orphan records from fleet admission", released)
+		// Providers with exact-ID absence checks release orphan slots only via
+		// reconcileOrphanedInstances; tag-based sweeps cannot prove absence of
+		// an instance whose ownership tags were stripped.
+		if !confirmsAbsence && eligibleErr == nil {
+			if released, releaseErr := h.store.ReleaseSweptOrphans(ctx, h.provider, cutoff, knownInstances, eligibleOrphans, h.budgetTracker.Settle); releaseErr != nil {
+				reconciliationErrors = append(reconciliationErrors, fmt.Errorf("release swept orphan admission: %w", releaseErr))
+			} else if released != 0 {
+				log.Printf("WARN: released %d swept orphan records from fleet admission", released)
+			}
 		}
 	}
 	reconciliationErrors = append(reconciliationErrors, h.reconcileProvisionedRunners(ctx)...)
 	return reconciliationErrors
+}
+
+func (h *Handler) snapshotSweptOrphanCandidates(ctx context.Context, cutoff time.Time) (map[string]string, error) {
+	orphans, err := h.store.ListOrphaned(ctx)
+	if err != nil {
+		return nil, err
+	}
+	eligible := make(map[string]string, len(orphans))
+	for _, record := range orphans {
+		created := record.ProvisionedAt
+		if created.IsZero() {
+			created = record.CreatedAt
+		}
+		if record.Provider == h.provider && record.InstanceID != "" && created.Before(cutoff) {
+			eligible[record.Key] = record.InstanceID
+		}
+	}
+	return eligible, nil
 }
 
 func (h *Handler) expireAged(ctx context.Context, cutoff time.Time) []error {
@@ -707,6 +739,10 @@ func (h *Handler) reconcileOrphanedInstances(ctx context.Context) []error {
 			continue
 		}
 		if !absent {
+			continue
+		}
+		if err := h.budgetTracker.Settle(record.Key); err != nil {
+			reconciliationErrors = append(reconciliationErrors, fmt.Errorf("settle absent orphan %s: %w", record.Key, err))
 			continue
 		}
 		if err := h.store.ReleaseAbsentOrphan(context.WithoutCancel(ctx), record.Key, record.InstanceID); err != nil {
@@ -817,6 +853,9 @@ func (h *Handler) reconcileProviderFoundRunner(ctx context.Context, record state
 		if err := h.store.ClearProviderMissing(ctx, record.Key); err != nil {
 			return false, fmt.Errorf("clear provider-missing observations for %s: %w", record.Key, err)
 		}
+	}
+	if record.GitHubRunnerID == 0 {
+		return false, nil
 	}
 	runnerStatus, err := h.githubClient.RepoRunnerStatus(ctx, record.Owner, record.Repository, record.GitHubRunnerID)
 	if err != nil {
@@ -990,6 +1029,10 @@ func (h *Handler) deleteUntrackedExpiredRunner(ctx context.Context, record state
 	if err := h.computeClient.CleanupRunner(ctx, record.Key); err != nil {
 		return h.untrackedCleanupFailed(ctx, record, attempt, fmt.Errorf("clean up untracked provider resources for %s: %w", record.Key, err))
 	}
+	if err := h.budgetTracker.Settle(record.Key); err != nil {
+		deferErr := h.store.DeferRateLimitedCleanup(context.WithoutCancel(ctx), record.Key, err.Error(), time.Now().Add(retryDelay(attempt)), h.maxAttempts, false)
+		return errors.Join(fmt.Errorf("settle cleaned up runner %s: %w", record.Key, err), deferErr)
+	}
 	return h.store.MarkDeleted(ctx, record.Key)
 }
 
@@ -1066,7 +1109,7 @@ func (h *Handler) provision(ctx context.Context, record state.Record) {
 		return
 	}
 	if found {
-		if record.GitHubRunnerID == 0 {
+		if record.GitHubRunnerID == 0 && !h.disableJITConfig {
 			if deleteErr := h.computeClient.DeleteRunner(ctx, existing.ID, record.Key); deleteErr != nil {
 				h.provisionFailed(ctx, record, fmt.Errorf("delete runner with missing JIT identity: %w", deleteErr))
 				return
@@ -1467,6 +1510,12 @@ func (h *Handler) delete(ctx context.Context, record state.Record) {
 			return
 		}
 	}
+	if err := h.budgetTracker.Settle(record.Key); err != nil {
+		if stateErr := h.store.DeferReassignmentDemand(persistCtx, record.Key, err.Error(), time.Now().Add(retryDelay(record.DeleteAttempts))); stateErr != nil {
+			log.Printf("ERROR: persist budget settlement retry for %s: %v", record.Key, stateErr)
+		}
+		return
+	}
 	queued, err := h.recheckCleanedRunnerDemand(ctx, record)
 	if err != nil {
 		if h.releaseCanceledDelete(ctx, persistCtx, record, err) {
@@ -1494,7 +1543,7 @@ func (h *Handler) delete(ctx context.Context, record state.Record) {
 		h.signal()
 		return
 	}
-	h.budgetTracker.Release(record.Key)
+
 	log.Printf("Deleted owned runner instance %s for %s", record.InstanceID, record.Key)
 	if restored {
 		log.Printf("Restored queued original job demand for %s after reassigned runner completion", record.Key)

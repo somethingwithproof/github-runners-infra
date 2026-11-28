@@ -7,6 +7,12 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/fake"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 	"text/template"
 	"time"
@@ -395,5 +401,28 @@ func TestAzureEvictedVMIsAbsent(t *testing.T) {
 	vms.vm.Properties = &armcompute.VirtualMachineProperties{ProvisioningState: &deleting}
 	if absent, err := client.RunnerAbsent(context.Background(), name); err != nil || !absent {
 		t.Fatalf("RunnerAbsent(Deleting) = absent=%v err=%v, want true", absent, err)
+	}
+}
+
+type vmTransport func(*http.Request) (*http.Response, error)
+
+func (f vmTransport) Do(req *http.Request) (*http.Response, error) { return f(req) }
+
+func TestVMGetRequestsPowerState(t *testing.T) {
+	response := vmTransport(func(req *http.Request) (*http.Response, error) {
+		if got := req.URL.Query().Get("$expand"); got != "instanceView" {
+			t.Errorf("$expand = %q", got)
+		}
+		body := `{"properties":{"provisioningState":"Succeeded","instanceView":{"statuses":[{"code":"PowerState/deallocated"}]}}}`
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+	})
+	sdk, err := armcompute.NewVirtualMachinesClient("subscription", &fake.TokenCredential{}, &arm.ClientOptions{ClientOptions: policy.ClientOptions{Transport: response}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := virtualMachinesClient{client: sdk}
+	vm, err := client.Get(context.Background(), "group", "runner")
+	if err != nil || !isAbsentVM(vm) {
+		t.Fatalf("deallocated VM not detected: %v, %v", vm, err)
 	}
 }

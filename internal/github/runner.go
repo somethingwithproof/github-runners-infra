@@ -141,7 +141,7 @@ func (a *App) GenerateRepoJITConfig(ctx context.Context, owner, repo, name strin
 		"https://api.github.com/repos/%s/%s/actions/runners/generate-jitconfig",
 		url.PathEscape(owner), url.PathEscape(repo),
 	)
-	return a.generateJITConfig(ctx, endpoint, "repository", name, runnerGroupID, labels)
+	return a.generateJITConfig(ctx, endpoint, "repository", "", name, runnerGroupID, labels)
 }
 
 // GenerateOrgJITConfig creates a one-job organization-scoped runner configuration
@@ -151,11 +151,11 @@ func (a *App) GenerateOrgJITConfig(ctx context.Context, org, name string, runner
 		"https://api.github.com/orgs/%s/actions/runners/generate-jitconfig",
 		url.PathEscape(org),
 	)
-	return a.generateJITConfig(ctx, endpoint, "organization", name, runnerGroupID, labels)
+	return a.generateJITConfig(ctx, endpoint, "organization", org, name, runnerGroupID, labels)
 }
 
-func (a *App) generateJITConfig(ctx context.Context, endpoint, scope, name string, runnerGroupID int64, labels []string) (JITConfig, error) {
-	token, err := a.InstallationTokenContext(ctx)
+func (a *App) generateJITConfig(ctx context.Context, endpoint, scope, org, name string, runnerGroupID int64, labels []string) (JITConfig, error) {
+	token, err := a.installationToken(ctx, org)
 	if err != nil {
 		return JITConfig{}, fmt.Errorf("get installation token: %w", err)
 	}

@@ -98,7 +98,7 @@ func TestRenderCloudInitSpotPreemptionWatcher(t *testing.T) {
 		"opc/v2/instance/ ",
 		`.instancePreemptionAction.preemptionAction == "terminate"`,
 		"Authorization: Bearer Oracle",
-		"pkill -TERM -f Runner.Listener",
+		"until pkill -TERM -x Runner.Listener 2>/dev/null; do\n            sleep 5",
 		`kill "$PREEMPT_WATCH_PID"`,
 	} {
 		if !strings.Contains(spotOut, want) {

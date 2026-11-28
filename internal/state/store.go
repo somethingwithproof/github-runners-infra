@@ -120,7 +120,7 @@ type Store interface {
 	ListOrphaned(context.Context) ([]Record, error)
 	ReleaseAbsentOrphan(context.Context, string, string) error
 	KnownInstanceIDs(context.Context) (map[string]struct{}, error)
-	ReleaseSweptOrphans(context.Context, string, time.Time) (int, error)
+	ReleaseSweptOrphans(context.Context, string, time.Time, map[string]struct{}, map[string]string, func(string) error) (int, error)
 	ObserveRunnerMissing(context.Context, string, time.Time, time.Duration, int) (bool, error)
 	ObserveGitHubRunnerMissing(context.Context, string, time.Time, time.Duration, int) (bool, error)
 	ClearProviderMissing(context.Context, string) error
@@ -831,7 +831,7 @@ func (s *FileStore) MarkProvisioned(_ context.Context, key, instanceID string, r
 		}
 		record.DropletID = 0
 		record.GitHubRunnerID = runnerID
-		record.GitHubRunnerOwned = true
+		record.GitHubRunnerOwned = runnerID > 0
 		record.RunnerName = runnerName
 		record.LastError = ""
 		record.ThrottleFailures = 0
@@ -1292,6 +1292,30 @@ func (s *FileStore) ReleaseAbsentOrphan(_ context.Context, key, instanceID strin
 	})
 }
 
+// ValidateRoutedState prevents the router from sweeping single-provider resources.
+func (s *FileStore) ValidateRoutedState() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, r := range s.records {
+		if key == completionMarkerKey(r.Owner, r.Repository, r.GitHubRunnerID) {
+			continue
+		}
+		if r.Status == StatusDeleted || (r.Status == StatusOrphaned && r.InstanceID == "" && !r.GitHubRunnerOwned) {
+			continue
+		}
+		if r.Provider != "multi" {
+			return fmt.Errorf("drain single-provider record %q using its original provider before enabling CLOUD_PROVIDERS", r.Key)
+		}
+		if r.InstanceID != "" {
+			backend, id, ok := strings.Cut(r.InstanceID, ":")
+			if !ok || backend == "" || id == "" {
+				return fmt.Errorf("routed record %q has an invalid instance ID", r.Key)
+			}
+		}
+	}
+	return nil
+}
+
 // KnownInstanceIDs returns every provider resource still represented by a
 // non-deleted lifecycle record. Provider sweeps use this to reclaim resources
 // stranded by a lost or replaced state file without touching live work.
@@ -1309,18 +1333,30 @@ func (s *FileStore) KnownInstanceIDs(_ context.Context) (map[string]struct{}, er
 
 // ReleaseSweptOrphans clears admission-bearing instance identities only after
 // a successful provider sweep has confirmed every old untracked resource is
-// absent or deleted.
-func (s *FileStore) ReleaseSweptOrphans(_ context.Context, provider string, cutoff time.Time) (int, error) {
+// absent or deleted. Instances protected by knownInstances, orphans created
+// after the pre-sweep snapshot, and ownership-mismatch orphans (whose mutable
+// controller tags may be missing) are never released blindly.
+func (s *FileStore) ReleaseSweptOrphans(_ context.Context, provider string, cutoff time.Time, knownInstances map[string]struct{}, eligibleOrphans map[string]string, settle func(string) error) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	before := make(map[string]Record)
 	for key, record := range s.records {
-		instanceCreatedAt := record.ProvisionedAt
-		if instanceCreatedAt.IsZero() {
-			instanceCreatedAt = record.CreatedAt
-		}
-		if record.Status != StatusOrphaned || record.Provider != provider || record.InstanceID == "" || !instanceCreatedAt.Before(cutoff) {
+		if !record.releasableOrphan(provider, cutoff) {
 			continue
+		}
+		if _, protected := knownInstances[record.InstanceID]; protected {
+			continue
+		}
+		if eligibleOrphans != nil && eligibleOrphans[key] != record.InstanceID {
+			continue
+		}
+		if settle != nil {
+			if err := settle(key); err != nil {
+				for savedKey, saved := range before {
+					s.records[savedKey] = saved
+				}
+				return 0, err
+			}
 		}
 		before[key] = clone(record)
 		record.InstanceID = ""
@@ -1338,6 +1374,21 @@ func (s *FileStore) ReleaseSweptOrphans(_ context.Context, provider string, cuto
 		return 0, err
 	}
 	return len(before), nil
+}
+
+func (record Record) releasableOrphan(provider string, cutoff time.Time) bool {
+	if record.Status != StatusOrphaned || record.Provider != provider || record.InstanceID == "" {
+		return false
+	}
+	createdAt := record.ProvisionedAt
+	if createdAt.IsZero() {
+		createdAt = record.CreatedAt
+	}
+	return createdAt.Before(cutoff) && !isOwnershipMismatchError(record.LastError)
+}
+
+func isOwnershipMismatchError(message string) bool {
+	return strings.Contains(strings.ToLower(message), "ownership mismatch")
 }
 
 // RequeueMissingRunner clears stale provider and JIT identity after liveness

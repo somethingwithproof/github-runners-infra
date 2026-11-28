@@ -23,6 +23,8 @@ build tools, and a SHA-256-verified `actions/runner` archive pre-installed in
 > build-host-only SSH ingress rule). Keep the production `terraform/oci` runner
 > subnet deny-inbound.
 
+Stock images support workflows that need the Actions runner and Docker. Use cold boot for `chef` workloads, or add a checksum-verified Chef Workstation installation to the image before assigning that label.
+
 ## Build example
 
 ```bash

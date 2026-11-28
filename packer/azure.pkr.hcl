@@ -11,6 +11,11 @@ packer {
   }
 }
 
+variable "arm_subscription_id" {
+  type      = string
+  default   = env("ARM_SUBSCRIPTION_ID")
+}
+
 variable "runner_version" { type = string }
 variable "runner_sha256" { type = string }
 variable "resource_group" { type = string }
@@ -20,7 +25,7 @@ variable "location" {
 }
 
 source "azure-arm" "runner" {
-  subscription_id                   = env("ARM_SUBSCRIPTION_ID")
+  subscription_id                   = var.arm_subscription_id
   use_azure_cli_auth                = true
   os_type                           = "Linux"
   image_publisher                   = "Canonical"

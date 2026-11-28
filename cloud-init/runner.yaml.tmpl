@@ -58,28 +58,38 @@ runcmd:
     systemctl enable --now docker
     {{- if .EgressAllowlist}}
 
-    # Optional egress allowlist for untrusted workflow isolation (disabled by default).
-    if command -v iptables >/dev/null 2>&1; then
-      iptables -F OUTPUT || true
-      iptables -A OUTPUT -o lo -j ACCEPT
-      iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-      iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
-      iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
-      {{- if .SpotActive}}
-      iptables -A OUTPUT -p tcp --dport 80 -d 169.254.169.254 -m owner --uid-owner 0 -j ACCEPT 2>/dev/null || true
-      {{- end}}
-      {{- range .EgressAllowlist}}
-      for DEST in $(getent ahostsv4 '{{.}}' 2>/dev/null | awk '{print $1}' | sort -u); do
-        iptables -A OUTPUT -p tcp --dport 443 -d "$DEST" -j ACCEPT
-      done
-      case '{{.}}' in
-        *[0-9].*[0-9]*)
-          iptables -A OUTPUT -p tcp --dport 443 -d '{{.}}' -j ACCEPT 2>/dev/null || true
-          ;;
-      esac
-      {{- end}}
-      iptables -A OUTPUT -j REJECT
-    fi
+    # The administrator-controlled network firewall enforces workload isolation.
+    # This optional host policy restricts ordinary host processes on both IP families.
+    for filter in iptables ip6tables; do
+      "$filter" -N RUNNER_HTTPS 2>/dev/null || "$filter" -F RUNNER_HTTPS
+      "$filter" -A RUNNER_HTTPS -o lo -j ACCEPT
+      "$filter" -A RUNNER_HTTPS -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+      "$filter" -A RUNNER_HTTPS -p udp --dport 53 -j ACCEPT
+      "$filter" -A RUNNER_HTTPS -p tcp --dport 53 -j ACCEPT
+    done
+    {{- if .SpotActive}}
+    iptables -A RUNNER_HTTPS -p tcp --dport 80 -d 169.254.169.254 -m owner --uid-owner 0 -j ACCEPT
+    {{- end}}
+    # IPv6 neighbor discovery is required on the link.
+    for kind in neighbor-solicitation neighbor-advertisement router-solicitation; do
+      ip6tables -A RUNNER_HTTPS -p ipv6-icmp --icmpv6-type "$kind" -m hl --hl-eq 255 -j ACCEPT
+    done
+    {{- range .EgressAllowlist}}
+    dest='{{.}}'
+    case "$dest" in
+      *:*) ip6tables -A RUNNER_HTTPS -p tcp --dport 443 -d "$dest" -j ACCEPT ;;
+      */*) iptables -A RUNNER_HTTPS -p tcp --dport 443 -d "$dest" -j ACCEPT ;;
+      *)
+        for ip in $(getent ahosts "$dest" | awk '{print $1}' | sort -u); do
+          case "$ip" in *:*) filter=ip6tables ;; *) filter=iptables ;; esac
+          "$filter" -A RUNNER_HTTPS -p tcp --dport 443 -d "$ip" -j ACCEPT
+        done ;;
+    esac
+    {{- end}}
+    for filter in iptables ip6tables; do
+      "$filter" -A RUNNER_HTTPS -j REJECT
+      "$filter" -C OUTPUT -j RUNNER_HTTPS 2>/dev/null || "$filter" -I OUTPUT 1 -j RUNNER_HTTPS
+    done
     {{- end}}
 
     {{- if not .PrebakedImage}}
@@ -156,7 +166,9 @@ runcmd:
       while true; do
         if spot_preemption_detected; then
           logger -t runner-preemption "Spot preemption notice detected; sending SIGTERM to Runner.Listener" 2>/dev/null || true
-          pkill -TERM -f Runner.Listener 2>/dev/null || true
+          until pkill -TERM -x Runner.Listener 2>/dev/null; do
+            sleep 5
+          done
           break
         fi
         sleep 5
