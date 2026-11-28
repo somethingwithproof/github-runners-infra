@@ -322,10 +322,7 @@ func newMultiCloudRouter(
 
 	for _, rawProvider := range providers {
 		name := strings.ToLower(strings.TrimSpace(rawProvider))
-		backendSpot := spot
-		if backendSpot && spotFallbackOnDemand && !router.ProviderSupportsSpot(name) {
-			backendSpot = false
-		}
+		backendSpot := spot && router.ProviderSupportsSpot(name)
 		// Disable per-backend on-demand fallback so the router exhausts spot
 		// capacity across all configured clouds before falling back to on-demand.
 		client, closeFn, err := newSingleComputeClient(startupCtx, lifetimeCtx, name, controllerID, cloudInitPath, backendSpot, false)

@@ -417,3 +417,12 @@ func TestAWSRunnerAbsentAndFindRunnerTreatPreemptedTerminatedAsAbsent(t *testing
 		t.Fatalf("RunnerAbsent(running) = absent=%v err=%v, want false", absent, err)
 	}
 }
+
+func TestCreateRunnerRejectsBlankSubnets(t *testing.T) {
+	api := &fakeEC2{}
+	client := newClient(api, nil, Config{SubnetID: " ", AlternateSubnetIDs: []string{"", "  "}})
+	instance, err := client.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:42"})
+	if err == nil || instance != nil || len(api.runInputs) != 0 {
+		t.Fatalf("blank subnets: instance=%v, err=%v, launch attempts=%d", instance, err, len(api.runInputs))
+	}
+}

@@ -160,7 +160,9 @@ runcmd:
       while true; do
         if spot_preemption_detected; then
           logger -t runner-preemption "Spot preemption notice detected; sending SIGTERM to Runner.Listener" 2>/dev/null || true
-          pkill -TERM -f Runner.Listener 2>/dev/null || true
+          until pkill -TERM -x Runner.Listener 2>/dev/null; do
+            sleep 5
+          done
           break
         fi
         sleep 5

@@ -668,7 +668,6 @@ func TestNewComputeClientSpotFallbackMixedMultiCloud(t *testing.T) {
 	t.Setenv("CLOUD_INIT_PATH", writeRunnerTemplate(t))
 	t.Setenv("CLOUD_PROVIDERS", "aws,vultr")
 	t.Setenv("RUNNER_SPOT", "true")
-	t.Setenv("SPOT_FALLBACK_ON_DEMAND", "true")
 	t.Setenv("AWS_REGION", "us-west-2")
 	t.Setenv("AWS_AMI_ID", "ami-0123456789abcdef0")
 	t.Setenv("AWS_INSTANCE_TYPE", "m7i.large")
@@ -680,12 +679,18 @@ func TestNewComputeClientSpotFallbackMixedMultiCloud(t *testing.T) {
 	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
 	t.Setenv("VULTR_API_KEY", "test-vultr-key")
 
-	client, closeFn, err := newComputeClient(context.Background(), context.Background())
-	if err != nil {
-		t.Fatalf("mixed spot+fallback multi-cloud error = %v", err)
+	for _, fallback := range []string{"false", "true"} {
+		t.Run("fallback="+fallback, func(t *testing.T) {
+			t.Setenv("SPOT_FALLBACK_ON_DEMAND", fallback)
+			client, closeFn, err := newComputeClient(context.Background(), context.Background())
+			if err != nil {
+				t.Fatalf("mixed spot+fallback multi-cloud error = %v", err)
+			}
+			defer closeFn()
+			if client.Provider() != "multi" {
+				t.Fatalf("provider = %q, want multi", client.Provider())
+			}
+		})
 	}
-	defer closeFn()
-	if client.Provider() != "multi" {
-		t.Fatalf("provider = %q, want multi", client.Provider())
-	}
+
 }

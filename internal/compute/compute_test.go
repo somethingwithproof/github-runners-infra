@@ -95,7 +95,7 @@ func TestRenderCloudInitSpotPreemptionWatcher(t *testing.T) {
 		"latest/meta-data/spot/instance-action",
 		"computeMetadata/v1/instance/preempted",
 		"metadata/scheduledevents?api-version=2020-07-01",
-		"pkill -TERM -f Runner.Listener",
+		"until pkill -TERM -x Runner.Listener 2>/dev/null; do\n            sleep 5",
 		`kill "$PREEMPT_WATCH_PID"`,
 	} {
 		if !strings.Contains(spotOut, want) {

@@ -336,7 +336,7 @@ func TestGCPResourceExhaustedWithoutFallback(t *testing.T) {
 	}
 }
 
-func TestGCPPreemptedVMIsAbsent(t *testing.T) {
+func TestGCPStoppedInstanceRetainsNameUntilDeleted(t *testing.T) {
 	name := resourceName("org/repo:gcp-term")
 	terminated := "TERMINATED"
 	instances := &fakeInstances{
@@ -353,12 +353,27 @@ func TestGCPPreemptedVMIsAbsent(t *testing.T) {
 	if _, found, err := client.FindRunner(context.Background(), "org/repo:gcp-term"); err != nil || found {
 		t.Fatalf("FindRunner(TERMINATED) = found=%v err=%v, want absent", found, err)
 	}
-	if absent, err := client.RunnerAbsent(context.Background(), name); err != nil || !absent {
-		t.Fatalf("RunnerAbsent(TERMINATED) = absent=%v err=%v, want true", absent, err)
+	if absent, err := client.RunnerAbsent(context.Background(), name); err != nil || absent {
+		t.Fatalf("RunnerAbsent(TERMINATED) = absent=%v err=%v, want false", absent, err)
+	}
+	instances.deleteOp = fakeOperation{}
+	ctx := context.Background()
+	params := compute.RunnerParams{JobKey: "org/repo:gcp-term", RunnerJITConfig: "jit"}
+	if _, err := client.CreateRunner(ctx, params); err == nil || instances.insertReq != nil || instances.deletes != 1 {
+		t.Fatalf("reused occupied GCP name: deletes=%d insert=%v err=%v", instances.deletes, instances.insertReq, err)
+	}
+	if err := client.CleanupRunner(ctx, params.JobKey); err != nil || instances.deletes != 2 {
+		t.Fatalf("cleanup of stopped instance: deletes=%d err=%v", instances.deletes, err)
 	}
 	running := "RUNNING"
 	instances.instance.Status = &running
 	if absent, err := client.RunnerAbsent(context.Background(), name); err != nil || absent {
 		t.Fatalf("RunnerAbsent(RUNNING) = absent=%v err=%v, want false", absent, err)
 	}
+	instances.getErr = status.Error(codes.NotFound, "gone")
+	instances.insertOp = fakeOperation{}
+	if _, err := client.CreateRunner(ctx, params); err != nil || instances.insertReq == nil {
+		t.Fatalf("replacement after deletion: %v", err)
+	}
+
 }
