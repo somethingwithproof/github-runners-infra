@@ -52,7 +52,7 @@ func IsHTTPNotFound(err error) bool {
 // IsAmbiguousCreateError reports whether a create error may have succeeded
 // server-side (transport failure, 408 timeout, or 5xx response).
 func IsAmbiguousCreateError(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if err == nil {
 		return false
 	}
 	var apiErr *APIError

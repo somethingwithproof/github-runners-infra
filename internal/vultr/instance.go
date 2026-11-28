@@ -206,6 +206,9 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 
 	reqBody := c.buildCreateRequest(desiredName, plan, params.JobKey, userData)
 	var resp instanceResponse
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := c.doJSON(ctx, http.MethodPost, instancesPath, reqBody, &resp); err != nil {
 		return c.handleCreateError(ctx, params.JobKey, desiredName, err)
 	}
@@ -274,6 +277,10 @@ func (c *Client) RunnerAbsent(ctx context.Context, id string) (bool, error) {
 
 // DeleteRunner deletes a Vultr instance only after verifying controller and job ownership tags.
 func (c *Client) DeleteRunner(ctx context.Context, id, jobKey string) error {
+	return c.deleteOwned(ctx, id, compute.JobTag(jobKey))
+}
+
+func (c *Client) deleteOwned(ctx context.Context, id, expectedJobTag string) error {
 	if !instanceIDRegex.MatchString(id) {
 		return fmt.Errorf("invalid Vultr instance ID %q", id)
 	}
@@ -285,7 +292,7 @@ func (c *Client) DeleteRunner(ctx context.Context, id, jobKey string) error {
 		}
 		return fmt.Errorf("get Vultr instance %s before delete: %w", id, err)
 	}
-	if !compute.HasTag(resp.Instance.Tags, c.controllerTag) || !compute.HasTag(resp.Instance.Tags, compute.JobTag(jobKey)) {
+	if !compute.HasTag(resp.Instance.Tags, c.controllerTag) || (expectedJobTag != "" && !compute.HasTag(resp.Instance.Tags, expectedJobTag)) {
 		var confirm instanceResponse
 		if confirmErr := c.doJSON(ctx, http.MethodGet, path, nil, &confirm); confirmErr != nil {
 			if compute.IsHTTPNotFound(confirmErr) {
@@ -336,7 +343,7 @@ func (c *Client) SweepOrphanedRunners(ctx context.Context, known map[string]stru
 		func(v vultrInstance) []string { return v.Tags },
 		func(v vultrInstance) (time.Time, error) { return time.Parse(time.RFC3339, v.DateCreated) },
 		func(delCtx context.Context, id string) error {
-			return c.doJSON(delCtx, http.MethodDelete, instancesBasePath+url.PathEscape(id), nil, nil)
+			return c.deleteOwned(delCtx, id, "")
 		},
 	)
 }

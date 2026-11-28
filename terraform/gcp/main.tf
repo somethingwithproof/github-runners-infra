@@ -56,12 +56,15 @@ variable "controller_role" {
 
 locals {
   safe_id       = replace(lower(var.controller_id), "_", "-")
+  account_name  = "gh-runner-${local.safe_id}"
+  preserve_id   = local.safe_id == var.controller_id && !endswith(local.safe_id, "-")
+  suffix        = substr(sha256(var.controller_id), 0, 12)
   firewall_name = "gh-runners-${local.safe_id}-deny-inbound"
 }
 
 resource "google_service_account" "runner" {
   project      = var.project_id
-  account_id   = replace(substr("gh-runner-${local.safe_id}", 0, 30), "/-+$/", "")
+  account_id   = local.preserve_id && length(local.account_name) <= 30 ? local.account_name : "${substr(local.account_name, 0, 17)}-${local.suffix}"
   display_name = "Ephemeral GitHub Actions Runner (${var.controller_id})"
   description  = "Zero-role identity attached to ephemeral runner VMs"
 }
@@ -89,7 +92,7 @@ resource "google_project_iam_member" "controller" {
 
 resource "google_compute_firewall" "deny_inbound" {
   project                 = var.project_id
-  name                    = length(local.firewall_name) <= 63 ? local.firewall_name : "${substr(local.firewall_name, 0, 50)}-${substr(sha256(var.controller_id), 0, 12)}"
+  name                    = local.preserve_id && length(local.firewall_name) <= 63 ? local.firewall_name : "${substr(local.firewall_name, 0, 50)}-${local.suffix}"
   network                 = var.network
   direction               = "INGRESS"
   priority                = 1000
