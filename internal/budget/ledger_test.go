@@ -94,7 +94,11 @@ func TestUTCDayAndMonthRolloverAndPersistence(t *testing.T) {
 	if err := tracker.Reserve(Reservation{Key: "org/r:1", Repository: "org/r", HourlyRateUSD: 1.00}); err != nil {
 		t.Fatal(err)
 	}
-	now = now.Add(time.Hour) // 2026-12-01 00:00:00Z -> next day AND next month!
+	now = now.Add(time.Hour)
+	if atBoundary := tracker.Snapshot(); atBoundary.DailySpendUSD != 0 || atBoundary.MonthlySpendUSD != 0 {
+		t.Fatalf("prior window charged again: %#v", atBoundary)
+	}
+	now = now.Add(30 * time.Minute)
 	tracker.Release("org/r:1")
 
 	// Reload from disk on the new day/month; persisted state restores cleanly.
@@ -114,10 +118,10 @@ func TestUTCDayAndMonthRolloverAndPersistence(t *testing.T) {
 
 	// Advance to next UTC day inside same month: daily resets, monthly persists.
 	now = now.Add(24 * time.Hour)
-	if snap := reloaded.Snapshot(); snap.Day != "2026-12-02" || snap.DailySpendUSD != 0 || snap.MonthlySpendUSD < 0.99 {
+	if snap := reloaded.Snapshot(); snap.Day != "2026-12-02" || snap.DailySpendUSD != 0 || snap.MonthlySpendUSD != 0.5 {
 		t.Fatalf("next-day snapshot = %#v", snap)
 	}
-	if err := reloaded.Reserve(Reservation{Key: "org/r:2", Repository: "org/r", HourlyRateUSD: 0.50}); !errors.Is(err, ErrBudgetExceeded) {
+	if err := reloaded.Reserve(Reservation{Key: "org/r:2", Repository: "org/r", HourlyRateUSD: 0.80}); !errors.Is(err, ErrBudgetExceeded) {
 		t.Fatalf("monthly cap after day rollover = %v, want ErrBudgetExceeded", err)
 	}
 }
@@ -224,5 +228,44 @@ func TestFallbackReservationReplacesSpotPrice(t *testing.T) {
 	tracker.Release(res.Key)
 	if got := tracker.Snapshot().DailySpendUSD; got != 0.90 {
 		t.Fatalf("settled cost = %v", got)
+	}
+}
+
+func TestSettlementRetriesFailedWriteWithoutDoubleCharging(t *testing.T) {
+	now := time.Now().UTC()
+	root := t.TempDir()
+	path := filepath.Join(root, "ledger")
+	tracker, err := NewTracker(Config{StatePath: path, DailyCapUSD: 10, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tracker.Reserve(Reservation{Key: "job", Repository: "org/repo", HourlyRateUSD: 1}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Hour)
+	prior := tracker.Snapshot()
+	if err := os.Rename(path, path+".bak"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := tracker.Settle("job"); err == nil {
+		t.Fatal("accepted a failed ledger write")
+	}
+	failed := tracker.Snapshot()
+	if failed.DailySpendUSD != prior.DailySpendUSD || failed.InFlightSpendUSD != prior.InFlightSpendUSD || failed.RepoDailySpendUSD["org/repo"] != prior.RepoDailySpendUSD["org/repo"] {
+		t.Fatalf("failed write changed budget: %+v", failed)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := tracker.Settle("job"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := tracker.Snapshot(); got.InFlightSpendUSD != 0 || got.DailySpendUSD != 1 || got.RepoDailySpendUSD["org/repo"] != 1 {
+		t.Fatalf("settled spend: %+v", got)
 	}
 }

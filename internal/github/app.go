@@ -42,10 +42,13 @@ type App struct {
 	AllowedRepositories []string
 	ReadWorkflowRuns    bool
 
-	tokenMu      sync.Mutex
-	cachedToken  string
-	tokenExpires time.Time
-	cachedScope  string
+	tokenMu         sync.Mutex
+	cachedToken     string
+	tokenExpires    time.Time
+	cachedScope     string
+	orgToken        string
+	orgTokenExpires time.Time
+	orgScope        string
 }
 
 // ValidateTokenScope fetches and verifies a least-privilege installation token
@@ -89,28 +92,42 @@ func (a *App) GenerateJWT() (string, error) {
 // InstallationTokenContext retrieves and caches an installation token while
 // honoring cancellation from the provisioning lifecycle.
 func (a *App) InstallationTokenContext(ctx context.Context) (string, error) {
+	return a.installationToken(ctx, "")
+}
+
+func (a *App) installationToken(ctx context.Context, org string) (string, error) {
 	repositoryNames, expectedRepositories, scope, err := a.tokenScope()
 	if err != nil {
 		return "", err
 	}
 	a.tokenMu.Lock()
 	defer a.tokenMu.Unlock()
-	if a.cachedToken != "" && a.cachedScope == scope && time.Now().Before(a.tokenExpires.Add(-5*time.Minute)) {
-		return a.cachedToken, nil
+	permissions := map[string]string{"administration": "write"}
+	if a.ReadWorkflowRuns {
+		permissions["actions"] = "read"
 	}
-
+	cached, cachedScope, expires := &a.cachedToken, &a.cachedScope, &a.tokenExpires
+	if org != "" {
+		owner, _, _ := strings.Cut(expectedRepositories[0], "/")
+		if !strings.EqualFold(owner, org) {
+			return "", fmt.Errorf("organization does not match the configured installation owner")
+		}
+		scope = owner + "|organization_self_hosted_runners:write"
+		permissions = map[string]string{"organization_self_hosted_runners": "write"}
+		repositoryNames, expectedRepositories = nil, nil
+		cached, cachedScope, expires = &a.orgToken, &a.orgScope, &a.orgTokenExpires
+	}
+	if *cached != "" && *cachedScope == scope && time.Now().Before(expires.Add(-5*time.Minute)) {
+		return *cached, nil
+	}
 	jwtToken, err := a.GenerateJWT()
 	if err != nil {
 		return "", fmt.Errorf("generate JWT: %w", err)
 	}
 
 	url := fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", a.InstallationID)
-	permissions := map[string]string{"administration": "write"}
-	if a.ReadWorkflowRuns {
-		permissions["actions"] = "read"
-	}
 	body, err := json.Marshal(struct {
-		Repositories []string          `json:"repositories"`
+		Repositories []string          `json:"repositories,omitempty"`
 		Permissions  map[string]string `json:"permissions"`
 	}{Repositories: repositoryNames, Permissions: permissions})
 	if err != nil {
@@ -148,23 +165,22 @@ func (a *App) InstallationTokenContext(ctx context.Context) (string, error) {
 	if result.Token == "" || result.ExpiresAt.IsZero() {
 		return "", fmt.Errorf("GitHub returned an incomplete installation token")
 	}
-	if result.Permissions["administration"] != "write" {
-		return "", fmt.Errorf("GitHub installation token lacks administration:write scope")
-	}
-	if a.ReadWorkflowRuns && result.Permissions["actions"] != "read" {
-		return "", fmt.Errorf("GitHub installation token lacks actions:read scope")
+	for permission, level := range permissions {
+		if result.Permissions[permission] != level {
+			return "", fmt.Errorf("GitHub installation token lacks %s:%s scope", permission, level)
+		}
 	}
 	actualRepositories := make([]string, 0, len(result.Repositories))
 	for _, repository := range result.Repositories {
 		actualRepositories = append(actualRepositories, strings.ToLower(repository.FullName))
 	}
 	sort.Strings(actualRepositories)
-	if strings.Join(actualRepositories, ",") != strings.Join(expectedRepositories, ",") {
+	if org == "" && strings.Join(actualRepositories, ",") != strings.Join(expectedRepositories, ",") {
 		return "", fmt.Errorf("GitHub installation token repository scope does not match allowlist")
 	}
-	a.cachedToken = result.Token
-	a.tokenExpires = result.ExpiresAt
-	a.cachedScope = scope
+	*cached = result.Token
+	*expires = result.ExpiresAt
+	*cachedScope = scope
 	return result.Token, nil
 }
 

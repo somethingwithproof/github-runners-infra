@@ -175,10 +175,10 @@ func (t *Tracker) Reserve(res Reservation) error {
 		return nil
 	}
 	estCost := res.HourlyRateUSD * t.reservationDuration.Hours()
-	inFlightTotal, inFlightRepo := t.inFlightTotalsLocked(nowUTC, repo, res.Key)
+	inFlightDay, inFlightMonth, inFlightRepo := t.inFlightTotalsLocked(nowUTC, repo, res.Key)
 
-	projectedDaily := t.state.DailyAccruedUSD + inFlightTotal + estCost
-	projectedMonthly := t.state.MonthlyAccruedUSD + inFlightTotal + estCost
+	projectedDaily := t.state.DailyAccruedUSD + inFlightDay + estCost
+	projectedMonthly := t.state.MonthlyAccruedUSD + inFlightMonth + estCost
 	projectedRepoDaily := t.state.RepoDailyAccrued[repo] + inFlightRepo + estCost
 
 	if t.dailyCapUSD > 0 && projectedDaily > t.dailyCapUSD+costEpsilon {
@@ -214,8 +214,15 @@ func (t *Tracker) Reserve(res Reservation) error {
 // Release settles an in-flight runner into accrued daily/monthly spend based on
 // elapsed runtime. Release is never blocked by budget caps.
 func (t *Tracker) Release(key string) {
+	if err := t.Settle(key); err != nil {
+		log.Printf("WARN: persist budget ledger after release for %s: %v", key, err)
+	}
+}
+
+// Settle records the elapsed cost once. On a write failure the reservation remains retriable.
+func (t *Tracker) Settle(key string) error {
 	if t == nil || key == "" {
-		return
+		return nil
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -225,23 +232,33 @@ func (t *Tracker) Release(key string) {
 
 	active, ok := t.state.InFlight[key]
 	if !ok {
-		return
+		return nil
 	}
 	delete(t.state.InFlight, key)
 
-	elapsed := nowUTC.Sub(active.StartedAt)
-	if elapsed < minAccruedDuration {
-		elapsed = minAccruedDuration
+	end := nowUTC
+	if minEnd := active.StartedAt.Add(minAccruedDuration); minEnd.After(end) {
+		end = minEnd
 	}
-	actualCost := active.HourlyRateUSD * elapsed.Hours()
-	t.state.DailyAccruedUSD += actualCost
-	t.state.MonthlyAccruedUSD += actualCost
+	dayCost, monthCost := currentWindowCosts(active, nowUTC, end)
+	priorDaily, priorMonthly := t.state.DailyAccruedUSD, t.state.MonthlyAccruedUSD
+	priorRepo, wasAccrued := t.state.RepoDailyAccrued[active.Repository]
+	t.state.DailyAccruedUSD += dayCost
+	t.state.MonthlyAccruedUSD += monthCost
 	if active.Repository != "" {
-		t.state.RepoDailyAccrued[active.Repository] += actualCost
+		t.state.RepoDailyAccrued[active.Repository] += dayCost
 	}
 	if err := t.persistLocked(); err != nil {
-		log.Printf("WARN: persist budget ledger after release for %s: %v", key, err)
+		t.state.InFlight[key] = active
+		t.state.DailyAccruedUSD, t.state.MonthlyAccruedUSD = priorDaily, priorMonthly
+		if wasAccrued {
+			t.state.RepoDailyAccrued[active.Repository] = priorRepo
+		} else {
+			delete(t.state.RepoDailyAccrued, active.Repository)
+		}
+		return err
 	}
+	return nil
 }
 
 // Cancel drops an in-flight reservation without accruing spend (used when
@@ -273,23 +290,24 @@ func (t *Tracker) Snapshot() Metrics {
 	nowUTC := t.now().UTC()
 	t.rolloverLocked(nowUTC)
 
-	inFlightTotal, _ := t.inFlightTotalsLocked(nowUTC, "", "")
+	inFlightDay, inFlightMonth, _ := t.inFlightTotalsLocked(nowUTC, "", "")
 	repoSpend := make(map[string]float64, len(t.state.RepoDailyAccrued))
 	for repo, cost := range t.state.RepoDailyAccrued {
 		repoSpend[repo] = cost
 	}
 	for _, active := range t.state.InFlight {
 		if active.Repository != "" {
-			repoSpend[active.Repository] += activeEstimate(active, nowUTC)
+			day, _ := activeEstimate(active, nowUTC)
+			repoSpend[active.Repository] += day
 		}
 	}
 
 	return Metrics{
 		Day:                t.state.Day,
 		Month:              t.state.Month,
-		DailySpendUSD:      t.state.DailyAccruedUSD + inFlightTotal,
-		MonthlySpendUSD:    t.state.MonthlyAccruedUSD + inFlightTotal,
-		InFlightSpendUSD:   inFlightTotal,
+		DailySpendUSD:      t.state.DailyAccruedUSD + inFlightDay,
+		MonthlySpendUSD:    t.state.MonthlyAccruedUSD + inFlightMonth,
+		InFlightSpendUSD:   inFlightDay,
 		RepoDailySpendUSD:  repoSpend,
 		BudgetBlockedTotal: t.state.BudgetBlockedTotal,
 	}
@@ -319,26 +337,45 @@ func (t *Tracker) rolloverLocked(nowUTC time.Time) {
 	}
 }
 
-func (t *Tracker) inFlightTotalsLocked(nowUTC time.Time, repo, excludeKey string) (total, forRepo float64) {
+func (t *Tracker) inFlightTotalsLocked(nowUTC time.Time, repo, excludeKey string) (daily, monthly, forRepo float64) {
 	for key, active := range t.state.InFlight {
 		if key == excludeKey {
 			continue
 		}
-		cost := activeEstimate(active, nowUTC)
-		total += cost
+		dayCost, monthCost := activeEstimate(active, nowUTC)
+		daily += dayCost
+		monthly += monthCost
 		if repo != "" && active.Repository == repo {
-			forRepo += cost
+			forRepo += dayCost
 		}
 	}
-	return total, forRepo
+	return daily, monthly, forRepo
 }
 
-func activeEstimate(active activeReservation, nowUTC time.Time) float64 {
-	elapsedCost := active.HourlyRateUSD * max(nowUTC.Sub(active.StartedAt), 0).Hours()
-	if elapsedCost > active.EstimatedCapUSD {
-		return elapsedCost
+func activeEstimate(active activeReservation, now time.Time) (float64, float64) {
+	end := now
+	if active.HourlyRateUSD > 0 {
+		estimatedDuration := time.Duration(active.EstimatedCapUSD / active.HourlyRateUSD * float64(time.Hour))
+		if reservedUntil := active.StartedAt.Add(estimatedDuration); reservedUntil.After(end) {
+			end = reservedUntil
+		}
 	}
-	return active.EstimatedCapUSD
+	return currentWindowCosts(active, now, end)
+}
+
+func currentWindowCosts(active activeReservation, now, end time.Time) (float64, float64) {
+	day := now.Truncate(24 * time.Hour)
+	month := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	cost := func(start, limit time.Time) float64 {
+		if active.StartedAt.After(start) {
+			start = active.StartedAt
+		}
+		if end.Before(limit) {
+			limit = end
+		}
+		return active.HourlyRateUSD * max(limit.Sub(start), 0).Hours()
+	}
+	return cost(day, day.AddDate(0, 0, 1)), cost(month, month.AddDate(0, 1, 0))
 }
 
 func (t *Tracker) loadLocked() error {

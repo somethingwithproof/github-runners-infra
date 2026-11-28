@@ -11,6 +11,12 @@ packer {
   }
 }
 
+variable "digitalocean_token" {
+  type      = string
+  default   = env("DIGITALOCEAN_TOKEN")
+  sensitive = true
+}
+
 variable "runner_version" { type = string }
 variable "runner_sha256" { type = string }
 variable "region" {
@@ -23,7 +29,7 @@ variable "size" {
 }
 
 source "digitalocean" "runner" {
-  api_token     = env("DIGITALOCEAN_TOKEN")
+  api_token     = var.digitalocean_token
   image         = "ubuntu-24-04-x64"
   region        = var.region
   size          = var.size
