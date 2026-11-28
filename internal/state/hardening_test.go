@@ -106,7 +106,7 @@ func TestReleaseSweptOrphansProtectsOwnershipMismatchAndTOCTOU(t *testing.T) {
 		if err := store.update(key, func(r *Record) { r.ProvisionedAt = oldTime; r.CreatedAt = oldTime }); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.MarkOrphaned(ctx, key, lastErr); err != nil {
+		if err := store.MarkOrphaned(ctx, key, lastErr, ""); err != nil {
 			t.Fatal(err)
 		}
 	}

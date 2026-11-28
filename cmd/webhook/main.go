@@ -161,16 +161,20 @@ func run() error {
 		writeBudgetMetrics(w, budgetTracker)
 	})
 
-	srv := &http.Server{
-		Addr:              cfg.listenAddr,
-		Handler:           mux,
+	srv := newHTTPServer(cfg.listenAddr, mux)
+	metrics := newMetricsServer(cfg.metricsAddr, stateStore, budgetTracker, cfg.maxLiveRunners, computeClient.Provider(), handler.OrphanCleanups)
+	return serveUntilShutdown(processCtx, srv, handler.Start, handler.Wait, srv.ListenAndServe, metrics)
+}
+
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-
-	return serveUntilShutdown(processCtx, srv, handler.Start, handler.Wait, srv.ListenAndServe)
 }
 
 func serveUntilShutdown(
@@ -179,11 +183,15 @@ func serveUntilShutdown(
 	startWorkers func(context.Context),
 	waitWorkers func(),
 	listen func() error,
+	metrics *http.Server,
 ) error {
 	workerCtx, cancelWorkers := context.WithCancel(context.Background())
 	startWorkers(workerCtx)
 
-	serverErr := make(chan error, 1)
+	serverErr := make(chan error, 2)
+	if metrics != nil {
+		go func() { serverErr <- metrics.ListenAndServe() }()
+	}
 	go func() {
 		log.Print(i18n.T("webhook.log.starting", srv.Addr))
 		serverErr <- listen()
@@ -201,6 +209,11 @@ func serveUntilShutdown(
 	defer cancelShutdown()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Print(i18n.T("webhook.log.http_shutdown", err))
+	}
+	if metrics != nil {
+		if err := metrics.Shutdown(shutdownCtx); err != nil {
+			log.Print(i18n.T("webhook.log.http_shutdown", err))
+		}
 	}
 	cancelWorkers()
 	waitWorkers()
@@ -598,6 +611,7 @@ type runtimeConfig struct {
 	appID, installationID              int64
 	privateKeyPath, stateFile          string
 	requiredLabel, listenAddr          string
+	metricsAddr                        string
 	webhookSecret, runnerVersion       string
 	runnerSHA256, chefInstallerSHA256  string
 	allowedLabels, allowedRepositories []string
@@ -706,6 +720,7 @@ func loadRuntimeConfig() (runtimeConfig, error) {
 	}
 	cfg.stateFile = envOrDefault("STATE_FILE", "/var/lib/github-runners/state.json")
 	cfg.requiredLabel = envOrDefault("REQUIRED_LABEL", "self-hosted")
+	cfg.metricsAddr = strings.TrimSpace(os.Getenv("METRICS_ADDR"))
 	cfg.listenAddr = envOrDefault("LISTEN_ADDR", ":8080")
 	return cfg, nil
 }

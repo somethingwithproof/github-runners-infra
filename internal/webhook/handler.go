@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/thomasvincent/github-runners-infra/internal/budget"
@@ -98,6 +99,7 @@ type spotRateEstimator interface {
 
 // Handler authenticates webhooks and drives durable runner lifecycle workers.
 type Handler struct {
+	orphanCleanups            atomic.Uint64
 	webhookSecret             []byte
 	githubClient              GitHubClient
 	computeClient             ComputeClient
@@ -666,7 +668,7 @@ func (h *Handler) reconcileLiveness(ctx context.Context, cutoff time.Time) []err
 	knownInstances, err := h.store.KnownInstanceIDs(ctx)
 	if err != nil {
 		reconciliationErrors = append(reconciliationErrors, fmt.Errorf("list known provider instances: %w", err))
-	} else if deleted, sweepErr := h.computeClient.SweepOrphanedRunners(ctx, knownInstances, cutoff); sweepErr != nil {
+	} else if deleted, sweepErr := h.sweepOrphans(ctx, knownInstances, cutoff); sweepErr != nil {
 		reconciliationErrors = append(reconciliationErrors, fmt.Errorf("sweep orphaned provider instances: %w", sweepErr))
 	} else {
 		if deleted != 0 {
@@ -685,6 +687,17 @@ func (h *Handler) reconcileLiveness(ctx context.Context, cutoff time.Time) []err
 	}
 	reconciliationErrors = append(reconciliationErrors, h.reconcileProvisionedRunners(ctx)...)
 	return reconciliationErrors
+}
+
+// OrphanCleanups counts provider resources reclaimed by sweeps since startup.
+func (h *Handler) OrphanCleanups() uint64 { return h.orphanCleanups.Load() }
+
+func (h *Handler) sweepOrphans(ctx context.Context, known map[string]struct{}, cutoff time.Time) (int, error) {
+	deleted, err := h.computeClient.SweepOrphanedRunners(ctx, known, cutoff)
+	if deleted > 0 {
+		h.orphanCleanups.Add(uint64(deleted))
+	}
+	return deleted, err
 }
 
 func (h *Handler) snapshotSweptOrphanCandidates(ctx context.Context, cutoff time.Time) (map[string]string, error) {
@@ -778,7 +791,7 @@ func (h *Handler) reconcileOrphanedGitHubRunners(ctx context.Context) []error {
 			} else {
 				retryAt = time.Now().Add(retryDelay(record.ReconcileFailures + 1))
 			}
-			if stateErr := h.store.DeferOrphanCleanup(context.WithoutCancel(ctx), record.Key, err.Error(), retryAt); stateErr != nil {
+			if stateErr := h.store.DeferOrphanCleanup(context.WithoutCancel(ctx), record.Key, err.Error(), retryAt, rateLimited); stateErr != nil {
 				err = errors.Join(err, fmt.Errorf("persist orphan GitHub cleanup backoff: %w", stateErr))
 			}
 			reconciliationErrors = append(reconciliationErrors, err)
@@ -973,7 +986,7 @@ func (h *Handler) expireRunner(ctx context.Context, record state.Record) error {
 	if record.Provider != h.provider {
 		err := fmt.Errorf("cannot expire runner %s owned by provider %q with configured provider %q", record.Key, record.Provider, h.provider)
 		log.Printf("ERROR: %v", err)
-		if stateErr := h.markOrphaned(ctx, record, err); stateErr != nil {
+		if stateErr := h.markOrphaned(ctx, record, err, state.WorkDelete); stateErr != nil {
 			return errors.Join(err, fmt.Errorf("persist provider-mismatch orphan: %w", stateErr))
 		}
 		return err
@@ -1009,7 +1022,7 @@ func (h *Handler) deferReconciliation(ctx context.Context, record state.Record, 
 	return cause
 }
 
-func (h *Handler) markOrphaned(ctx context.Context, record state.Record, cause error) error {
+func (h *Handler) markOrphaned(ctx context.Context, record state.Record, cause error, failedWork state.WorkKind) error {
 	persistCtx := context.WithoutCancel(ctx)
 	var cleanupErr error
 	if record.GitHubRunnerID != 0 && record.GitHubRunnerOwned {
@@ -1023,7 +1036,7 @@ func (h *Handler) markOrphaned(ctx context.Context, record state.Record, cause e
 		}
 	}
 	orphanCause := errors.Join(cause, cleanupErr)
-	if err := h.store.MarkOrphaned(persistCtx, record.Key, orphanCause.Error()); err != nil {
+	if err := h.store.MarkOrphaned(persistCtx, record.Key, orphanCause.Error(), failedWork); err != nil {
 		return errors.Join(orphanCause, fmt.Errorf("persist orphaned runner %s: %w", record.Key, err))
 	}
 	return cleanupErr
@@ -1051,7 +1064,7 @@ func (h *Handler) deleteUntrackedExpiredRunner(ctx context.Context, record state
 
 func (h *Handler) untrackedCleanupFailed(ctx context.Context, record state.Record, attempt int, cleanupErr error) error {
 	if errors.Is(cleanupErr, compute.ErrOwnershipMismatch) {
-		if err := h.markOrphaned(ctx, record, cleanupErr); err != nil {
+		if err := h.markOrphaned(ctx, record, cleanupErr, state.WorkDelete); err != nil {
 			return errors.Join(cleanupErr, fmt.Errorf("persist orphaned cleanup state: %w", err))
 		}
 		return cleanupErr
@@ -1099,7 +1112,7 @@ func (h *Handler) process(parent context.Context, record state.Record, kind stat
 	}
 	if record.Provider != h.provider {
 		err := fmt.Errorf("state record belongs to provider %q, controller is configured for %q", record.Provider, h.provider)
-		if stateErr := h.markOrphaned(persistCtx, record, err); stateErr != nil {
+		if stateErr := h.markOrphaned(persistCtx, record, err, kind); stateErr != nil {
 			log.Printf("ERROR: persist provider mismatch for %s: %v", record.Key, stateErr)
 		}
 		return
@@ -1409,7 +1422,7 @@ func (h *Handler) provisionFailed(ctx context.Context, record state.Record, err 
 		return
 	}
 	if errors.Is(err, compute.ErrCreateOutcomeUnknown) {
-		if stateErr := h.markOrphaned(persistCtx, record, err); stateErr != nil {
+		if stateErr := h.markOrphaned(persistCtx, record, err, state.WorkProvision); stateErr != nil {
 			log.Printf("ERROR: persist ambiguous provider create for %s: %v", record.Key, stateErr)
 		}
 		log.Printf("ERROR: provider create outcome for %s is unknown; automatic retry disabled", record.Key)
@@ -1420,7 +1433,7 @@ func (h *Handler) provisionFailed(ctx context.Context, record state.Record, err 
 		cleanupErr := h.computeClient.CleanupRunner(cleanupCtx, record.Key)
 		cancel()
 		if errors.Is(cleanupErr, compute.ErrOwnershipMismatch) {
-			if stateErr := h.markOrphaned(persistCtx, record, cleanupErr); stateErr != nil {
+			if stateErr := h.markOrphaned(persistCtx, record, cleanupErr, state.WorkProvision); stateErr != nil {
 				log.Printf("ERROR: persist orphaned failed provision for %s: %v", record.Key, stateErr)
 			}
 			log.Printf("ERROR: failed provision for %s requires operator cleanup: %v", record.Key, cleanupErr)
@@ -1463,7 +1476,7 @@ func (h *Handler) delete(ctx context.Context, record state.Record) {
 			return
 		}
 		if errors.Is(err, compute.ErrOwnershipMismatch) {
-			if stateErr := h.markOrphaned(persistCtx, record, err); stateErr != nil {
+			if stateErr := h.markOrphaned(persistCtx, record, err, state.WorkDelete); stateErr != nil {
 				log.Printf("ERROR: persist orphaned runner %s: %v", record.Key, stateErr)
 			}
 			log.Printf("ERROR: runner %s requires operator cleanup: %v", record.Key, err)

@@ -144,7 +144,7 @@ type Store interface {
 	DeferDeletionConfirmation(context.Context, string, string, time.Time, DeferPolicy) error
 	BeginCleanupAttempt(context.Context, string, int) (int, bool, error)
 	MarkDeleteFailed(context.Context, string, string, time.Time, int) error
-	MarkOrphaned(context.Context, string, string) error
+	MarkOrphaned(context.Context, string, string, WorkKind) error
 	ListExpired(context.Context, time.Time) ([]Record, error)
 	ListProvisioned(context.Context) ([]Record, error)
 	ListOrphaned(context.Context) ([]Record, error)
@@ -159,7 +159,7 @@ type Store interface {
 	ClearRunnerMissing(context.Context, string, RunnerGuard) error
 	DeferReconciliation(context.Context, string, RunnerGuard, string, time.Time, DeferPolicy) error
 	DeferRateLimitedCleanup(context.Context, string, string, time.Time, int, bool) error
-	DeferOrphanCleanup(context.Context, string, string, time.Time) error
+	DeferOrphanCleanup(context.Context, string, string, time.Time, bool) error
 	RequeueMissingRunner(context.Context, string, RunnerGuard, int) (bool, error)
 	PruneDeleted(context.Context) (int, error)
 }
@@ -178,6 +178,7 @@ type journalEntry struct {
 // periodically compacts them into an atomically replaced snapshot. It is
 // intended for a single controller process.
 type FileStore struct {
+	metrics          map[string]ProviderCounters
 	mu               sync.Mutex
 	lockFile         *os.File
 	path             string
@@ -693,11 +694,7 @@ func (s *FileStore) ClaimNext(ctx context.Context, now time.Time, maxAttempts in
 func (s *FileStore) liveRunnerCountLocked() int {
 	count := 0
 	for _, record := range s.records {
-		if record.Status == StatusDeleted || (record.Status == StatusOrphaned && record.InstanceID == "") {
-			continue
-		}
-		if record.InstanceID != "" || (record.GitHubRunnerOwned && record.GitHubRunnerID != 0) ||
-			record.ClaimedWork == WorkProvision || record.Status == StatusProvisioning {
+		if record.countsAsLive() {
 			count++
 		}
 	}
@@ -1116,19 +1113,24 @@ func (s *FileStore) DeferRateLimitedCleanup(_ context.Context, key, message stri
 
 // DeferOrphanCleanup records backoff while keeping an orphan terminal and
 // admission-safe.
-func (s *FileStore) DeferOrphanCleanup(_ context.Context, key, message string, retryAt time.Time) error {
+func (s *FileStore) DeferOrphanCleanup(_ context.Context, key, message string, retryAt time.Time, throttled bool) error {
 	return s.update(key, func(record *Record) {
 		if record.Status != StatusOrphaned {
 			return
 		}
 		record.ReconcileFailures++
+		if throttled {
+			record.ThrottleFailures++
+		} else {
+			record.ThrottleFailures = 0
+		}
 		record.LastError = message
 		record.NextAttemptAt = retryAt.UTC()
 	})
 }
 
 func (s *FileStore) MarkProvisionFailed(_ context.Context, key, message string, retryAt time.Time, maxAttempts int) error {
-	return s.update(key, func(record *Record) {
+	return s.updateWithFailure(key, WorkProvision, func(record *Record) {
 		if record.Status == StatusDeleted || record.Status == StatusOrphaned {
 			return
 		}
@@ -1355,7 +1357,7 @@ func (s *FileStore) BeginCleanupAttempt(_ context.Context, key string, maxAttemp
 }
 
 func (s *FileStore) MarkDeleteFailed(_ context.Context, key, message string, retryAt time.Time, maxAttempts int) error {
-	return s.update(key, func(record *Record) {
+	return s.updateWithFailure(key, WorkDelete, func(record *Record) {
 		if record.Status == StatusDeleted || record.Status == StatusOrphaned {
 			return
 		}
@@ -1373,8 +1375,8 @@ func (s *FileStore) MarkDeleteFailed(_ context.Context, key, message string, ret
 
 // MarkOrphaned records an operator-actionable terminal resource without
 // retrying unsafe provider mutation. A live instance still consumes admission.
-func (s *FileStore) MarkOrphaned(_ context.Context, key, message string) error {
-	return s.update(key, func(record *Record) {
+func (s *FileStore) MarkOrphaned(_ context.Context, key, message string, failedWork WorkKind) error {
+	return s.updateWithFailure(key, failedWork, func(record *Record) {
 		// Every other mutator returns early here; without this a late worker
 		// write resurrects a deleted record, and PruneDeleted then never
 		// collects it because GitHubRunnerID is still set.
@@ -1651,6 +1653,10 @@ func cloneRecords(records map[string]Record) map[string]Record {
 }
 
 func (s *FileStore) update(key string, mutate func(*Record)) error {
+	return s.updateWithFailure(key, "", mutate)
+}
+
+func (s *FileStore) updateWithFailure(key string, failure WorkKind, mutate func(*Record)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	record, ok := s.records[key]
@@ -1669,6 +1675,7 @@ func (s *FileStore) update(key string, mutate func(*Record)) error {
 		s.records[key] = before
 		return err
 	}
+	s.countLifecycleEvents(before, record, failure)
 	if before.GitHubRunnerID != 0 &&
 		(record.Status == StatusDeleted || !record.GitHubRunnerOwned || record.GitHubRunnerID != before.GitHubRunnerID) {
 		s.evictRunnerKeyLocked(key, before)

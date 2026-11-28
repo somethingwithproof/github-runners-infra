@@ -584,6 +584,31 @@ format.
 
 Admission reserves the estimated hourly rate for `MAX_RUNNER_AGE`. UTC daily and monthly totals use the runtime in each window. Provider billing can continue during outages or delayed deletion. Configure provider billing alerts for that exposure.
 
+### Monitor the controller
+
+Set `METRICS_ADDR=127.0.0.1:9090` to scrape `GET /metrics` on a separate
+listener. Leaving it unset disables this listener. Use a private interface
+reachable by your scraper. The webhook listener continues to serve budget
+metrics at its existing address.
+
+| Metric | What it measures |
+| --- | --- |
+| `runner_records{provider,state}` | Job records in each lifecycle state. The pending count shows the provisioning backlog. |
+| `runner_live` | Fleet slots in use, including in-progress claims and orphaned instances that still reserve capacity. |
+| `runner_live_limit` | Configured admission limit (`MAX_LIVE_RUNNERS`). |
+| `runner_provision_failures_total{provider}` | Provision failures recorded by the controller, including retryable attempts. |
+| `runner_delete_failures_total{provider}` | Deletion failures recorded by the controller, including retryable attempts. |
+| `runner_rate_limit_deferrals_total{provider}` | Recorded throttle events during provisioning, deletion or reconciliation. |
+| `runner_orphan_cleanups_total` | Provider resources reclaimed by orphan sweeps. |
+| `budget_blocked_total` | Provisioning requests blocked by a spend cap. |
+| `estimated_spend_usd{window}` | Estimated daily, monthly and in-flight spend in USD. |
+
+Lifecycle counters reset when the controller restarts. The provider label
+identifies the configured provider (`multi` for routed jobs). For an initial
+capacity alert, look for pending jobs while `runner_live >= runner_live_limit`
+for 10 minutes. Investigate repeated failures or throttles when their counters
+keep increasing across scrapes.
+
 ### JIT config, pre-baked images, and optional egress allowlist
 
 ```dotenv

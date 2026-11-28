@@ -59,7 +59,7 @@ func TestServeUntilShutdownDrainsWorkers(t *testing.T) {
 			func() error {
 				<-shutdown
 				return http.ErrServerClosed
-			},
+			}, nil,
 		)
 	}()
 
@@ -83,7 +83,7 @@ func TestServeUntilShutdownPropagatesListenerFailureAndDrainsWorkers(t *testing.
 		&http.Server{},
 		func(ctx context.Context) { workerCtx = ctx },
 		func() { workerCanceled = workerCtx.Err() != nil },
-		func() error { return want },
+		func() error { return want }, nil,
 	)
 	if !errors.Is(err, want) || !workerCanceled {
 		t.Fatalf("listener failure = %v, workers canceled=%v", err, workerCanceled)
@@ -564,7 +564,7 @@ func setValidRuntimeEnvironment(t *testing.T) {
 		"LINODE_FIREWALL_ID", "LINODE_IMAGE", "LINODE_INSTANCE_TYPE", "LINODE_REGION",
 		"LINODE_SSH_PUBLIC_KEY_FILE", "LINODE_VPC_SUBNET_ID", "LISTEN_ADDR",
 		"LIVENESS_CONFIRMATIONS", "LIVENESS_SETTLE_WINDOW", "MAX_ATTEMPTS", "MAX_LIVE_RUNNERS",
-		"MAX_RUNNER_AGE", "OCI_API_URL", "OCI_ASSIGN_PUBLIC_IP", "OCI_AVAILABILITY_DOMAIN",
+		"MAX_RUNNER_AGE", "METRICS_ADDR", "OCI_API_URL", "OCI_ASSIGN_PUBLIC_IP", "OCI_AVAILABILITY_DOMAIN",
 		"OCI_COMPARTMENT_OCID", "OCI_FINGERPRINT", "OCI_IMAGE_OCID", "OCI_LABEL_SIZE_MAP",
 		"OCI_MEMORY_GB", "OCI_OCPUS", "OCI_PRIVATE_KEY_PATH", "OCI_PRIVATE_KEY_PEM",
 		"OCI_REGION", "OCI_SHAPE", "OCI_SSH_PUBLIC_KEY_FILE", "OCI_SUBNET_OCID",

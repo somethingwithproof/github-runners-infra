@@ -54,7 +54,7 @@ func TestKnownInstanceIDsExcludesOrphanedRecords(t *testing.T) {
 	if _, ok := known["i-orphaned"]; !ok {
 		t.Fatal("active instance was absent from known IDs")
 	}
-	if err := store.MarkOrphaned(context.Background(), record.Key, "operator attention required"); err != nil {
+	if err := store.MarkOrphaned(context.Background(), record.Key, "operator attention required", ""); err != nil {
 		t.Fatal(err)
 	}
 	known, err = store.KnownInstanceIDs(context.Background())
@@ -456,7 +456,7 @@ func TestMatchingCompletionReconcilesOrphanedRunner(t *testing.T) {
 	if err := store.MarkProvisioned(context.Background(), record.Key, "instance-902", 902, "runner-902"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MarkOrphaned(context.Background(), record.Key, "busy runner retry budget exhausted"); err != nil {
+	if err := store.MarkOrphaned(context.Background(), record.Key, "busy runner retry budget exhausted", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -728,7 +728,7 @@ func TestDeletedStateRejectsLateWorkerWrites(t *testing.T) {
 	if err := store.ScheduleDeletion(context.Background(), record.Key, RunnerGuard{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MarkOrphaned(context.Background(), record.Key, "late orphan"); err != nil {
+	if err := store.MarkOrphaned(context.Background(), record.Key, "late orphan", ""); err != nil {
 		t.Fatal(err)
 	}
 	terminal, _, err := store.Get(context.Background(), record.Key)
@@ -778,7 +778,7 @@ func TestCompletionPersistenceFailurePreservesRunnerIndex(t *testing.T) {
 	if err := store.MarkJITCreated(context.Background(), record.Key, 77, "runner-77"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MarkOrphaned(context.Background(), record.Key, "operator cleanup"); err != nil {
+	if err := store.MarkOrphaned(context.Background(), record.Key, "operator cleanup", ""); err != nil {
 		t.Fatal(err)
 	}
 	identity := runnerIdentityKey("org", "repo", 77)
@@ -1030,17 +1030,27 @@ func TestOrphanCleanupDeferralPreservesTerminalState(t *testing.T) {
 	if _, err := store.Create(context.Background(), record); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MarkOrphaned(context.Background(), record.Key, "operator cleanup"); err != nil {
+	if err := store.MarkOrphaned(context.Background(), record.Key, "operator cleanup", ""); err != nil {
 		t.Fatal(err)
 	}
 	retryAt := time.Now().Add(time.Minute).UTC()
-	if err := store.DeferOrphanCleanup(context.Background(), record.Key, "GitHub unavailable", retryAt); err != nil {
+	if err := store.DeferOrphanCleanup(context.Background(), record.Key, "GitHub unavailable", retryAt, false); err != nil {
 		t.Fatal(err)
 	}
 	persisted, _, err := store.Get(context.Background(), record.Key)
 	if err != nil || persisted.Status != StatusOrphaned || persisted.ReconcileFailures != 1 || !persisted.NextAttemptAt.Equal(retryAt) {
 		t.Fatalf("deferred orphan cleanup = %#v, %v", persisted, err)
 	}
+	if got := store.Metrics("").Providers["unknown"].RateLimitDeferrals; got != 0 {
+		t.Fatalf("ordinary cleanup error counted as throttle: %d", got)
+	}
+	if err := store.DeferOrphanCleanup(t.Context(), record.Key, "rate limited", retryAt, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Metrics("").Providers["unknown"].RateLimitDeferrals; got != 1 {
+		t.Fatalf("orphan throttle count = %d", got)
+	}
+
 }
 
 func TestDeletedRecordsArePrunedAfterRetention(t *testing.T) {

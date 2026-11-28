@@ -787,7 +787,7 @@ func TestOrphanedGitHubRunnerCleanupRetriesUntilIdentityCleared(t *testing.T) {
 	}
 	record, _, _ = store.Get(context.Background(), record.Key)
 	githubClient.removeErr = map[int64]error{807: errors.New("temporary GitHub failure")}
-	if err := handler.markOrphaned(context.Background(), record, compute.ErrOwnershipMismatch); err == nil {
+	if err := handler.markOrphaned(context.Background(), record, compute.ErrOwnershipMismatch, state.WorkDelete); err == nil {
 		t.Fatal("initial orphan deregistration failure was hidden")
 	}
 	githubClient.removeErr = nil
@@ -1176,7 +1176,7 @@ func TestProviderSweepReclaimsOnlyOldInstancesAbsentFromState(t *testing.T) {
 	if err := store.MarkProvisioned(context.Background(), orphaned.Key, "instance-terminal-orphan", 816, "runner-816"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.MarkOrphaned(context.Background(), orphaned.Key, "delete retries exhausted"); err != nil {
+	if err := store.MarkOrphaned(context.Background(), orphaned.Key, "delete retries exhausted", ""); err != nil {
 		t.Fatal(err)
 	}
 	old := time.Now().Add(-2 * time.Hour)
@@ -1190,6 +1190,9 @@ func TestProviderSweepReclaimsOnlyOldInstancesAbsentFromState(t *testing.T) {
 	handler.maxRunnerAge = time.Hour
 	if err := handler.expireRunners(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+	if got := handler.OrphanCleanups(); got != 2 {
+		t.Errorf("orphan cleanups = %d, want 2", got)
 	}
 	if _, ok := computeClient.orphans["instance-orphan"]; ok {
 		t.Fatal("old orphaned provider instance was not reclaimed")
@@ -1247,6 +1250,9 @@ func TestAmbiguousProviderCreateIsNeverAutomaticallyRetried(t *testing.T) {
 	}
 	if retry, _, err := store.ClaimNext(context.Background(), time.Now().Add(time.Hour), 3); err != nil || retry != nil {
 		t.Fatalf("ambiguous create was retried: %#v, %v", retry, err)
+	}
+	if got := store.Metrics("test").Providers["unknown"].ProvisionFailures; got != 1 {
+		t.Fatalf("terminal failure count = %d, want 1", got)
 	}
 }
 
@@ -1722,6 +1728,9 @@ func TestUntrackedOwnershipMismatchBecomesOrphanedImmediately(t *testing.T) {
 	persisted, _, err := store.Get(context.Background(), key)
 	if err != nil || persisted.Status != state.StatusOrphaned || persisted.DeleteAttempts != 1 {
 		t.Fatalf("ownership cleanup record = %#v, %v", persisted, err)
+	}
+	if got := store.Metrics("test").Providers["unknown"].DeleteFailures; got != 1 {
+		t.Fatalf("terminal failure count = %d, want 1", got)
 	}
 }
 
