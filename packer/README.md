@@ -16,6 +16,8 @@ build tools, and a SHA-256-verified `actions/runner` archive pre-installed in
 | Vultr | [`vultr.pkr.hcl`](./vultr.pkr.hcl) | `VULTR_API_KEY` |
 | Linode / Akamai | [`linode.pkr.hcl`](./linode.pkr.hcl) | `LINODE_TOKEN` |
 
+Stock images support workflows that need the Actions runner and Docker. Use cold boot for `chef` workloads, or add a checksum-verified Chef Workstation installation to the image before assigning that label.
+
 ## Build example
 
 ```bash

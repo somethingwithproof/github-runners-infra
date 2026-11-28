@@ -55,6 +55,7 @@ func ValidControllerID(value string) bool {
 // RunnerParams contains the non-secret values rendered into runner user data
 // and per-job provisioning overrides.
 type RunnerParams struct {
+	AuthorizeLaunch         func(provider, size string, spot bool) error
 	JobKey                  string
 	ProvisionEpoch          int
 	RunnerName              string

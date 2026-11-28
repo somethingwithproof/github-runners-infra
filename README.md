@@ -420,6 +420,8 @@ of passing an old resource ID to a different provider adapter.
 
 ### Cross-cloud failover and cost-aware routing
 
+Before switching a controller from a single provider to routing, stop new admissions and drain its pending jobs, runners, and orphans using the old configuration. Startup checks the state file before enabling routing. Keep the existing state file so resources can be reconciled.
+
 Set `CLOUD_PROVIDERS` to a comma-separated list of two or more configured
 providers (for example `vultr,linode,digitalocean,aws,gcp,azure`) to enable
 `internal/router.MultiCloudRouter`:
@@ -457,6 +459,8 @@ BUDGET_STATE_FILE=/var/lib/github-runners/budget.json
 `estimated_spend_usd{window="daily|monthly|in_flight"}` in Prometheus text
 format.
 
+Admission reserves the estimated hourly rate for `MAX_RUNNER_AGE`. UTC daily and monthly totals use the runtime in each window. Provider billing can continue during outages or delayed deletion. Configure provider billing alerts for that exposure.
+
 ### JIT config, pre-baked images, and optional egress allowlist
 
 ```dotenv
@@ -467,6 +471,10 @@ RUNNER_PREBAKED=false
 # Optional comma-separated host/CIDR HTTPS allowlist (off by default).
 RUNNER_EGRESS_ALLOWLIST=
 ```
+
+The host HTTPS allowlist applies to host processes. For untrusted workflows, enforce IPv4 and IPv6 egress outside the VM using a cloud firewall or a mandatory proxy. Docker access gives jobs administrative control inside the VM.
+
+The stock Packer images contain the Actions runner and Docker. Use cold boot for `chef` workloads or install and verify Chef Workstation in a custom image before advertising the `chef` label.
 
 Build pre-baked images across all six clouds using the HCL2 templates under
 [`packer/`](packer/README.md).

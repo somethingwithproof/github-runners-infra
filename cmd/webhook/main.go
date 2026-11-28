@@ -78,12 +78,18 @@ func run() error {
 		return i18n.Wrap(err, "webhook.err.create_compute", err)
 	}
 	defer closeCompute()
+	if _, routed := computeClient.(*router.MultiCloudRouter); routed {
+		if err := stateStore.ValidateRoutedState(); err != nil {
+			return err
+		}
+	}
 
 	budgetTracker, err := budget.NewTracker(budget.Config{
-		DailyCapUSD:     cfg.budgetDailyUSD,
-		MonthlyCapUSD:   cfg.budgetMonthlyUSD,
-		RepoDailyCapUSD: cfg.budgetRepoDailyUSD,
-		StatePath:       cfg.budgetStateFile,
+		DailyCapUSD:         cfg.budgetDailyUSD,
+		MonthlyCapUSD:       cfg.budgetMonthlyUSD,
+		RepoDailyCapUSD:     cfg.budgetRepoDailyUSD,
+		StatePath:           cfg.budgetStateFile,
+		ReservationDuration: cfg.maxRunnerAge,
 	})
 	if err != nil {
 		return i18n.Wrap(err, "webhook.err.invalid_config", err)

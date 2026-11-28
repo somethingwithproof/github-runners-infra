@@ -303,3 +303,22 @@ func TestParseHourlyRateOverridesValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestFallbackChecksBudgetBeforeNextBackend(t *testing.T) {
+	first, second := newStubProvider("vultr"), newStubProvider("linode")
+	first.createErr = errors.New("vultr API status 503: insufficient capacity")
+	r, err := New(Config{Strategy: StrategyPriority, Backends: []Backend{{Name: "vultr", DefaultSize: "small", Provider: first}, {Name: "linode", DefaultSize: "large", Provider: second}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	overBudget := errors.New("fallback too expensive")
+	_, err = r.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:1", AuthorizeLaunch: func(provider, size string, spot bool) error {
+		if provider == "linode" && size == "large" {
+			return overBudget
+		}
+		return nil
+	}})
+	if !errors.Is(err, overBudget) || first.createCalls != 1 || second.createCalls != 0 {
+		t.Fatalf("budget gate: first=%d, second=%d, err=%v", first.createCalls, second.createCalls, err)
+	}
+}

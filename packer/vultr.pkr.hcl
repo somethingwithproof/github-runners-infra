@@ -11,6 +11,12 @@ packer {
   }
 }
 
+variable "vultr_api_key" {
+  type      = string
+  default   = env("VULTR_API_KEY")
+  sensitive = true
+}
+
 variable "runner_version" { type = string }
 variable "runner_sha256" { type = string }
 variable "region" {
@@ -23,7 +29,7 @@ variable "plan" {
 }
 
 source "vultr" "runner" {
-  api_key              = env("VULTR_API_KEY")
+  api_key              = var.vultr_api_key
   os_id                = 2284
   region_id            = var.region
   plan_id              = var.plan

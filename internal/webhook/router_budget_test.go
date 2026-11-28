@@ -154,6 +154,13 @@ func TestHandlerPrebakedEgressAndRegistrationTokenFallback(t *testing.T) {
 		t.Fatalf("unexpected fallback auth params: %#v", comp.lastParams)
 	}
 
+	provisioned, _, err := store.Get(ctx, key)
+	if err != nil || provisioned.GitHubRunnerID != 0 || provisioned.GitHubRunnerOwned {
+		t.Fatalf("unknown registration identity: %#v, %v", provisioned, err)
+	}
+	if deleted, err := handler.reconcileProviderFoundRunner(ctx, provisioned); err != nil || deleted || ghClient.statusChecks != 0 {
+		t.Fatalf("fallback runner liveness: deleted=%v checks=%d err=%v", deleted, ghClient.statusChecks, err)
+	}
 	tmpl, err := template.ParseFiles("../../cloud-init/runner.yaml.tmpl")
 	if err != nil {
 		t.Fatal(err)

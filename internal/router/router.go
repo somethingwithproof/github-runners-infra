@@ -187,6 +187,15 @@ func (r *MultiCloudRouter) CreateRunner(ctx context.Context, params compute.Runn
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+		if params.AuthorizeLaunch != nil {
+			size := params.InstanceSize
+			if size == "" {
+				size = b.DefaultSize
+			}
+			if err := params.AuthorizeLaunch(b.Name, size, false); err != nil {
+				return nil, err
+			}
+		}
 		inst, err := b.Provider.CreateRunner(ctx, params)
 		if err == nil {
 			return &compute.RunnerInstance{

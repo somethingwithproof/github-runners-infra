@@ -11,6 +11,12 @@ packer {
   }
 }
 
+variable "linode_token" {
+  type      = string
+  default   = env("LINODE_TOKEN")
+  sensitive = true
+}
+
 variable "runner_version" { type = string }
 variable "runner_sha256" { type = string }
 variable "region" {
@@ -23,7 +29,7 @@ variable "instance_type" {
 }
 
 source "linode" "runner" {
-  linode_token      = env("LINODE_TOKEN")
+  linode_token      = var.linode_token
   image             = "linode/ubuntu24.04"
   region            = var.region
   instance_type     = var.instance_type
