@@ -313,152 +313,150 @@ func TestParseHourlyRateOverridesValidation(t *testing.T) {
 	}
 }
 
-func TestRouterSpotPricingFailoverAndOnDemandFallback(t *testing.T) {
-	t.Run("spot discount ranks GCP spot below Vultr on-demand", func(t *testing.T) {
-		vultrProv := newStubProvider("vultr")
-		vultrProv.createErrFn = func(p compute.RunnerParams) error {
-			return compute.RejectSpotUnsupported("Vultr", compute.ResolveSpot(false, p.Spot))
-		}
-		gcpProv := newStubProvider("gcp")
+func TestRouterRanksSpotByDiscountedPrice(t *testing.T) {
+	vultrProv := newStubProvider("vultr")
+	vultrProv.createErrFn = func(p compute.RunnerParams) error {
+		return compute.RejectSpotUnsupported("Vultr", compute.ResolveSpot(false, p.Spot))
+	}
+	gcpProv := newStubProvider("gcp")
 
-		r, err := New(Config{
-			Strategy:    StrategyCheapest,
-			DefaultSpot: true,
-			Backends: []Backend{
-				{Name: "vultr", DefaultSize: "vc2-4c-8gb", Provider: vultrProv},
-				{Name: "gcp", DefaultSize: "n2-standard-4", Provider: gcpProv},
-			},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		provName, _, spotRate := r.EstimateHourlyRateForMode("", compute.BoolPtr(true))
-		if provName != "gcp" || spotRate >= HourlyRate("vultr", "vc2-4c-8gb", nil) {
-			t.Fatalf("expected gcp spot cheapest, got %s %.4f", provName, spotRate)
-		}
-		inst, err := r.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:spot-cheap"})
-		if err != nil || !strings.HasPrefix(inst.ID, "gcp:") {
-			t.Fatalf("CreateRunner = %#v, %v", inst, err)
-		}
-		if gcpProv.createCalls != 1 || gcpProv.createParams[0].Spot == nil || !*gcpProv.createParams[0].Spot {
-			t.Fatalf("gcp createParams = %#v", gcpProv.createParams)
-		}
+	r, err := New(Config{
+		Strategy:    StrategyCheapest,
+		DefaultSpot: true,
+		Backends: []Backend{
+			{Name: "vultr", DefaultSize: "vc2-4c-8gb", Provider: vultrProv},
+			{Name: "gcp", DefaultSize: "n2-standard-4", Provider: gcpProv},
+		},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provName, _, spotRate := r.EstimateHourlyRateForMode("", compute.BoolPtr(true))
+	if provName != "gcp" || spotRate >= HourlyRate("vultr", "vc2-4c-8gb", nil) {
+		t.Fatalf("expected gcp spot cheapest, got %s %.4f", provName, spotRate)
+	}
+	inst, err := r.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:spot-cheap"})
+	if err != nil || !strings.HasPrefix(inst.ID, "gcp:") {
+		t.Fatalf("CreateRunner = %#v, %v", inst, err)
+	}
+	if gcpProv.createCalls != 1 || gcpProv.createParams[0].Spot == nil || !*gcpProv.createParams[0].Spot {
+		t.Fatalf("gcp createParams = %#v", gcpProv.createParams)
+	}
+}
 
-	t.Run("spot capacity failover across clouds then on-demand fallback", func(t *testing.T) {
-		awsProv := newStubProvider("aws")
-		awsProv.createErrFn = func(p compute.RunnerParams) error {
-			if compute.ResolveSpot(false, p.Spot) {
-				return fmt.Errorf("%w: aws spot full", compute.ErrCapacityUnavailable)
-			}
-			return nil
+func TestRouterRetriesOnDemandAfterSpotFailover(t *testing.T) {
+	awsProv := newStubProvider("aws")
+	awsProv.createErrFn = func(p compute.RunnerParams) error {
+		if compute.ResolveSpot(false, p.Spot) {
+			return fmt.Errorf("%w: aws spot full", compute.ErrCapacityUnavailable)
 		}
-		vultrProv := newStubProvider("vultr")
-		vultrProv.createErrFn = func(p compute.RunnerParams) error {
-			return compute.RejectSpotUnsupported("Vultr", compute.ResolveSpot(false, p.Spot))
-		}
+		return nil
+	}
+	vultrProv := newStubProvider("vultr")
+	vultrProv.createErrFn = func(p compute.RunnerParams) error {
+		return compute.RejectSpotUnsupported("Vultr", compute.ResolveSpot(false, p.Spot))
+	}
 
-		r, err := New(Config{
-			Strategy:             StrategyPriority,
-			DefaultSpot:          true,
-			SpotFallbackOnDemand: true,
-			Backends: []Backend{
-				{Name: "aws", DefaultSize: "m7i.xlarge", Provider: awsProv},
-				{Name: "vultr", DefaultSize: "vc2-4c-8gb", Provider: vultrProv},
-			},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		inst, err := r.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:spot-fb"})
-		if err != nil || !strings.HasPrefix(inst.ID, "aws:") {
-			t.Fatalf("fallback CreateRunner = %#v, %v", inst, err)
-		}
-		// Pass 1: aws(spot)->capErr, vultr(spot)->spotUnsupported; Pass 2: aws(on-demand)->ok
-		if awsProv.createCalls != 2 || vultrProv.createCalls != 1 {
-			t.Fatalf("calls aws=%d vultr=%d", awsProv.createCalls, vultrProv.createCalls)
-		}
-		if awsProv.createParams[1].Spot == nil || *awsProv.createParams[1].Spot {
-			t.Fatalf("second aws call was not forced on-demand: %#v", awsProv.createParams[1])
-		}
+	r, err := New(Config{
+		Strategy:             StrategyPriority,
+		DefaultSpot:          true,
+		SpotFallbackOnDemand: true,
+		Backends: []Backend{
+			{Name: "aws", DefaultSize: "m7i.xlarge", Provider: awsProv},
+			{Name: "vultr", DefaultSize: "vc2-4c-8gb", Provider: vultrProv},
+		},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inst, err := r.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:spot-fb"})
+	if err != nil || !strings.HasPrefix(inst.ID, "aws:") {
+		t.Fatalf("fallback CreateRunner = %#v, %v", inst, err)
+	}
+	// Pass 1: aws(spot)->capErr, vultr(spot)->spotUnsupported; Pass 2: aws(on-demand)->ok
+	if awsProv.createCalls != 2 || vultrProv.createCalls != 1 {
+		t.Fatalf("calls aws=%d vultr=%d", awsProv.createCalls, vultrProv.createCalls)
+	}
+	if awsProv.createParams[1].Spot == nil || *awsProv.createParams[1].Spot {
+		t.Fatalf("second aws call was not forced on-demand: %#v", awsProv.createParams[1])
+	}
+}
 
-	t.Run("denied budget prevents on-demand launch", func(t *testing.T) {
-		aws := newStubProvider("aws")
-		aws.createErr = compute.ErrCapacityUnavailable
-		r, err := New(Config{DefaultSpot: true, SpotFallbackOnDemand: true, Backends: []Backend{{Name: "aws", DefaultSize: "m7i.xlarge", Provider: aws}}})
-		if err != nil {
-			t.Fatal(err)
+func TestRouterPreventsOverBudgetFallback(t *testing.T) {
+	aws := newStubProvider("aws")
+	aws.createErr = compute.ErrCapacityUnavailable
+	r, err := New(Config{DefaultSpot: true, SpotFallbackOnDemand: true, Backends: []Backend{{Name: "aws", DefaultSize: "m7i.xlarge", Provider: aws}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	denied := errors.New("budget exhausted")
+	_, err = r.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:cap", AuthorizeLaunch: func(provider, size string, spot bool) error {
+		if provider != "aws" || size != "m7i.xlarge" {
+			t.Fatalf("unexpected quote %s/%s", provider, size)
 		}
-		denied := errors.New("budget exhausted")
-		_, err = r.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:cap", AuthorizeLaunch: func(provider, size string, spot bool) error {
-			if provider != "aws" || size != "m7i.xlarge" {
-				t.Fatalf("unexpected quote %s/%s", provider, size)
-			}
-			if !spot {
-				return denied
-			}
-			return nil
-		}})
-		if !errors.Is(err, denied) || aws.createCalls != 1 {
-			t.Fatalf("create calls = %d, error = %v", aws.createCalls, err)
+		if !spot {
+			return denied
 		}
-	})
+		return nil
+	}})
+	if !errors.Is(err, denied) || aws.createCalls != 1 {
+		t.Fatalf("create calls = %d, error = %v", aws.createCalls, err)
+	}
+}
 
-	t.Run("no on-demand fallback when SpotFallbackOnDemand is false", func(t *testing.T) {
-		awsProv := newStubProvider("aws")
-		awsProv.createErr = fmt.Errorf("%w: aws spot full", compute.ErrCapacityUnavailable)
-		r, err := New(Config{
-			DefaultSpot:          true,
-			SpotFallbackOnDemand: false,
-			Backends:             []Backend{{Name: "aws", Provider: awsProv}},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = r.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:spot-nofb"})
-		if !errors.Is(err, ErrAllProvidersExhausted) || !compute.IsCapacityError(err) || awsProv.createCalls != 1 {
-			t.Fatalf("err=%v calls=%d", err, awsProv.createCalls)
-		}
+func TestRouterDisablesOnDemandFallback(t *testing.T) {
+	awsProv := newStubProvider("aws")
+	awsProv.createErr = fmt.Errorf("%w: aws spot full", compute.ErrCapacityUnavailable)
+	r, err := New(Config{
+		DefaultSpot:          true,
+		SpotFallbackOnDemand: false,
+		Backends:             []Backend{{Name: "aws", Provider: awsProv}},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = r.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:spot-nofb"})
+	if !errors.Is(err, ErrAllProvidersExhausted) || !compute.IsCapacityError(err) || awsProv.createCalls != 1 {
+		t.Fatalf("err=%v calls=%d", err, awsProv.createCalls)
+	}
+}
 
-	t.Run("explicit :spot hourly rate override", func(t *testing.T) {
-		overrides, err := ParseHourlyRateOverrides("aws:m7i.xlarge:spot=0.055, gcp:spot=0.045, oci:VM.Standard.E4.Flex:4:16:spot=0.050")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := HourlyRateForMode("aws", "m7i.xlarge", true, overrides); got != 0.055 {
-			t.Fatalf("aws spot override = %v, want 0.055", got)
-		}
-		if got := HourlyRateForMode("gcp", "n2-standard-4", true, overrides); got != 0.045 {
-			t.Fatalf("gcp spot override = %v, want 0.045", got)
-		}
-		if got := HourlyRateForMode("oci", "VM.Standard.E4.Flex:4:16", true, overrides); got != 0.050 {
-			t.Fatalf("oci flex spot override = %v, want 0.050", got)
-		}
-		// Dynamic OCI Flex rate + 50% Preemptible discount when no override is set.
-		if got := HourlyRate("oci", "VM.Standard.A1.Flex:8:48", nil); got < 0.151 || got > 0.153 {
-			t.Fatalf("oci dynamic A1.Flex:8:48 rate = %v, want ~0.152", got)
-		}
-		if got := HourlyRateForMode("oci", "VM.Standard.E4.Flex:4:16", true, nil); got != 0.062 {
-			t.Fatalf("oci default E4.Flex preemptible rate = %v, want 0.062", got)
-		}
-		bareOverrides, err := ParseHourlyRateOverrides("oci:VM.Standard.E4.Flex=0.50, oci:VM.Standard.E4.Flex:spot=0.20")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := HourlyRate("oci", "VM.Standard.E4.Flex:4:16", bareOverrides); got != 0.50 {
-			t.Fatalf("oci bare-shape fallback rate = %v, want 0.50", got)
-		}
-		if got := HourlyRateForMode("oci", "VM.Standard.E4.Flex:4:16", true, bareOverrides); got != 0.20 {
-			t.Fatalf("oci bare-shape spot fallback rate = %v, want 0.20", got)
-		}
-		bothOverrides, err := ParseHourlyRateOverrides("oci:VM.Standard.E4.Flex=0.50, oci:VM.Standard.E4.Flex:4:16=0.40")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := HourlyRate("oci", "VM.Standard.E4.Flex:4:16", bothOverrides); got != 0.40 {
-			t.Fatalf("oci exact-dimension precedence = %v, want 0.40", got)
-		}
-	})
+func TestRouterHonorsSpotRateOverride(t *testing.T) {
+	overrides, err := ParseHourlyRateOverrides("aws:m7i.xlarge:spot=0.055, gcp:spot=0.045, oci:VM.Standard.E4.Flex:4:16:spot=0.050")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := HourlyRateForMode("aws", "m7i.xlarge", true, overrides); got != 0.055 {
+		t.Fatalf("aws spot override = %v, want 0.055", got)
+	}
+	if got := HourlyRateForMode("gcp", "n2-standard-4", true, overrides); got != 0.045 {
+		t.Fatalf("gcp spot override = %v, want 0.045", got)
+	}
+	if got := HourlyRateForMode("oci", "VM.Standard.E4.Flex:4:16", true, overrides); got != 0.050 {
+		t.Fatalf("oci flex spot override = %v, want 0.050", got)
+	}
+	// Dynamic OCI Flex rate + 50% Preemptible discount when no override is set.
+	if got := HourlyRate("oci", "VM.Standard.A1.Flex:8:48", nil); got < 0.151 || got > 0.153 {
+		t.Fatalf("oci dynamic A1.Flex:8:48 rate = %v, want ~0.152", got)
+	}
+	if got := HourlyRateForMode("oci", "VM.Standard.E4.Flex:4:16", true, nil); got != 0.062 {
+		t.Fatalf("oci default E4.Flex preemptible rate = %v, want 0.062", got)
+	}
+	bareOverrides, err := ParseHourlyRateOverrides("oci:VM.Standard.E4.Flex=0.50, oci:VM.Standard.E4.Flex:spot=0.20")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := HourlyRate("oci", "VM.Standard.E4.Flex:4:16", bareOverrides); got != 0.50 {
+		t.Fatalf("oci bare-shape fallback rate = %v, want 0.50", got)
+	}
+	if got := HourlyRateForMode("oci", "VM.Standard.E4.Flex:4:16", true, bareOverrides); got != 0.20 {
+		t.Fatalf("oci bare-shape spot fallback rate = %v, want 0.20", got)
+	}
+	bothOverrides, err := ParseHourlyRateOverrides("oci:VM.Standard.E4.Flex=0.50, oci:VM.Standard.E4.Flex:4:16=0.40")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := HourlyRate("oci", "VM.Standard.E4.Flex:4:16", bothOverrides); got != 0.40 {
+		t.Fatalf("oci exact-dimension precedence = %v, want 0.40", got)
+	}
 }

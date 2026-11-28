@@ -32,8 +32,11 @@ func TestRESTHelpers(t *testing.T) {
 	if !IsAmbiguousCreateError(&APIError{Provider: "test", StatusCode: http.StatusServiceUnavailable}) {
 		t.Fatal("503 should be ambiguous")
 	}
-	if IsAmbiguousCreateError(context.Canceled) {
-		t.Fatal("canceled should not be ambiguous")
+	if !IsAmbiguousCreateError(context.DeadlineExceeded) {
+		t.Fatal("a timed-out POST may have created the instance")
+	}
+	if !IsAmbiguousCreateError(context.Canceled) {
+		t.Fatal("a canceled POST may have created the instance")
 	}
 
 	if !HasTag([]string{"a", "b"}, "b") || HasTag([]string{"a"}, "c") {
@@ -75,7 +78,7 @@ func TestReconcileAmbiguousCreateConfirmedAbsentAndRecovered(t *testing.T) {
 func TestSweepContinuesAfterResourceError(t *testing.T) {
 	failure := errors.New("delete rejected")
 	var attempted []string
-	deleted, err := SweepOrphans(context.Background(), "test", "owned", nil, time.Now(), []string{"first", "second"},
+	deleted, err := SweepOrphans(context.Background(), OrphanSweep{Provider: "test", ControllerTag: "owned", Cutoff: time.Now()}, []string{"first", "second"},
 		func(id string) string { return id }, func(string) []string { return []string{"owned"} },
 		func(string) (time.Time, error) { return time.Time{}, nil }, func(_ context.Context, id string) error {
 			attempted = append(attempted, id)
@@ -123,5 +126,20 @@ func TestDoJSONRequiresExpectedBodyAndPreservesErrorStatus(t *testing.T) {
 	}
 	if err := request("/list", &list); err != nil || list == nil {
 		t.Fatalf("empty JSON list = %v %v", list, err)
+	}
+}
+
+func TestRecoverCreateAfterCallerCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	found := RunnerInstance{ID: "existing"}
+	runner, err := RecoverCreateError(ctx, "test", "runner", RecoveryTiming{Timeout: time.Second, Poll: time.Millisecond}, context.Canceled, func(poll context.Context) (*RunnerInstance, error) {
+		if err := poll.Err(); err != nil {
+			t.Fatalf("recovery context canceled: %v", err)
+		}
+		return &found, nil
+	}, func(inst *RunnerInstance) *RunnerInstance { return inst })
+	if err != nil || runner != &found {
+		t.Fatalf("recovered instance = %v, %v", runner, err)
 	}
 }

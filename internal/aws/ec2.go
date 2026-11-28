@@ -207,8 +207,7 @@ func (c *Client) runAcrossSubnets(
 	params compute.RunnerParams,
 	instanceType types.InstanceType,
 	subnets []string,
-	useSpot bool,
-	isFallback bool,
+	useSpot, isFallback bool,
 ) (*compute.RunnerInstance, error) {
 	userData, err := compute.RenderCloudInit(c.tmpl, params.WithSpot(useSpot))
 	if err != nil {

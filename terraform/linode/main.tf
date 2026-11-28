@@ -35,11 +35,14 @@ variable "subnet_ipv4" {
 }
 
 locals {
-  safe_id = trim(replace(lower(var.controller_id), "/[-_]+/", "-"), "-")
+  suffix        = substr(sha256(var.controller_id), 0, 12)
+  vpc_name      = "ghr-${local.safe_id}"
+  firewall_name = "ghr-${local.safe_id}-deny-in"
+  safe_id       = trim(replace(lower(var.controller_id), "/[-_]+/", "-"), "-")
 }
 
 resource "linode_vpc" "runners" {
-  label       = trimsuffix(substr("ghr-${local.safe_id}", 0, 64), "-")
+  label       = local.safe_id == var.controller_id && length(local.vpc_name) <= 64 ? local.vpc_name : "${trimsuffix(substr(local.vpc_name, 0, 51), "-")}-${local.suffix}"
   region      = var.region
   description = "Dedicated VPC for ephemeral GitHub Actions runners (${var.controller_id})"
 }
@@ -51,7 +54,7 @@ resource "linode_vpc_subnet" "runners" {
 }
 
 resource "linode_firewall" "runners" {
-  label           = trimsuffix(substr("ghr-${local.safe_id}-deny-in", 0, 32), "-")
+  label           = local.safe_id == var.controller_id && length(local.firewall_name) <= 32 ? local.firewall_name : "${trimsuffix(substr(local.vpc_name, 0, 19), "-")}-${local.suffix}"
   inbound_policy  = "DROP"
   outbound_policy = "DROP"
   tags            = ["runner-controller-${var.controller_id}"]
