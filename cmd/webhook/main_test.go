@@ -216,6 +216,25 @@ func TestSplitCSV(t *testing.T) {
 	}
 }
 
+func TestSingleProviderRejectsSpot(t *testing.T) {
+	for _, provider := range []string{"digitalocean", "vultr", "linode"} {
+		t.Run(provider+" spot", func(t *testing.T) {
+			t.Setenv("CONTROLLER_ID", "controller-1")
+			t.Setenv("COMPUTE_PROVIDER", provider)
+			t.Setenv("CLOUD_INIT_PATH", writeRunnerTemplate(t))
+			t.Setenv("VULTR_API_KEY", "test-token")
+			t.Setenv("LINODE_TOKEN", "test-token")
+			t.Setenv("DIGITALOCEAN_TOKEN", "test-token")
+			t.Setenv("DO_VPC_UUID", "vpc-id")
+			t.Setenv("DO_FIREWALL_ID", "firewall-id")
+			t.Setenv("RUNNER_SPOT", "true")
+			if _, _, err := newComputeClient(context.Background(), context.Background()); err == nil || !strings.Contains(err.Error(), "RUNNER_SPOT") || !strings.Contains(strings.ToLower(err.Error()), provider) {
+				t.Fatalf("newComputeClient(%s, spot) = %v", provider, err)
+			}
+		})
+	}
+}
+
 func TestNewComputeClientRejectsInvalidProviderConfiguration(t *testing.T) {
 	t.Run("invalid spot boolean", func(t *testing.T) {
 		t.Setenv("CONTROLLER_ID", "controller-1")
@@ -258,22 +277,6 @@ func TestNewComputeClientRejectsInvalidProviderConfiguration(t *testing.T) {
 			t.Fatalf("invalid GCP_EXTERNAL_IP error = %v", err)
 		}
 	})
-	for _, provider := range []string{"digitalocean", "vultr", "linode"} {
-		t.Run(provider+" spot", func(t *testing.T) {
-			t.Setenv("CONTROLLER_ID", "controller-1")
-			t.Setenv("COMPUTE_PROVIDER", provider)
-			t.Setenv("CLOUD_INIT_PATH", writeRunnerTemplate(t))
-			t.Setenv("VULTR_API_KEY", "test-token")
-			t.Setenv("LINODE_TOKEN", "test-token")
-			t.Setenv("DIGITALOCEAN_TOKEN", "test-token")
-			t.Setenv("DO_VPC_UUID", "vpc-id")
-			t.Setenv("DO_FIREWALL_ID", "firewall-id")
-			t.Setenv("RUNNER_SPOT", "true")
-			if _, _, err := newComputeClient(context.Background(), context.Background()); err == nil || !strings.Contains(err.Error(), "RUNNER_SPOT") || !strings.Contains(strings.ToLower(err.Error()), provider) {
-				t.Fatalf("newComputeClient(%s, spot) = %v", provider, err)
-			}
-		})
-	}
 	t.Run("Azure unreadable SSH key", func(t *testing.T) {
 		t.Setenv("CONTROLLER_ID", "controller-1")
 		t.Setenv("COMPUTE_PROVIDER", "azure")

@@ -78,7 +78,7 @@ func TestReconcileAmbiguousCreateConfirmedAbsentAndRecovered(t *testing.T) {
 func TestSweepContinuesAfterResourceError(t *testing.T) {
 	failure := errors.New("delete rejected")
 	var attempted []string
-	deleted, err := SweepOrphans(context.Background(), "test", "owned", nil, time.Now(), []string{"first", "second"},
+	deleted, err := SweepOrphans(context.Background(), OrphanSweep{Provider: "test", ControllerTag: "owned", Cutoff: time.Now()}, []string{"first", "second"},
 		func(id string) string { return id }, func(string) []string { return []string{"owned"} },
 		func(string) (time.Time, error) { return time.Time{}, nil }, func(_ context.Context, id string) error {
 			attempted = append(attempted, id)
@@ -133,7 +133,7 @@ func TestRecoverCreateAfterCallerCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	found := RunnerInstance{ID: "existing"}
-	runner, err := RecoverCreateError(ctx, "test", "runner", time.Second, time.Millisecond, context.Canceled, func(poll context.Context) (*RunnerInstance, error) {
+	runner, err := RecoverCreateError(ctx, "test", "runner", RecoveryTiming{Timeout: time.Second, Poll: time.Millisecond}, context.Canceled, func(poll context.Context) (*RunnerInstance, error) {
 		if err := poll.Err(); err != nil {
 			t.Fatalf("recovery context canceled: %v", err)
 		}

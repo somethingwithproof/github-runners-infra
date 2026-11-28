@@ -320,13 +320,16 @@ func SelectSizeOverride(defaultSize, override, sizeLabel string) (string, error)
 	return override, nil
 }
 
+// RecoveryTiming bounds reconciliation after an uncertain create.
+type RecoveryTiming struct{ Timeout, Poll time.Duration }
+
 // RecoverCreateError resolves an ambiguous provider create error by polling
 // lookup for the deterministically named instance before deciding whether the
 // caller may retry or must treat the outcome as unknown.
 func RecoverCreateError[T any](
 	ctx context.Context,
 	provider, desiredName string,
-	timeout, poll time.Duration,
+	timing RecoveryTiming,
 	createErr error,
 	lookup func(context.Context) (*T, error),
 	toRunner func(*T) *RunnerInstance,
@@ -334,10 +337,10 @@ func RecoverCreateError[T any](
 	if !IsAmbiguousCreateError(createErr) {
 		return nil, fmt.Errorf("create %s instance: %w", provider, createErr)
 	}
-	recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timing.Timeout)
 	defer cancel()
 	recovered, confirmedAbsent, recoveryErr := ReconcileAmbiguousCreate(
-		recoveryCtx, provider, desiredName, poll, lookup,
+		recoveryCtx, provider, desiredName, timing.Poll, lookup,
 	)
 	if recoveryErr != nil {
 		return nil, errors.Join(fmt.Errorf("create %s instance: %w", provider, createErr), fmt.Errorf("reconcile ambiguous create: %w", recoveryErr))
@@ -387,13 +390,18 @@ func FindUniqueByName[T any](provider, jobKey, name string, items []T, nameOf fu
 	return match, nil
 }
 
+// OrphanSweep identifies the controller, live instances and age boundary for one sweep.
+type OrphanSweep struct {
+	Provider, ControllerTag string
+	Known                   map[string]struct{}
+	Cutoff                  time.Time
+}
+
 // SweepOrphans deletes controller-owned items absent from known and older than
 // cutoff while continuing past items with unparseable creation timestamps.
 func SweepOrphans[T any](
 	ctx context.Context,
-	provider, controllerTag string,
-	known map[string]struct{},
-	cutoff time.Time,
+	sweep OrphanSweep,
 	items []T,
 	idOf func(T) string,
 	tagsOf func(T) []string,
@@ -406,23 +414,23 @@ func SweepOrphans[T any](
 		if err := ctx.Err(); err != nil {
 			return deleted, errors.Join(append(sweepErrs, err)...)
 		}
-		if !HasTag(tagsOf(item), controllerTag) {
+		if !HasTag(tagsOf(item), sweep.ControllerTag) {
 			continue
 		}
 		id := idOf(item)
-		if _, ok := known[id]; ok {
+		if _, ok := sweep.Known[id]; ok {
 			continue
 		}
 		created, err := createdOf(item)
 		if err != nil {
-			sweepErrs = append(sweepErrs, fmt.Errorf("parse creation time for controller %s instance %s: %w", provider, id, err))
+			sweepErrs = append(sweepErrs, fmt.Errorf("parse creation time for controller %s instance %s: %w", sweep.Provider, id, err))
 			continue
 		}
-		if !created.Before(cutoff) {
+		if !created.Before(sweep.Cutoff) {
 			continue
 		}
 		if err := deleteFn(ctx, id); err != nil && !IsHTTPNotFound(err) {
-			sweepErrs = append(sweepErrs, fmt.Errorf("delete orphaned controller %s instance %s: %w", provider, id, err))
+			sweepErrs = append(sweepErrs, fmt.Errorf("delete orphaned controller %s instance %s: %w", sweep.Provider, id, err))
 			if ctx.Err() != nil {
 				break
 			}
