@@ -1452,7 +1452,7 @@ func (h *Handler) delete(ctx context.Context, record state.Record) {
 		}
 	}
 	if err := deleteErr; err != nil {
-		if h.releaseCanceledDelete(ctx, persistCtx, record, err) {
+		if h.releaseCanceledDelete(ctx, persistCtx, record) {
 			return
 		}
 		if errors.Is(err, compute.ErrOwnershipMismatch) {
@@ -1476,7 +1476,7 @@ func (h *Handler) delete(ctx context.Context, record state.Record) {
 		// Never re-delete it or run duplicate cleanup during that transition.
 		absent, err := checker.RunnerAbsent(ctx, record.InstanceID)
 		if err != nil || !absent {
-			if h.releaseCanceledDelete(ctx, persistCtx, record, err) {
+			if h.releaseCanceledDelete(ctx, persistCtx, record) {
 				return
 			}
 			message := "provider deletion accepted; awaiting confirmed absence"
@@ -1507,7 +1507,7 @@ func (h *Handler) delete(ctx context.Context, record state.Record) {
 		cleanupErr = h.computeClient.CleanupRunner(ctx, record.Key)
 	}
 	if err := cleanupErr; err != nil {
-		if h.releaseCanceledDelete(ctx, persistCtx, record, err) {
+		if h.releaseCanceledDelete(ctx, persistCtx, record) {
 			return
 		}
 		retryAt := time.Now().Add(retryDelay(record.DeleteAttempts))
@@ -1519,7 +1519,7 @@ func (h *Handler) delete(ctx context.Context, record state.Record) {
 	}
 	if record.GitHubRunnerID != 0 && record.GitHubRunnerOwned {
 		if err := h.githubClient.RemoveRepoRunner(ctx, record.Owner, record.Repository, record.GitHubRunnerID); err != nil {
-			if h.releaseCanceledDelete(ctx, persistCtx, record, err) {
+			if h.releaseCanceledDelete(ctx, persistCtx, record) {
 				return
 			}
 			if resetAt, rateLimited := gh.RateLimitReset(err); rateLimited {
@@ -1539,9 +1539,27 @@ func (h *Handler) delete(ctx context.Context, record state.Record) {
 			return
 		}
 	}
+	h.finishRunnerCleanup(ctx, record)
+}
+
+func (h *Handler) finishRunnerCleanup(ctx context.Context, record state.Record) {
+	persistCtx := context.WithoutCancel(ctx)
+	// Finish settlement while the durable delete claim can still be retried.
+	// After the state transition the same job may reserve a replacement.
+	if err := h.budgetTracker.Settle(record.Key); err != nil {
+		message := fmt.Sprintf("settle deleted runner budget: %v", err)
+		log.Printf("WARN: %s for %s", message, record.Key)
+		if _, deferErr := h.store.DeferReassignmentDemand(persistCtx, record.Key, message, time.Now().Add(retryDelay(record.DeleteAttempts)), state.DeferPolicy{}); deferErr != nil {
+			log.Printf("ERROR: persist budget settlement retry for %s: %v", record.Key, deferErr)
+			if releaseErr := h.store.ReleaseClaim(persistCtx, record.Key, state.WorkDelete); releaseErr != nil {
+				log.Printf("ERROR: release budget settlement claim for %s: %v", record.Key, releaseErr)
+			}
+		}
+		return
+	}
 	queued, err := h.recheckCleanedRunnerDemand(ctx, record)
 	if err != nil {
-		if h.releaseCanceledDelete(ctx, persistCtx, record, err) {
+		if h.releaseCanceledDelete(ctx, persistCtx, record) {
 			return
 		}
 		retryAt, policy := h.demandDeferSpec(record, err)
@@ -1549,7 +1567,6 @@ func (h *Handler) delete(ctx context.Context, record state.Record) {
 		if stateErr != nil {
 			log.Printf("ERROR: defer reassigned runner demand for %s: %v", record.Key, stateErr)
 		} else if terminated {
-			h.budgetTracker.Release(record.Key)
 			log.Printf("WARN: exhausted reassigned demand verification for %s; marked deleted without replenishment: %v", record.Key, err)
 		}
 		return
@@ -1567,7 +1584,6 @@ func (h *Handler) delete(ctx context.Context, record state.Record) {
 		h.signal()
 		return
 	}
-	h.budgetTracker.Release(record.Key)
 	log.Printf("Deleted owned runner instance %s for %s", record.InstanceID, record.Key)
 	if restored {
 		log.Printf("Restored queued original job demand for %s after reassigned runner completion", record.Key)
@@ -1611,8 +1627,8 @@ func (h *Handler) recheckCleanedRunnerDemand(ctx context.Context, record state.R
 	return status == gh.JobQueued, nil
 }
 
-func (h *Handler) releaseCanceledDelete(ctx, persistCtx context.Context, record state.Record, _ error) bool {
-	if ctx.Err() == nil {
+func (h *Handler) releaseCanceledDelete(ctx, persistCtx context.Context, record state.Record) bool {
+	if !errors.Is(ctx.Err(), context.Canceled) {
 		return false
 	}
 	if releaseErr := h.store.ReleaseClaim(persistCtx, record.Key, state.WorkDelete); releaseErr != nil {

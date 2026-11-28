@@ -39,6 +39,10 @@ func TestOwnedJITRetryReusesAdmissionSlot(t *testing.T) {
 	if err := store.ClearJIT(ctx, record.Key, record.Guard()); err != nil {
 		t.Fatal(err)
 	}
+	cleared, found, err := store.Get(ctx, record.Key)
+	if err != nil || !found || cleared.GitHubRunnerID != 0 || cleared.GitHubRunnerOwned || cleared.ClaimedWork != WorkProvision {
+		t.Fatalf("cleared JIT identity on claimed retry = %#v, found=%v, err=%v", cleared, found, err)
+	}
 	if next, _, err := store.ClaimNext(ctx, time.Now(), 5); err != nil || next != nil {
 		t.Fatalf("fresh admission while retry occupies pool = %#v, %v", next, err)
 	}

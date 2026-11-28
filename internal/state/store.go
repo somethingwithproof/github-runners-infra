@@ -1217,6 +1217,11 @@ func (s *FileStore) DeferDeletionConfirmation(_ context.Context, key, message st
 		ageExpired := policy.MaxAge > 0 && now.Sub(record.DeletionAcceptedAt) >= policy.MaxAge
 		budgetExhausted := policy.MaxAttempts > 0 && record.ConfirmAttempts >= policy.MaxAttempts
 		if budgetExhausted || ageExpired {
+			if record.RecheckDemand {
+				record.RecheckDemand = false
+				record.ReassignedRunID = 0
+				record.LastError += "; deletion confirmation exhausted, original job replenishment stopped"
+			}
 			record.Status = StatusOrphaned
 			record.NextAttemptAt = time.Time{}
 			return
