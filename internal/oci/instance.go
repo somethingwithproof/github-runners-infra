@@ -419,7 +419,7 @@ func (c *Client) launchInstance(
 
 func (c *Client) handleCreateError(ctx context.Context, jobKey, desiredName string, createErr error) (*compute.RunnerInstance, error) {
 	return compute.RecoverCreateError(
-		ctx, "OCI", desiredName, c.recoveryTimeout, c.recoveryPoll, createErr,
+		ctx, "OCI", desiredName, compute.RecoveryTiming{Timeout: c.recoveryTimeout, Poll: c.recoveryPoll}, createErr,
 		func(pollCtx context.Context) (*ociInstance, error) {
 			instances, err := c.listJobInstances(pollCtx, jobKey, "")
 			if err != nil {
@@ -522,7 +522,7 @@ func (c *Client) SweepOrphanedRunners(ctx context.Context, known map[string]stru
 		return 0, fmt.Errorf("list controller OCI instances for orphan sweep: %w", err)
 	}
 	return compute.SweepOrphans(
-		ctx, "OCI", c.controllerTag, known, cutoff, instances,
+		ctx, compute.OrphanSweep{Provider: "OCI", ControllerTag: c.controllerTag, Known: known, Cutoff: cutoff}, instances,
 		func(i ociInstance) string { return i.ID },
 		instanceTags,
 		func(i ociInstance) (time.Time, error) {

@@ -771,17 +771,7 @@ func (s *FileStore) DeferProvisioningDemand(_ context.Context, key, message stri
 			record.NextAttemptAt = time.Time{}
 			return
 		}
-		if policy.CountFailure {
-			record.ReconcileFailures++
-		}
-		if policy.CountThrottle {
-			record.ThrottleFailures++
-		} else {
-			record.ThrottleFailures = 0
-		}
-		ageExpired := policy.MaxAge > 0 && !record.CreatedAt.IsZero() && time.Now().UTC().Sub(record.CreatedAt) >= policy.MaxAge
-		budgetExhausted := policy.MaxAttempts > 0 && (record.ReconcileFailures >= policy.MaxAttempts || record.ThrottleFailures >= policy.MaxAttempts)
-		if budgetExhausted || ageExpired {
+		if policy.demandExhausted(record) {
 			if record.InstanceID != "" || (record.GitHubRunnerOwned && record.GitHubRunnerID != 0) {
 				record.Status = StatusOrphaned
 			} else {
@@ -792,6 +782,20 @@ func (s *FileStore) DeferProvisioningDemand(_ context.Context, key, message stri
 		}
 		record.NextAttemptAt = retryAt.UTC()
 	})
+}
+
+func (policy DeferPolicy) demandExhausted(record *Record) bool {
+	if policy.CountFailure {
+		record.ReconcileFailures++
+	}
+	if policy.CountThrottle {
+		record.ThrottleFailures++
+	} else {
+		record.ThrottleFailures = 0
+	}
+	ageExpired := policy.MaxAge > 0 && !record.CreatedAt.IsZero() && time.Since(record.CreatedAt) >= policy.MaxAge
+	budgetExhausted := policy.MaxAttempts > 0 && (record.ReconcileFailures >= policy.MaxAttempts || record.ThrottleFailures >= policy.MaxAttempts)
+	return budgetExhausted || ageExpired
 }
 
 func releaseProvisionClaim(record *Record) {
@@ -1057,29 +1061,32 @@ func (s *FileStore) DeferReconciliation(_ context.Context, key string, guard Run
 		if record.ProvisionEpoch != guard.ProvisionEpoch || record.InstanceID != guard.InstanceID {
 			return
 		}
-		if policy.CountFailure {
-			record.ReconcileFailures++
-			if policy.MaxAttempts > 0 && record.ReconcileFailures >= policy.MaxAttempts {
-				record.Status = StatusOrphaned
-				record.LastError = message
-				record.NextAttemptAt = time.Time{}
-				return
-			}
-		}
-		if policy.CountThrottle {
-			record.ThrottleFailures++
-			if policy.MaxAttempts > 0 && record.ThrottleFailures >= policy.MaxAttempts {
-				record.Status = StatusOrphaned
-				record.LastError = message
-				record.NextAttemptAt = time.Time{}
-				return
-			}
-		} else {
-			record.ThrottleFailures = 0
-		}
 		record.LastError = message
+		if policy.reconciliationExhausted(record) {
+			record.Status = StatusOrphaned
+			record.NextAttemptAt = time.Time{}
+			return
+		}
 		record.NextAttemptAt = retryAt.UTC()
 	})
+}
+
+func (policy DeferPolicy) reconciliationExhausted(record *Record) bool {
+	if policy.CountFailure {
+		record.ReconcileFailures++
+		if policy.MaxAttempts > 0 && record.ReconcileFailures >= policy.MaxAttempts {
+			return true
+		}
+	}
+	if policy.CountThrottle {
+		record.ThrottleFailures++
+		if policy.MaxAttempts > 0 && record.ThrottleFailures >= policy.MaxAttempts {
+			return true
+		}
+	} else {
+		record.ThrottleFailures = 0
+	}
+	return false
 }
 
 // DeferRateLimitedCleanup refunds the attempt reserved by BeginCleanupAttempt
@@ -1290,17 +1297,7 @@ func (s *FileStore) DeferReassignmentDemand(_ context.Context, key, message stri
 		record.ClaimedWork = ""
 		releaseDeleteClaim(record)
 		record.LastError = message
-		if policy.CountFailure {
-			record.ReconcileFailures++
-		}
-		if policy.CountThrottle {
-			record.ThrottleFailures++
-		} else {
-			record.ThrottleFailures = 0
-		}
-		ageExpired := policy.MaxAge > 0 && !record.CreatedAt.IsZero() && time.Now().UTC().Sub(record.CreatedAt) >= policy.MaxAge
-		budgetExhausted := policy.MaxAttempts > 0 && (record.ReconcileFailures >= policy.MaxAttempts || record.ThrottleFailures >= policy.MaxAttempts)
-		if budgetExhausted || ageExpired {
+		if policy.demandExhausted(record) {
 			record.Status = StatusDeleted
 			record.RecheckDemand = false
 			record.ReassignedRunID = 0
@@ -1450,24 +1447,14 @@ func (s *FileStore) ReleaseSweptOrphans(_ context.Context, provider string, cuto
 	defer s.mu.Unlock()
 	before := make(map[string]Record)
 	for key, record := range s.records {
-		instanceCreatedAt := record.ProvisionedAt
-		if instanceCreatedAt.IsZero() {
-			instanceCreatedAt = record.CreatedAt
-		}
-		if record.Status != StatusOrphaned || record.Provider != provider || record.InstanceID == "" || !instanceCreatedAt.Before(cutoff) {
-			continue
-		}
-		if isOwnershipMismatchError(record.LastError) {
+		if !record.releasableOrphan(provider, cutoff) {
 			continue
 		}
 		if _, protected := knownInstances[record.InstanceID]; protected {
 			continue
 		}
-		if eligibleOrphans != nil {
-			expectedID, ok := eligibleOrphans[key]
-			if !ok || expectedID != record.InstanceID {
-				continue
-			}
+		if eligibleOrphans != nil && eligibleOrphans[key] != record.InstanceID {
+			continue
 		}
 		before[key] = clone(record)
 		record.InstanceID = ""
@@ -1485,6 +1472,17 @@ func (s *FileStore) ReleaseSweptOrphans(_ context.Context, provider string, cuto
 		return 0, err
 	}
 	return len(before), nil
+}
+
+func (record Record) releasableOrphan(provider string, cutoff time.Time) bool {
+	if record.Status != StatusOrphaned || record.Provider != provider || record.InstanceID == "" {
+		return false
+	}
+	createdAt := record.ProvisionedAt
+	if createdAt.IsZero() {
+		createdAt = record.CreatedAt
+	}
+	return createdAt.Before(cutoff) && !isOwnershipMismatchError(record.LastError)
 }
 
 func isOwnershipMismatchError(message string) bool {

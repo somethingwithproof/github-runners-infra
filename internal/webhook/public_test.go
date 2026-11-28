@@ -79,68 +79,78 @@ func TestPublicControllerStillVerifiesOriginAfterVisibilityChange(t *testing.T) 
 	}
 }
 
+type publicReassignmentCase struct {
+	name          string
+	reassignedRun int64
+	trusted       bool
+	wantReplenish bool
+	wantStatus    state.Status
+}
+
 func TestPublicRepoUntrustedReassignedCompletionHaltsReplenishment(t *testing.T) {
-	for _, tc := range []struct {
-		name           string
-		reassignedRun  int64
-		trusted        bool
-		wantReplenish  bool
-		wantStatus     state.Status
-	}{
+	for _, tc := range []publicReassignmentCase{
 		{name: "untrusted reassigned run halts replenishment", reassignedRun: 999, trusted: false, wantReplenish: false, wantStatus: state.StatusDeleted},
 		{name: "missing reassigned run ID halts replenishment", reassignedRun: 0, trusted: true, wantReplenish: false, wantStatus: state.StatusDeleted},
 		{name: "trusted reassigned run replenishes queued demand", reassignedRun: 888, trusted: true, wantReplenish: true, wantStatus: state.StatusPending},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			handler, store, githubClient, cloud := newTestHandler(t)
-			handler.allowedPublicRepositories = map[string]struct{}{"trusted/private-repo": {}}
-			ctx := context.Background()
+		t.Run(tc.name, tc.check)
+	}
+}
 
-			record := claimedDemand(t, store)
-			if err := store.MarkJITCreated(ctx, record.Key, 101, "runner"); err != nil {
-				t.Fatal(err)
-			}
-			if err := store.MarkProvisioned(ctx, record.Key, "500", 101, "runner"); err != nil {
-				t.Fatal(err)
-			}
-			// Deliver reassigned completion via webhook so ReassignedRunID flows end-to-end.
-			completedEvent := testEvent("completed", []string{"self-hosted", "chef"})
-			completedEvent.Repo.Private = false
-			completedEvent.WorkflowJob.ID = 43
-			completedEvent.WorkflowJob.RunID = tc.reassignedRun
-			completedEvent.WorkflowJob.RunnerID = 101
-			completedEvent.WorkflowJob.RunnerName = "eph-trusted-private-repo-0123456789ab"
-			resp := serveEvent(handler, completedEvent, "delivery-reassigned-public")
-			if resp.Code != 202 {
-				t.Fatalf("completed webhook status = %d: %s", resp.Code, resp.Body.String())
-			}
+func (tc publicReassignmentCase) check(t *testing.T) {
+	handler, store, githubClient, cloud := newTestHandler(t)
+	handler.allowedPublicRepositories = map[string]struct{}{"trusted/private-repo": {}}
+	ctx := context.Background()
 
-			githubClient.workflowTrusted = tc.trusted
-			githubClient.jobStates = map[int64]gh.JobStatus{42: gh.JobQueued}
+	record := claimedDemand(t, store)
+	if err := store.MarkJITCreated(ctx, record.Key, 101, "runner"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkProvisioned(ctx, record.Key, "500", 101, "runner"); err != nil {
+		t.Fatal(err)
+	}
+	// Deliver reassigned completion via webhook so ReassignedRunID flows end-to-end.
+	completedEvent := testEvent("completed", []string{"self-hosted", "chef"})
+	completedEvent.Repo.Private = false
+	completedEvent.WorkflowJob.ID = 43
+	completedEvent.WorkflowJob.RunID = tc.reassignedRun
+	completedEvent.WorkflowJob.RunnerID = 101
+	completedEvent.WorkflowJob.RunnerName = "eph-trusted-private-repo-0123456789ab"
+	resp := serveEvent(handler, completedEvent, "delivery-reassigned-public")
+	if resp.Code != 202 {
+		t.Fatalf("completed webhook status = %d: %s", resp.Code, resp.Body.String())
+	}
 
-			claimed, kind, err := store.ClaimNext(ctx, time.Now(), 3)
-			if err != nil || claimed == nil || kind != state.WorkDelete {
-				t.Fatalf("claim delete = %#v %q %v", claimed, kind, err)
-			}
-			handler.process(ctx, *claimed, kind)
+	githubClient.workflowTrusted = tc.trusted
+	githubClient.jobStates = map[int64]gh.JobStatus{42: gh.JobQueued}
 
-			current, _, err := store.Get(ctx, record.Key)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if current.Status != tc.wantStatus || current.RecheckDemand {
-				t.Fatalf("post-cleanup state = %#v, want status %s with RecheckDemand=false", current, tc.wantStatus)
-			}
-			if len(cloud.deleted) != 1 || len(githubClient.removed) != 1 {
-				t.Fatalf("owned runner cleanup incomplete: deleted=%v removed=%v", cloud.deleted, githubClient.removed)
-			}
-			if tc.wantReplenish {
-				if current.ProvisionEpoch != 1 {
-					t.Fatalf("expected replenished ProvisionEpoch=1, got %d", current.ProvisionEpoch)
-				}
-			} else if next, _, err := store.ClaimNext(ctx, time.Now(), 3); err != nil || next != nil {
-				t.Fatalf("untrusted public reassignment still scheduled work: %#v, %v", next, err)
-			}
-		})
+	claimed, kind, err := store.ClaimNext(ctx, time.Now(), 3)
+	if err != nil || claimed == nil || kind != state.WorkDelete {
+		t.Fatalf("claim delete = %#v %q %v", claimed, kind, err)
+	}
+	handler.process(ctx, *claimed, kind)
+
+	if len(cloud.deleted) != 1 || len(githubClient.removed) != 1 {
+		t.Fatalf("owned runner cleanup incomplete: deleted=%v removed=%v", cloud.deleted, githubClient.removed)
+	}
+	tc.checkDemand(t, store, record.Key)
+}
+
+func (tc publicReassignmentCase) checkDemand(t *testing.T, store *state.FileStore, key string) {
+	t.Helper()
+	ctx := context.Background()
+	current, _, err := store.Get(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != tc.wantStatus || current.RecheckDemand {
+		t.Fatalf("post-cleanup state = %#v, want status %s with RecheckDemand=false", current, tc.wantStatus)
+	}
+	if tc.wantReplenish {
+		if current.ProvisionEpoch != 1 {
+			t.Fatalf("expected replenished ProvisionEpoch=1, got %d", current.ProvisionEpoch)
+		}
+	} else if next, _, err := store.ClaimNext(ctx, time.Now(), 3); err != nil || next != nil {
+		t.Fatalf("untrusted public reassignment still scheduled work: %#v, %v", next, err)
 	}
 }

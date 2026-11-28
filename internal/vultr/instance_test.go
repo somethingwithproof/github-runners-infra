@@ -21,11 +21,12 @@ import (
 )
 
 type vultrMock struct {
-	mu         sync.Mutex
-	token      string
-	instances  []vultrInstance
-	createdReq createInstanceRequest
-	deletedIDs []string
+	mu          sync.Mutex
+	token       string
+	instances   []vultrInstance
+	createCalls int
+	createdReq  createInstanceRequest
+	deletedIDs  []string
 }
 
 func (m *vultrMock) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -39,6 +40,7 @@ func (m *vultrMock) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == instancesPath:
 		m.handleList(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == instancesPath:
+		m.createCalls++
 		m.handleCreate(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, instancesBasePath):
 		m.handleGet(w, strings.TrimPrefix(r.URL.Path, instancesBasePath))
@@ -167,6 +169,10 @@ func TestVultrLifecycleAndSizeOverride(t *testing.T) {
 		t.Fatalf("CreateRunner() = %#v, %v", created, err)
 	}
 	assertVultrCreatePayload(t, mock.createdReq)
+	reused, err := client.CreateRunner(context.Background(), params)
+	if err != nil || reused == nil || reused.ID != created.ID || mock.createCalls != 1 {
+		t.Fatalf("repeat create = %v, %v; provider POSTs = %d", reused, err, mock.createCalls)
+	}
 
 	foundInst, found, err := client.FindRunner(context.Background(), params.JobKey)
 	if err != nil || !found || foundInst.ID != "inst-uuid-1" {
@@ -209,6 +215,10 @@ func TestVultrCursorSweepAndUndatedTolerance(t *testing.T) {
 		if r.Method == http.MethodDelete {
 			deleted = append(deleted, strings.TrimPrefix(r.URL.Path, instancesBasePath))
 			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, instancesBasePath) {
+			_ = json.NewEncoder(w).Encode(instanceResponse{Instance: vultrInstance{Tags: []string{"runner-controller-primary"}}})
 			return
 		}
 		cursor := r.URL.Query().Get("cursor")
