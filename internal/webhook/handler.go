@@ -303,7 +303,7 @@ func normalizeLabelSizeMap(raw, allowedLabels map[string]string) (map[string]str
 		if !compute.ValidLabel(label) {
 			return nil, fmt.Errorf("invalid label %q in label size map", rawLabel)
 		}
-		if !compute.ValidInstanceSize(size) {
+		if !compute.ValidSizeSpec(size) {
 			return nil, fmt.Errorf("invalid instance size %q for label %q", rawSize, label)
 		}
 		key := strings.ToLower(label)
@@ -792,11 +792,12 @@ func (h *Handler) reconcileProvisionedRunners(ctx context.Context) []error {
 	if err != nil {
 		return []error{fmt.Errorf("list provisioned runners: %w", err)}
 	}
+	lookup := compute.ReconciliationLookup(h.computeClient)
 	for _, record := range provisioned {
 		if record.Provider != h.provider {
 			continue
 		}
-		requeued, err := h.reconcileProvisionedRunner(ctx, record)
+		requeued, err := h.reconcileProvisionedRunner(ctx, record, lookup)
 		if err != nil {
 			reconciliationErrors = append(reconciliationErrors, err)
 			continue
@@ -809,14 +810,14 @@ func (h *Handler) reconcileProvisionedRunners(ctx context.Context) []error {
 	return reconciliationErrors
 }
 
-func (h *Handler) reconcileProvisionedRunner(ctx context.Context, record state.Record) (bool, error) {
+func (h *Handler) reconcileProvisionedRunner(ctx context.Context, record state.Record, lookup compute.RunnerLookup) (bool, error) {
 	if !record.NextAttemptAt.IsZero() && record.NextAttemptAt.After(time.Now()) {
 		return false, nil
 	}
 	if !record.RegisteredAt.IsZero() && time.Since(record.ReconciledAt) < h.livenessCheckInterval {
 		return false, nil
 	}
-	_, found, err := h.computeClient.FindRunner(ctx, record.Key)
+	_, found, err := lookup(ctx, record.Key)
 	if err != nil {
 		if errors.Is(err, compute.ErrDuplicateInstances) {
 			return h.reconcileDuplicateRunners(ctx, record)
@@ -1242,10 +1243,7 @@ func (h *Handler) reserveBudget(ctx context.Context, record state.Record, resolv
 	}
 	useSpot := compute.ResolveSpot(h.defaultSpot, spotPref)
 	providerName := h.provider
-	size := resolvedSize
-	if size == "" {
-		size = h.defaultInstanceSize
-	}
+	size := compute.PricingSize(h.computeClient, resolvedSize, h.defaultInstanceSize)
 	hourlyUSD := router.HourlyRateForMode(providerName, size, useSpot, h.hourlyRateOverrides)
 	if est, ok := h.computeClient.(spotRateEstimator); ok {
 		providerName, size, hourlyUSD = est.EstimateHourlyRateForMode(resolvedSize, spotPref)

@@ -138,10 +138,7 @@ func (r *MultiCloudRouter) EstimateHourlyRateForMode(sizeOverride string, spot *
 	useSpot := compute.ResolveSpot(r.defaultSpot, spot)
 	ordered := r.OrderedBackendsForMode(sizeOverride, useSpot)
 	top := ordered[0]
-	effectiveSize := sizeOverride
-	if effectiveSize == "" {
-		effectiveSize = top.DefaultSize
-	}
+	effectiveSize := compute.PricingSize(top.Provider, sizeOverride, top.DefaultSize)
 	return top.Name, effectiveSize, HourlyRateForMode(top.Name, effectiveSize, useSpot, r.hourlyRates)
 }
 
@@ -160,10 +157,7 @@ func (r *MultiCloudRouter) OrderedBackendsForMode(sizeOverride string, spot bool
 		return ordered
 	}
 	rateOf := func(b Backend) float64 {
-		size := sizeOverride
-		if size == "" {
-			size = b.DefaultSize
-		}
+		size := compute.PricingSize(b.Provider, sizeOverride, b.DefaultSize)
 		return HourlyRateForMode(b.Name, size, spot, r.hourlyRates)
 	}
 	sort.SliceStable(ordered, func(i, j int) bool {
@@ -174,9 +168,28 @@ func (r *MultiCloudRouter) OrderedBackendsForMode(sizeOverride string, spot bool
 
 // FindRunner searches all configured backends for an instance owning jobKey.
 func (r *MultiCloudRouter) FindRunner(ctx context.Context, jobKey string) (*compute.RunnerInstance, bool, error) {
+	return r.findRunner(ctx, jobKey, nil)
+}
+
+// NewReconciliationLookup shares each backend's inventory within one liveness pass.
+func (r *MultiCloudRouter) NewReconciliationLookup() compute.RunnerLookup {
+	lookups := make(map[string]compute.RunnerLookup, len(r.backends))
+	for _, backend := range r.backends {
+		lookups[backend.Name] = compute.ReconciliationLookup(backend.Provider)
+	}
+	return func(ctx context.Context, key string) (*compute.RunnerInstance, bool, error) {
+		return r.findRunner(ctx, key, lookups)
+	}
+}
+
+func (r *MultiCloudRouter) findRunner(ctx context.Context, jobKey string, lookups map[string]compute.RunnerLookup) (*compute.RunnerInstance, bool, error) {
 	var foundInstances []*compute.RunnerInstance
 	for _, b := range r.backends {
-		inst, found, err := b.Provider.FindRunner(ctx, jobKey)
+		lookup := lookups[b.Name]
+		if lookup == nil {
+			lookup = b.Provider.FindRunner
+		}
+		inst, found, err := lookup(ctx, jobKey)
 		if err != nil {
 			return nil, false, fmt.Errorf("find runner on %s: %w", b.Name, err)
 		}
@@ -243,10 +256,7 @@ func (r *MultiCloudRouter) tryBackends(
 		if ctx.Err() != nil {
 			return nil, sawSpotOrCapacity, attemptErrs, ctx.Err()
 		}
-		size := params.InstanceSize
-		if size == "" {
-			size = b.DefaultSize
-		}
+		size := compute.PricingSize(b.Provider, params.InstanceSize, b.DefaultSize)
 		if err := params.CheckLaunchBudget(b.Name, size, useSpot); err != nil {
 			return nil, sawSpotOrCapacity, attemptErrs, err
 		}

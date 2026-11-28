@@ -22,6 +22,19 @@ const (
 	MaxDeadmanShutdownMinutes = 7 * 24 * 60
 )
 
+// RunnerLookup finds an active instance by job key.
+type RunnerLookup func(context.Context, string) (*RunnerInstance, bool, error)
+
+// ReconciliationLookup scopes any provider inventory cache to one liveness pass.
+func ReconciliationLookup(p interface {
+	FindRunner(context.Context, string) (*RunnerInstance, bool, error)
+}) RunnerLookup {
+	if cached, ok := p.(interface{ NewReconciliationLookup() RunnerLookup }); ok {
+		return cached.NewReconciliationLookup()
+	}
+	return p.FindRunner
+}
+
 // Provider owns cloud runner instances for one compute backend.
 type Provider interface {
 	Provider() string

@@ -21,6 +21,7 @@ func TestValidInstanceSize(t *testing.T) {
 		"voc-c-4c-8gb-75s-amd",
 		"g6-standard-4",
 		"g6-dedicated-8",
+		"VM.Standard.E4.Flex",
 	}
 	for _, size := range valid {
 		if !ValidInstanceSize(size) {
@@ -29,6 +30,7 @@ func TestValidInstanceSize(t *testing.T) {
 	}
 
 	invalid := []string{
+		"VM.Standard.E4.Flex:4:16", "m7i.xlarge:4:16",
 		"",
 		"-leading-hyphen",
 		".leading-dot",
@@ -38,6 +40,8 @@ func TestValidInstanceSize(t *testing.T) {
 		"size;rm -rf /",
 		"size=evil",
 		"size\nnewline",
+		"VM.Standard.E4.Flex:bad:16",
+		"VM.Standard.E4.Flex:4:",
 		strings.Repeat("a", 65),
 	}
 	for _, size := range invalid {

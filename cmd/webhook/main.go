@@ -27,6 +27,7 @@ import (
 	gh "github.com/thomasvincent/github-runners-infra/internal/github"
 	"github.com/thomasvincent/github-runners-infra/internal/i18n"
 	"github.com/thomasvincent/github-runners-infra/internal/linode"
+	"github.com/thomasvincent/github-runners-infra/internal/oci"
 	"github.com/thomasvincent/github-runners-infra/internal/router"
 	"github.com/thomasvincent/github-runners-infra/internal/state"
 	"github.com/thomasvincent/github-runners-infra/internal/vultr"
@@ -111,7 +112,7 @@ func run() error {
 		ComputeClient:             computeClient,
 		BudgetTracker:             budgetTracker,
 		HourlyRateOverrides:       cfg.hourlyRateOverrides,
-		DefaultInstanceSize:       defaultInstanceSizeForEnv(computeClient.Provider()),
+		DefaultInstanceSize:       defaultInstanceSize(computeClient),
 		DefaultSpot:               cfg.runnerSpot,
 		Store:                     stateStore,
 		RequiredLabel:             cfg.requiredLabel,
@@ -333,7 +334,7 @@ func newMultiCloudRouter(
 		closers = append(closers, closeFn)
 		backends = append(backends, router.Backend{
 			Name:        name,
-			DefaultSize: defaultInstanceSizeForEnv(name),
+			DefaultSize: defaultInstanceSize(client),
 			Provider:    client,
 		})
 	}
@@ -520,9 +521,67 @@ func newSingleComputeClient(
 			return nil, noClose, err
 		}
 		return client, noClose, nil
+	case "oci":
+		client, err := newOCIComputeClient(controllerID, cloudInitPath, spot, spotFallbackOnDemand)
+		if err != nil {
+			return nil, noClose, err
+		}
+		return client, noClose, nil
 	default:
 		return nil, noClose, errors.New(i18n.T("webhook.err.unsupported_provider", provider))
 	}
+}
+
+func newOCIComputeClient(controllerID, cloudInitPath string, spot, spotFallbackOnDemand bool) (*oci.Client, error) {
+	required, err := requiredValues(
+		"OCI_TENANCY_OCID", "OCI_USER_OCID", "OCI_FINGERPRINT", "OCI_REGION",
+		"OCI_COMPARTMENT_OCID", "OCI_SUBNET_OCID", "OCI_AVAILABILITY_DOMAIN", "OCI_IMAGE_OCID",
+	)
+	if err != nil {
+		return nil, err
+	}
+	ocpus, err := envNonNegativeFloat("OCI_OCPUS")
+	if err != nil {
+		return nil, err
+	}
+	memoryGB, err := envNonNegativeFloat("OCI_MEMORY_GB")
+	if err != nil {
+		return nil, err
+	}
+	assignPublicIP, err := envBoolValue("OCI_ASSIGN_PUBLIC_IP", false)
+	if err != nil {
+		return nil, err
+	}
+	sshPublicKey := ""
+	if keyPath := strings.TrimSpace(os.Getenv("OCI_SSH_PUBLIC_KEY_FILE")); keyPath != "" {
+		keyBytes, readErr := os.ReadFile(keyPath)
+		if readErr != nil {
+			return nil, fmt.Errorf("read OCI SSH public key: %w", readErr)
+		}
+		sshPublicKey = strings.TrimSpace(string(keyBytes))
+	}
+	return oci.NewClient(oci.Config{
+		TenancyOCID:          required["OCI_TENANCY_OCID"],
+		UserOCID:             required["OCI_USER_OCID"],
+		Fingerprint:          required["OCI_FINGERPRINT"],
+		PrivateKeyPath:       strings.TrimSpace(os.Getenv("OCI_PRIVATE_KEY_PATH")),
+		PrivateKeyPEM:        os.Getenv("OCI_PRIVATE_KEY_PEM"),
+		Region:               required["OCI_REGION"],
+		CompartmentOCID:      required["OCI_COMPARTMENT_OCID"],
+		SubnetOCID:           required["OCI_SUBNET_OCID"],
+		AvailabilityDomain:   required["OCI_AVAILABILITY_DOMAIN"],
+		ImageOCID:            required["OCI_IMAGE_OCID"],
+		Shape:                envOrDefault("OCI_SHAPE", "VM.Standard.E4.Flex"),
+		OCPUs:                ocpus,
+		MemoryGB:             memoryGB,
+		SSHPublicKey:         sshPublicKey,
+		AssignPublicIP:       assignPublicIP,
+		Spot:                 spot,
+		SpotFallbackOnDemand: spotFallbackOnDemand,
+		CloudInitPath:        cloudInitPath,
+		ControllerID:         controllerID,
+		BaseURL:              strings.TrimSpace(os.Getenv("OCI_API_URL")),
+	})
 }
 
 func noopClose() {
@@ -693,8 +752,8 @@ func envNonNegativeFloat(key string) (float64, error) {
 	return parsed, nil
 }
 
-func defaultInstanceSizeForEnv(provider string) string {
-	switch provider {
+func defaultInstanceSize(client webhook.ComputeClient) string {
+	switch client.Provider() {
 	case "digitalocean":
 		return envOrDefault("DO_SIZE", "s-4vcpu-8gb-amd")
 	case "aws":
@@ -707,6 +766,8 @@ func defaultInstanceSizeForEnv(provider string) string {
 		return envOrDefault("VULTR_PLAN", "vc2-4c-8gb")
 	case "linode":
 		return envOrDefault("LINODE_INSTANCE_TYPE", "g6-standard-4")
+	case "oci":
+		return compute.PricingSize(client, "", "")
 	default:
 		return ""
 	}
@@ -723,14 +784,24 @@ func writeBudgetMetrics(w http.ResponseWriter, tracker *budget.Tracker) {
 }
 
 func loadLabelSizeMap() (map[string]string, error) {
-	generic := strings.TrimSpace(os.Getenv("LABEL_SIZE_MAP"))
-	doAlias := strings.TrimSpace(os.Getenv("DO_LABEL_SIZE_MAP"))
-	if generic != "" && doAlias != "" {
-		return nil, fmt.Errorf("set LABEL_SIZE_MAP or DO_LABEL_SIZE_MAP, not both")
+	candidates := []struct {
+		name  string
+		value string
+	}{
+		{"LABEL_SIZE_MAP", strings.TrimSpace(os.Getenv("LABEL_SIZE_MAP"))},
+		{"DO_LABEL_SIZE_MAP", strings.TrimSpace(os.Getenv("DO_LABEL_SIZE_MAP"))},
+		{"OCI_LABEL_SIZE_MAP", strings.TrimSpace(os.Getenv("OCI_LABEL_SIZE_MAP"))},
 	}
-	raw := generic
-	if raw == "" {
-		raw = doAlias
+	var raw string
+	var setNames []string
+	for _, c := range candidates {
+		if c.value != "" {
+			raw = c.value
+			setNames = append(setNames, c.name)
+		}
+	}
+	if len(setNames) > 1 {
+		return nil, fmt.Errorf("set only one of %s, not multiple", strings.Join(setNames, ", "))
 	}
 	return compute.ParseLabelSizeMap(raw)
 }

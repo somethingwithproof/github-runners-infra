@@ -13,6 +13,7 @@ users:
 
 {{- if not .PrebakedImage}}
 apt:
+  preserve_sources_list: false
   primary:
     - arches: [default]
       uri: https://archive.ubuntu.com/ubuntu
@@ -130,9 +131,9 @@ runcmd:
 
     {{- if .SpotActive}}
     # Secret-free cloud metadata preemption watcher for spot/preemptible VMs.
-    # Polls AWS IMDSv2 (2-min notice), GCP (30s notice), and Azure Scheduled
-    # Events (30s notice), sending SIGTERM to Runner.Listener so the runner
-    # exits cleanly and deregisters before host termination.
+    # Polls AWS IMDSv2 (2-min notice), GCP (30s notice), Azure Scheduled Events
+    # (30s notice), and OCI IMDSv2 (2-min notice), sending SIGTERM to
+    # Runner.Listener so the runner exits cleanly and deregisters before host termination.
     spot_preemption_detected() {
       AWS_TOKEN=$(curl -fsS --max-time 2 -X PUT \
         -H "X-aws-ec2-metadata-token-ttl-seconds: 60" \
@@ -152,6 +153,11 @@ runcmd:
       AZURE_EVENTS=$(curl -fsS --max-time 2 -H "Metadata: true" \
         "http://169.254.169.254/metadata/scheduledevents?api-version=2020-07-01" 2>/dev/null || true)
       if printf '%s' "$AZURE_EVENTS" | grep -q '"EventType"[[:space:]]*:[[:space:]]*"Preempt"'; then
+        return 0
+      fi
+      if curl -fsS --max-time 2 -H "Authorization: Bearer Oracle" \
+        http://169.254.169.254/opc/v2/instance/ 2>/dev/null |
+        jq -e '.instancePreemptionAction.preemptionAction == "terminate"' >/dev/null 2>&1; then
         return 0
       fi
       return 1

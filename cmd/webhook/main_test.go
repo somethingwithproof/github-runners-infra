@@ -6,6 +6,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"log"
 	"net/http"
@@ -560,7 +564,11 @@ func setValidRuntimeEnvironment(t *testing.T) {
 		"LINODE_FIREWALL_ID", "LINODE_IMAGE", "LINODE_INSTANCE_TYPE", "LINODE_REGION",
 		"LINODE_SSH_PUBLIC_KEY_FILE", "LINODE_VPC_SUBNET_ID", "LISTEN_ADDR",
 		"LIVENESS_CONFIRMATIONS", "LIVENESS_SETTLE_WINDOW", "MAX_ATTEMPTS", "MAX_LIVE_RUNNERS",
-		"MAX_RUNNER_AGE", "REQUIRED_LABEL", "ROUTER_HOURLY_RATES", "ROUTER_STRATEGY",
+		"MAX_RUNNER_AGE", "OCI_API_URL", "OCI_ASSIGN_PUBLIC_IP", "OCI_AVAILABILITY_DOMAIN",
+		"OCI_COMPARTMENT_OCID", "OCI_FINGERPRINT", "OCI_IMAGE_OCID", "OCI_LABEL_SIZE_MAP",
+		"OCI_MEMORY_GB", "OCI_OCPUS", "OCI_PRIVATE_KEY_PATH", "OCI_PRIVATE_KEY_PEM",
+		"OCI_REGION", "OCI_SHAPE", "OCI_SSH_PUBLIC_KEY_FILE", "OCI_SUBNET_OCID",
+		"OCI_TENANCY_OCID", "OCI_USER_OCID", "REQUIRED_LABEL", "ROUTER_HOURLY_RATES", "ROUTER_STRATEGY",
 		"RUNNER_DEADMAN_MINUTES", "RUNNER_EGRESS_ALLOWLIST", "RUNNER_PREBAKED",
 		"RUNNER_REGISTRATION_TIMEOUT", "RUNNER_SPOT", "SPOT_FALLBACK_ON_DEMAND", "STATE_FILE",
 		"VULTR_API_URL", "VULTR_FIREWALL_GROUP_ID",
@@ -693,4 +701,56 @@ func TestNewComputeClientSpotFallbackMixedMultiCloud(t *testing.T) {
 		})
 	}
 
+}
+
+func TestNewComputeClientOCIHappyPathAndLabelSizeMap(t *testing.T) {
+	setValidRuntimeEnvironment(t)
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(t.TempDir(), "oci.pem")
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("CONTROLLER_ID", "controller-1")
+	t.Setenv("CLOUD_INIT_PATH", writeRunnerTemplate(t))
+	t.Setenv("COMPUTE_PROVIDER", "oci")
+	t.Setenv("RUNNER_SPOT", "true")
+	t.Setenv("SPOT_FALLBACK_ON_DEMAND", "true")
+	t.Setenv("OCI_TENANCY_OCID", "ocid1.tenancy.oc1..test")
+	t.Setenv("OCI_USER_OCID", "ocid1.user.oc1..test")
+	t.Setenv("OCI_FINGERPRINT", "aa:bb:cc:dd")
+	t.Setenv("OCI_PRIVATE_KEY_PATH", keyPath)
+	t.Setenv("OCI_REGION", "us-ashburn-1")
+	t.Setenv("OCI_COMPARTMENT_OCID", "ocid1.compartment.oc1..test")
+	t.Setenv("OCI_SUBNET_OCID", "ocid1.subnet.oc1..test")
+	t.Setenv("OCI_AVAILABILITY_DOMAIN", "Uocm:US-ASHBURN-AD-1")
+	t.Setenv("OCI_IMAGE_OCID", "ocid1.image.oc1..test")
+	t.Setenv("OCI_SHAPE", "VM.Standard.E4.Flex")
+	t.Setenv("OCI_OCPUS", "4e0")
+	t.Setenv("OCI_MEMORY_GB", "0")
+	client, closeFn, err := newComputeClient(context.Background(), context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeFn()
+	if client.Provider() != "oci" {
+		t.Fatalf("provider = %q", client.Provider())
+	}
+	if got := defaultInstanceSize(client); got != "VM.Standard.E4.Flex:4:16" {
+		t.Fatalf("defaultInstanceSize(oci) = %q, want VM.Standard.E4.Flex:4:16", got)
+	}
+
+	setValidRuntimeEnvironment(t)
+	t.Setenv("OCI_LABEL_SIZE_MAP", "chef=VM.Standard.A1.Flex:4:24")
+	cfg, err := loadRuntimeConfig()
+	if err != nil {
+		t.Fatalf("loadRuntimeConfig(OCI_LABEL_SIZE_MAP) error = %v", err)
+	}
+	if cfg.labelSizeMap["chef"] != "VM.Standard.A1.Flex:4:24" {
+		t.Fatalf("labelSizeMap = %#v", cfg.labelSizeMap)
+	}
 }

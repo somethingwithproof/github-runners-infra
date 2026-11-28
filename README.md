@@ -21,25 +21,65 @@
 
 </details>
 
-A Go controller that creates one-job, repository-scoped GitHub Actions runners
-on DigitalOcean, AWS EC2, Google Compute Engine, Azure VMs, Vultr Cloud Compute,
-or Akamai Cloud (Linode). GitHub webhook deliveries are persisted before
-acknowledgement, provisioning is retried after transient failures or controller
-restarts, and only controller-owned resources can be deleted.
+`github-runners-infra` is a single-binary Go controller that provisions
+ephemeral, scale-to-zero GitHub Actions runners across seven cloud providers
+(DigitalOcean, AWS EC2, Google Compute Engine, Azure VMs, Vultr Cloud Compute,
+Akamai Cloud / Linode, and Oracle Cloud Infrastructure) without a Kubernetes
+cluster or third-party SaaS control plane. It keeps self-hosted CI simple and
+predictable: no idle runner fleet, no cluster to maintain, and a fresh isolated
+VM for every job.
 
-A JIT registration is scoped to a repository, not bound to its triggering job.
-Before registering a runner and again before allocating a VM, the controller
-checks that the original job is still queued. API failures defer provisioning.
-Reconciliation also retires runners whose original job has completed, but first
-deregisters through GitHub, which rejects removal while another job is running.
+Cloud API credentials and the GitHub App private key stay on the controller
+host. By default (`GITHUB_USE_JIT_CONFIG=true`), each runner VM receives only a
+single-use, repository-scoped GitHub JIT configuration and public artifact
+metadata (setting `GITHUB_USE_JIT_CONFIG=false` falls back to a registration
+token in user data without JIT isolation), runs at most one job, and powers off
+while the controller deletes only instances carrying its ownership tags or
+labels.
 
-When a JIT runner completes a different job, its VM and registration are cleaned
-up first. The controller then checks the original job: only demand still queued
-gets replacement capacity. Original-job completion is persisted independently and
-wins over stale API observations. An unavailable API defers the demand decision;
-it does not discard the queued job or allocate an unverified replacement.
+## Key capabilities
 
-## Security architecture
+- **Seven-cloud scale-to-zero without Kubernetes:** One Go binary
+  (`cmd/webhook`) listens for `workflow_job` webhooks, journals state to an
+  fsynced write-ahead log (`<STATE_FILE>.wal`) with atomic snapshots, provisions
+  one VM per queued job, and tears it down on completion or timeout.
+- **Multi-cloud failover and cost-aware routing:** `internal/router.MultiCloudRouter`
+  routes across multiple configured clouds in priority or cheapest-first order
+  (`ROUTER_STRATEGY`), fails over on capacity, quota, or transient 5xx/429
+  errors, refuses failover on ambiguous creates (`ErrCreateOutcomeUnknown`) to
+  prevent duplicate VMs, and stores composite `<provider>:<id>` IDs so deletion
+  and sweeps always target the owning cloud.
+- **Spot and preemptible instances with fallback and preemption watchers:**
+  Supports AWS EC2 Spot, GCP Spot VMs, Azure Spot VMs, and OCI Preemptible
+  Instances (`RUNNER_SPOT=true`), optional on-demand fallback
+  (`SPOT_FALLBACK_ON_DEMAND=true`) after spot pools fail capacity, per-job
+  workflow label overrides (`[self-hosted, spot]` and
+  `[self-hosted, on-demand]`, where `on-demand` wins), and a secret-free in-VM
+  IMDS watcher (AWS IMDSv2, GCP, Azure Scheduled Events, OCI IMDSv2) that sends
+  `SIGTERM` to `Runner.Listener`.
+- **Per-label VM sizing:** `LABEL_SIZE_MAP` (plus backward-compatible aliases
+  `DO_LABEL_SIZE_MAP` and `OCI_LABEL_SIZE_MAP`) maps allowlisted workflow labels
+  to provider-specific instance sizes, including OCI Flex shapes
+  (`Shape:ocpus:memoryGB`).
+- **Hard USD spend circuit breaker:** `internal/budget` enforces daily, monthly,
+  and per-repository daily USD caps (`BUDGET_DAILY_USD`, `BUDGET_MONTHLY_USD`,
+  `BUDGET_REPO_DAILY_USD`) that block new provisioning when a cap would be
+  exceeded without ever blocking deletion or orphan cleanup, and exports
+  Prometheus metrics on `GET /metrics`.
+- **Secret-free runner VMs with runaway and egress controls:** Cloud credentials
+  never enter user data. Every VM arms a persistent systemd dead-man
+  poweroff timer (`RUNNER_DEADMAN_MINUTES`, default 180), supports an optional
+  `iptables` HTTPS egress allowlist (`RUNNER_EGRESS_ALLOWLIST`), and is bounded
+  by controller-side `MAX_RUNNER_AGE` sweeps.
+- **Fast-boot Packer images and Terraform baselines:** Seven Packer HCL2
+  templates under [`packer/`](packer/README.md) pre-bake Ubuntu 24.04 runner
+  images (`RUNNER_PREBAKED=true` skips `apt-get` and runner tarball downloads at
+  boot), and seven Terraform modules under [`terraform/`](terraform/README.md)
+  define private networking, deny-inbound firewalls or security lists, and
+  least-privilege IAM roles.
+
+<a id="security-architecture"></a>
+## How it works & security architecture
 
 ```text
 GitHub workflow_job webhook
@@ -53,10 +93,27 @@ GitHub workflow_job webhook
   -> controller reconciles owned runners that exceed MAX_RUNNER_AGE
 ```
 
+GitHub webhook deliveries are persisted before acknowledgement, provisioning is
+retried after transient failures or controller restarts, and only
+controller-owned resources can be deleted.
+
+A JIT registration is scoped to a repository, not bound to its triggering job.
+Before registering a runner and again before allocating a VM, the controller
+checks that the original job is still queued. API failures defer provisioning.
+Reconciliation also retires runners whose original job has completed, but first
+deregisters through GitHub, which rejects removal while another job is running.
+
+When a JIT runner completes a different job, its VM and registration are cleaned
+up first. The controller then checks the original job: only demand still queued
+gets replacement capacity. Original-job completion is persisted independently and
+wins over stale API observations. An unavailable API defers the demand decision;
+it does not discard the queued job or allocate an unverified replacement.
+
 Cloud credentials and the GitHub App private key remain on the controller.
-Runner user data contains only GitHub's single-use JIT configuration and public
-artifact metadata. Before deletion, every provider adapter verifies the
-controller ownership tag or label. Existing DigitalOcean state files are
+In the default JIT mode, runner user data contains only GitHub's single-use
+JIT configuration and public artifact metadata (setting
+`GITHUB_USE_JIT_CONFIG=false` passes a registration token instead). Before
+deletion, every provider adapter verifies the controller ownership tag or label. Existing DigitalOcean state files are
 automatically migrated from numeric `droplet_id` to provider-neutral string
 `instance_id` values.
 
@@ -89,17 +146,27 @@ egress through NAT and security groups or firewall rules with no inbound access.
 | `azure` | Standard VM | Spot VM, delete eviction policy | Supported (`AZURE_VM_SIZE` override) | [`terraform/azure`](terraform/azure) |
 | `vultr` | Cloud Compute | Not available; `RUNNER_SPOT=true` fails closed | Supported (`VULTR_PLAN` override) | [`terraform/vultr`](terraform/vultr) |
 | `linode` | Akamai Cloud / Linode | Not available; `RUNNER_SPOT=true` fails closed | Supported (`LINODE_INSTANCE_TYPE` override) | [`terraform/linode`](terraform/linode) |
+| `oci` | OCI Compute (Flex / Fixed) | Preemptible Instance (`TERMINATE`, no preserved boot volume) | Supported (`OCI_SHAPE` / `Shape:ocpus:memGB`, also accepts `OCI_LABEL_SIZE_MAP`) | [`terraform/oci`](terraform/oci) |
 
-`RUNNER_SPOT` defaults to `false`. Spot instances can disappear at any time and
-have no availability guarantee. A preempted GitHub job may need to be retried by
+`RUNNER_SPOT` defaults to `false`. Set `SPOT_FALLBACK_ON_DEMAND=true` to retry
+with on-demand capacity after spot pool exhaustion (across all spot-capable
+backends first in `MultiCloudRouter` mode). Workflows can override the default
+per job with `[self-hosted, spot]` or `[self-hosted, on-demand]` labels when
+allowlisted in `ALLOWED_LABELS` (`on-demand` wins if both labels are present so
+deploy and release jobs are never preempted). On spot/preemptible instances,
+cloud-init starts a secret-free background IMDS watcher (AWS IMDSv2, GCP, Azure
+Scheduled Events, and OCI IMDSv2) that sends `SIGTERM` to `Runner.Listener` upon
+receiving a preemption notice. Spot instances can disappear at any time and have
+no availability guarantee. A preempted GitHub job may need to be retried by
 workflow policy; the lifecycle TTL remains the cleanup backstop.
 
 DigitalOcean firewall posture is validated through its API before provisioning.
 AWS security-group, GCP VPC-firewall, Azure subnet/NSG, Vultr firewall group,
-and Linode Cloud Firewall ingress policies are managed through IaC (reference
-modules live under [`terraform/`](terraform/README.md)). Keep runners private
-and deny all unsolicited inbound traffic; enabling an external IP requires a
-separate policy review.
+Linode Cloud Firewall, and OCI egress-only security list ingress policies are
+managed through IaC (reference modules live under
+[`terraform/`](terraform/README.md)). Keep runners private and deny all
+unsolicited inbound traffic; enabling an external IP requires a separate policy
+review.
 
 ## Prerequisites
 
@@ -107,7 +174,8 @@ separate policy review.
 - A Linux controller host with Caddy or another TLS reverse proxy
 - A GitHub App subscribed to `workflow_job` with repository Administration: write
   and Actions: read, scoped to the configured repository allowlist
-- Least-privilege credentials for exactly one supported cloud provider
+- Least-privilege credentials for one supported cloud provider (or multiple
+  providers when using `CLOUD_PROVIDERS`)
 - A reviewed Chef installer SHA-256 and GitHub runner archive SHA-256
 - Outbound HTTPS from runner subnets, directly or through NAT
 
@@ -123,9 +191,10 @@ retain the firewall or proxy test as deployment evidence.
 
 AWS uses the Go SDK default credential chain, GCP uses Application Default
 Credentials, and Azure uses `DefaultAzureCredential`. Prefer workload identity
-or a controller instance role over long-lived static credentials. The
-DigitalOcean adapter reads `DIGITALOCEAN_TOKEN` because DigitalOcean's API client
-does not provide an equivalent workload-identity chain.
+or a controller instance role over long-lived static credentials. DigitalOcean
+reads `DIGITALOCEAN_TOKEN`, Vultr reads `VULTR_API_KEY`, Linode reads
+`LINODE_TOKEN`, and OCI signs requests with an RSA private key loaded from
+`OCI_PRIVATE_KEY_PATH` (or `OCI_PRIVATE_KEY_PEM`).
 
 ## Common configuration
 
@@ -161,8 +230,8 @@ RUNNER_SPOT=false
 ALLOWED_REPOSITORIES=example-org/private-repo,example-org/other-private-repo
 ALLOWED_LABELS=self-hosted,chef,large
 REQUIRED_LABEL=self-hosted
-# Optional: comma-separated label=size overrides applied across all 6 providers.
-# DigitalOcean also accepts the backward-compatible alias DO_LABEL_SIZE_MAP.
+# Optional: comma-separated label=size overrides applied across all 7 providers.
+# Also accepts backward-compatible aliases DO_LABEL_SIZE_MAP or OCI_LABEL_SIZE_MAP (set only one).
 LABEL_SIZE_MAP=large=m7i.2xlarge
 
 RUNNER_VERSION=2.336.0
@@ -193,10 +262,11 @@ reclaimed only after `MAX_RUNNER_AGE`.
 `LABEL_SIZE_MAP` maps allowlisted workflow labels to provider-specific instance
 sizes (for example `large=c-8,xlarge=c-16` on DigitalOcean, `large=m7i.2xlarge`
 on AWS, `large=n2-standard-8` on GCP, `large=Standard_D8s_v5` on Azure,
-`large=vhf-8c-16gb` on Vultr, or `large=g6-dedicated-8` on Linode). Every label
-key must also appear in `ALLOWED_LABELS`, and size values are validated against
-a strict character allowlist. Set either `LABEL_SIZE_MAP` or the DigitalOcean
-alias `DO_LABEL_SIZE_MAP`, not both.
+`large=vhf-8c-16gb` on Vultr, `large=g6-dedicated-8` on Linode, or
+`large=VM.Standard.E4.Flex:8:32` on OCI). Every label key must also appear in
+`ALLOWED_LABELS`, and size values are validated against a strict character
+allowlist. Set only one of `LABEL_SIZE_MAP`, `DO_LABEL_SIZE_MAP`, or
+`OCI_LABEL_SIZE_MAP`.
 
 `RUNNER_DEADMAN_MINUTES` arms a secret-free persistent systemd poweroff
 timer inside each runner VM (default `180` minutes, `0` disables). The original deadline survives a reboot. No cloud API
@@ -209,7 +279,7 @@ destroying the instance and ending billing.
 All allowlisted repositories must belong to the same GitHub App installation
 owner. Installation tokens are restricted to exactly those repository names and
 only the `administration: write` permission needed for runner management, plus
-`actions: read` when public run-origin verification is enabled.
+`actions: read` for current job-demand and public run-origin verification.
 
 Do not derive an integrity value and execute the artifact in the same automated
 step. Obtain runner digests from official release instructions and review the
@@ -262,7 +332,11 @@ AWS_REGION=us-west-2
 AWS_AMI_ID=ami-pinned-id
 AWS_INSTANCE_TYPE=m7i.xlarge
 AWS_SUBNET_ID=subnet-private-id
+# Optional: comma-separated alternate subnets for EC2 capacity failover.
+AWS_ALTERNATE_SUBNET_IDS=
 AWS_SECURITY_GROUP_IDS=sg-egress-only-id
+# Optional: retry as on-demand when all spot subnets/providers fail capacity.
+SPOT_FALLBACK_ON_DEMAND=false
 AWS_INSTANCE_PROFILE_ARN=
 AWS_KEY_NAME=
 AWS_EXTERNAL_IP=false
@@ -412,6 +486,43 @@ and paginated orphan sweeps. Provision the VPC, subnet, and default-DROP Cloud
 Firewall with [`terraform/linode`](terraform/linode). Set `LINODE_REGION` to the module’s `region` output. The firewall and VPC subnet options require an account that permits legacy configuration interfaces. With a VPC subnet configured, the runner uses 1:1 IPv4 NAT to reach GitHub through the cloud firewall. Powered-off Linode
 instances continue billing until destroyed by the controller.
 
+### Oracle Cloud Infrastructure (OCI)
+
+```dotenv
+COMPUTE_PROVIDER=oci
+RUNNER_SPOT=true
+SPOT_FALLBACK_ON_DEMAND=true
+OCI_TENANCY_OCID=ocid1.tenancy.oc1..example
+OCI_USER_OCID=ocid1.user.oc1..example
+OCI_FINGERPRINT=aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99
+# Set OCI_PRIVATE_KEY_PATH or OCI_PRIVATE_KEY_PEM (unencrypted PKCS#1/PKCS#8 RSA PEM), not both.
+OCI_PRIVATE_KEY_PATH=/etc/github-runners/oci-api-key.pem
+OCI_REGION=us-ashburn-1
+OCI_COMPARTMENT_OCID=ocid1.compartment.oc1..example
+OCI_SUBNET_OCID=ocid1.subnet.oc1..example
+OCI_AVAILABILITY_DOMAIN=Uocm:US-ASHBURN-AD-1
+OCI_IMAGE_OCID=ocid1.image.oc1.iad.example
+OCI_SHAPE=VM.Standard.E4.Flex
+OCI_OCPUS=4
+OCI_MEMORY_GB=16
+# Optional: per-label x86_64 Flex/fixed overrides (or use LABEL_SIZE_MAP; set only one).
+OCI_LABEL_SIZE_MAP=large=VM.Standard.E4.Flex:8:32,xlarge=VM.Standard.E5.Flex:8:32
+OCI_ASSIGN_PUBLIC_IP=false
+# Optional: path to an SSH public key file injected into instance metadata.
+OCI_SSH_PUBLIC_KEY_FILE=
+```
+
+The OCI adapter uses the OCI Compute REST API directly over `net/http` with
+RFC-compliant OCI HTTP Signature v1 (`RSA-SHA256`) request signing, Flex shape
+sizing (`Shape:ocpus:memoryGB`), Preemptible Instance support (`TERMINATE` with
+`preserveBootVolume: false`), capacity-error classification (`Out of host capacity`
+and `LimitExceeded`) for automatic failover or on-demand fallback, freeform
+ownership tags, `opc-next-page` paginated sweeps, and private-by-default VNICs.
+Provision the private VCN, NAT gateway, egress-only security list, and
+compartment-scoped IAM policy for the signing user’s group (`controller_group_ocid`) with [`terraform/oci`](terraform/oci), and build
+pre-baked images with [`packer/oci.pkr.hcl`](packer/oci.pkr.hcl). Both bundled
+installers use the Linux x64 runner archive and require an x86_64 image and shape.
+
 Drain all active records before changing `COMPUTE_PROVIDER`. State is bound to
 the provider that created each runner, and the controller fails closed instead
 of passing an old resource ID to a different provider adapter.
@@ -423,22 +534,26 @@ of passing an old resource ID to a different provider adapter.
 Before switching a controller from a single provider to routing, stop new admissions and drain its pending jobs, runners, and orphans using the old configuration. Startup checks the state file before enabling routing. Keep the existing state file so resources can be reconciled.
 
 Set `CLOUD_PROVIDERS` to a comma-separated list of two or more configured
-providers (for example `vultr,linode,digitalocean,aws,gcp,azure`) to enable
+providers (for example `vultr,linode,digitalocean,oci,aws,gcp,azure`) to enable
 `internal/router.MultiCloudRouter`:
 
 ```dotenv
-CLOUD_PROVIDERS=vultr,linode,digitalocean
+CLOUD_PROVIDERS=vultr,linode,oci,aws
 ROUTER_STRATEGY=cheapest
-# Optional: override built-in USD/hour reference rates (provider:size=rate)
-ROUTER_HOURLY_RATES=vultr:vc2-4c-8gb=0.071,linode:g6-standard-4=0.072
+# Optional: override built-in USD/hour reference rates (provider:size=rate or provider:size:spot=rate)
+ROUTER_HOURLY_RATES=vultr:vc2-4c-8gb=0.071,linode:g6-standard-4=0.072,aws:m7i.xlarge:spot=0.070
 ```
 
 - `ROUTER_STRATEGY=priority` (default) tries backends in list order.
-- `ROUTER_STRATEGY=cheapest` sorts backends ascending by hourly USD rate and
-  breaks ties by configured order.
+- `ROUTER_STRATEGY=cheapest` sorts backends ascending by hourly USD rate
+  (applying built-in spot discount multipliers or `:spot` rate overrides when
+  provisioning in spot mode) and breaks ties by configured order.
 - Provisioning automatically fails over to the next backend on quota, capacity,
-  or transient 5xx/429 errors, while refusing to fail over on ambiguous creates
-  (`ErrCreateOutcomeUnknown`) to prevent duplicate VMs.
+  spot-unsupported, or transient 5xx/429 errors, while refusing to fail over on
+  ambiguous creates (`ErrCreateOutcomeUnknown`) to prevent duplicate VMs.
+- When `SPOT_FALLBACK_ON_DEMAND=true` is enabled in `MultiCloudRouter` mode,
+  the router exhausts spot capacity across all configured clouds before falling
+  back to on-demand capacity.
 - Every instance ID is stored with its owning provider prefix (`<provider>:<id>`)
   so deletion, absence confirmation, and age-gated orphan sweeps always target
   the exact owning cloud.
@@ -476,7 +591,7 @@ The host HTTPS allowlist applies to host processes. For untrusted workflows, enf
 
 The stock Packer images contain the Actions runner and Docker. Use cold boot for `chef` workloads or install and verify Chef Workstation in a custom image before advertising the `chef` label.
 
-Build pre-baked images across all six clouds using the HCL2 templates under
+Build pre-baked images across all seven clouds using the HCL2 templates under
 [`packer/`](packer/README.md).
 
 ## Build, test, and deploy
@@ -513,6 +628,12 @@ Every requested label must be included in `ALLOWED_LABELS`:
 jobs:
   integration:
     runs-on: [self-hosted, chef]
+
+  burst-build:
+    runs-on: [self-hosted, spot, large]
+
+  release:
+    runs-on: [self-hosted, on-demand]
 ```
 
 Keep ordinary lint and unit jobs on GitHub-hosted runners.
