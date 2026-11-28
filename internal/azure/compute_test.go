@@ -315,87 +315,85 @@ func TestCreateRunnerAppliesVMSizeOverride(t *testing.T) {
 	}
 }
 
-func TestAzureSpotCapacityFallbackAndEvictedAbsence(t *testing.T) {
-	t.Run("classifies capacity errors and falls back to on-demand reusing NIC", func(t *testing.T) {
-		nicID := "/subscriptions/test/nics/runner"
-		nics := &fakeNICs{
-			getErr:   notFoundError(),
-			createOp: fakeNICCreateOperation{nic: armnetwork.Interface{ID: &nicID}},
-			deleteOp: fakeOperation{},
-		}
-		vms := &fakeVMs{
-			getErr: notFoundError(),
-			createErrs: []error{
-				&azcore.ResponseError{StatusCode: 409, ErrorCode: "SkuNotAvailable"},
-				nil,
-			},
-			createOps: []operation{fakeOperation{}},
-		}
-		client := testAzureClient(vms, nics)
-		client.spot = true
-		client.spotFallbackOnDemand = true
-		inst, err := client.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:az-fb", RunnerJITConfig: "jit"})
-		if err != nil || inst == nil {
-			t.Fatalf("CreateRunner fallback = %#v, %v", inst, err)
-		}
-		if len(vms.createdVMs) != 2 {
-			t.Fatalf("VM create calls = %d, want 2", len(vms.createdVMs))
-		}
-		if vms.createdVMs[0].Properties.Priority == nil || *vms.createdVMs[0].Properties.Priority != armcompute.VirtualMachinePriorityTypesSpot {
-			t.Fatal("first attempt did not request Spot")
-		}
-		if vms.createdVMs[1].Properties.Priority != nil {
-			t.Fatal("on-demand fallback still requested Spot priority")
-		}
-		if nics.deleteCalls != 0 {
-			t.Fatalf("NIC unexpectedly deleted during successful fallback: %d", nics.deleteCalls)
-		}
-	})
+func TestAzureSpotFallbackReusesNIC(t *testing.T) {
+	nicID := "/subscriptions/test/nics/runner"
+	nics := &fakeNICs{
+		getErr:   notFoundError(),
+		createOp: fakeNICCreateOperation{nic: armnetwork.Interface{ID: &nicID}},
+		deleteOp: fakeOperation{},
+	}
+	vms := &fakeVMs{
+		getErr: notFoundError(),
+		createErrs: []error{
+			&azcore.ResponseError{StatusCode: 409, ErrorCode: "SkuNotAvailable"},
+			nil,
+		},
+		createOps: []operation{fakeOperation{}},
+	}
+	client := testAzureClient(vms, nics)
+	client.spot = true
+	client.spotFallbackOnDemand = true
+	inst, err := client.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:az-fb", RunnerJITConfig: "jit"})
+	if err != nil || inst == nil {
+		t.Fatalf("CreateRunner fallback = %#v, %v", inst, err)
+	}
+	if len(vms.createdVMs) != 2 {
+		t.Fatalf("VM create calls = %d, want 2", len(vms.createdVMs))
+	}
+	if vms.createdVMs[0].Properties.Priority == nil || *vms.createdVMs[0].Properties.Priority != armcompute.VirtualMachinePriorityTypesSpot {
+		t.Fatal("first attempt did not request Spot")
+	}
+	if vms.createdVMs[1].Properties.Priority != nil {
+		t.Fatal("on-demand fallback still requested Spot priority")
+	}
+	if nics.deleteCalls != 0 {
+		t.Fatalf("NIC unexpectedly deleted during successful fallback: %d", nics.deleteCalls)
+	}
+}
 
-	t.Run("classifies AllocationFailed and cleans up NIC without fallback", func(t *testing.T) {
-		nicID := "/subscriptions/test/nics/runner"
-		nics := &fakeNICs{
-			getErr:   notFoundError(),
-			createOp: fakeNICCreateOperation{nic: armnetwork.Interface{ID: &nicID}},
-			deleteOp: fakeOperation{},
-		}
-		vms := &fakeVMs{
-			getErr:    notFoundError(),
-			createErr: &azcore.ResponseError{StatusCode: 409, ErrorCode: "AllocationFailed"},
-		}
-		client := testAzureClient(vms, nics)
-		client.spot = true
-		_, err := client.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:az-cap"})
-		if !compute.IsCapacityError(err) || nics.deleteCalls != 1 {
-			t.Fatalf("error=%v (isCap=%v), nicDeletes=%d", err, compute.IsCapacityError(err), nics.deleteCalls)
-		}
-	})
+func TestAzureAllocationFailureCleansNIC(t *testing.T) {
+	nicID := "/subscriptions/test/nics/runner"
+	nics := &fakeNICs{
+		getErr:   notFoundError(),
+		createOp: fakeNICCreateOperation{nic: armnetwork.Interface{ID: &nicID}},
+		deleteOp: fakeOperation{},
+	}
+	vms := &fakeVMs{
+		getErr:    notFoundError(),
+		createErr: &azcore.ResponseError{StatusCode: 409, ErrorCode: "AllocationFailed"},
+	}
+	client := testAzureClient(vms, nics)
+	client.spot = true
+	_, err := client.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:az-cap"})
+	if !compute.IsCapacityError(err) || nics.deleteCalls != 1 {
+		t.Fatalf("error=%v (isCap=%v), nicDeletes=%d", err, compute.IsCapacityError(err), nics.deleteCalls)
+	}
+}
 
-	t.Run("evicted deallocated or deleting VM treated as absent", func(t *testing.T) {
-		deallocated := "PowerState/deallocated"
-		name := resourceName("org/repo:az-evict")
-		vms := &fakeVMs{
-			vm: armcompute.VirtualMachine{
-				Name: &name,
-				Tags: ownershipTags("primary", "org/repo:az-evict"),
-				Properties: &armcompute.VirtualMachineProperties{
-					InstanceView: &armcompute.VirtualMachineInstanceView{
-						Statuses: []*armcompute.InstanceViewStatus{{Code: &deallocated}},
-					},
+func TestAzureEvictedVMIsAbsent(t *testing.T) {
+	deallocated := "PowerState/deallocated"
+	name := resourceName("org/repo:az-evict")
+	vms := &fakeVMs{
+		vm: armcompute.VirtualMachine{
+			Name: &name,
+			Tags: ownershipTags("primary", "org/repo:az-evict"),
+			Properties: &armcompute.VirtualMachineProperties{
+				InstanceView: &armcompute.VirtualMachineInstanceView{
+					Statuses: []*armcompute.InstanceViewStatus{{Code: &deallocated}},
 				},
 			},
-		}
-		client := testAzureClient(vms, &fakeNICs{})
-		if _, found, err := client.FindRunner(context.Background(), "org/repo:az-evict"); err != nil || found {
-			t.Fatalf("FindRunner(deallocated) = found=%v err=%v, want absent", found, err)
-		}
-		if absent, err := client.RunnerAbsent(context.Background(), name); err != nil || !absent {
-			t.Fatalf("RunnerAbsent(deallocated) = absent=%v err=%v, want true", absent, err)
-		}
-		deleting := "Deleting"
-		vms.vm.Properties = &armcompute.VirtualMachineProperties{ProvisioningState: &deleting}
-		if absent, err := client.RunnerAbsent(context.Background(), name); err != nil || !absent {
-			t.Fatalf("RunnerAbsent(Deleting) = absent=%v err=%v, want true", absent, err)
-		}
-	})
+		},
+	}
+	client := testAzureClient(vms, &fakeNICs{})
+	if _, found, err := client.FindRunner(context.Background(), "org/repo:az-evict"); err != nil || found {
+		t.Fatalf("FindRunner(deallocated) = found=%v err=%v, want absent", found, err)
+	}
+	if absent, err := client.RunnerAbsent(context.Background(), name); err != nil || !absent {
+		t.Fatalf("RunnerAbsent(deallocated) = absent=%v err=%v, want true", absent, err)
+	}
+	deleting := "Deleting"
+	vms.vm.Properties = &armcompute.VirtualMachineProperties{ProvisioningState: &deleting}
+	if absent, err := client.RunnerAbsent(context.Background(), name); err != nil || !absent {
+		t.Fatalf("RunnerAbsent(Deleting) = absent=%v err=%v, want true", absent, err)
+	}
 }

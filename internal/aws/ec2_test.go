@@ -304,83 +304,84 @@ func TestCreateRunnerAppliesInstanceSizeOverride(t *testing.T) {
 	}
 }
 
-func TestAWSSpotCapacityClassificationSubnetAndOnDemandFallback(t *testing.T) {
-	capErr := func(code string) error {
-		return &smithy.OperationError{
-			ServiceID: "EC2", OperationName: "RunInstances",
-			Err: &smithy.GenericAPIError{Code: code, Message: "capacity error", Fault: smithy.FaultClient},
-		}
+func spotCapacityError(code string) error {
+	return &smithy.OperationError{
+		ServiceID: "EC2", OperationName: "RunInstances",
+		Err: &smithy.GenericAPIError{Code: code, Message: "capacity error", Fault: smithy.FaultClient},
 	}
-	tmpl := template.Must(template.New("cloud-init").Parse("#cloud-config\nspot={{.SpotActive}}"))
+}
 
-	t.Run("classifies capacity errors", func(t *testing.T) {
-		for _, code := range []string{"InsufficientInstanceCapacity", "SpotMaxPriceTooLow", "InstanceLimitExceeded"} {
-			api := &fakeEC2{runErrs: []error{capErr(code)}}
-			client := newClient(api, tmpl, Config{
-				AMI: "ami-1", InstanceType: "m7i.large", SubnetID: "subnet-a",
-				SecurityGroupIDs: []string{"sg-1"}, ControllerID: "primary", Spot: true,
-			})
-			_, err := client.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:cap-" + code})
-			if !compute.IsCapacityError(err) {
-				t.Fatalf("code %s error = %v, want ErrCapacityUnavailable", code, err)
-			}
-		}
-	})
+func spotTestTemplate() *template.Template {
+	return template.Must(template.New("cloud-init").Parse("#cloud-config\nspot={{.SpotActive}}"))
+}
 
-	t.Run("alternate subnet failover then on-demand fallback", func(t *testing.T) {
-		api := &fakeEC2{
-			runErrs: []error{
-				capErr("InsufficientInstanceCapacity"),
-				capErr("SpotMaxPriceTooLow"),
-				nil,
-			},
-		}
-		client := newClient(api, tmpl, Config{
-			AMI: "ami-1", InstanceType: "m7i.large",
-			SubnetID: "subnet-a", AlternateSubnetIDs: []string{"subnet-b"},
-			SecurityGroupIDs: []string{"sg-1"}, ControllerID: "primary",
-			Spot: true, SpotFallbackOnDemand: true,
-		})
-		inst, err := client.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:fb"})
-		if err != nil || inst.ID != "i-123" {
-			t.Fatalf("CreateRunner fallback = %#v, %v", inst, err)
-		}
-		if len(api.runInputs) != 3 {
-			t.Fatalf("RunInstances calls = %d, want 3", len(api.runInputs))
-		}
-		if *api.runInputs[0].NetworkInterfaces[0].SubnetId != "subnet-a" || api.runInputs[0].InstanceMarketOptions == nil {
-			t.Fatalf("attempt 0 unexpected: %#v", api.runInputs[0])
-		}
-		if *api.runInputs[1].NetworkInterfaces[0].SubnetId != "subnet-b" || api.runInputs[1].InstanceMarketOptions == nil {
-			t.Fatalf("attempt 1 unexpected: %#v", api.runInputs[1])
-		}
-		if api.runInputs[2].InstanceMarketOptions != nil {
-			t.Fatal("on-demand fallback still requested Spot market options")
-		}
-		if *api.runInputs[0].ClientToken == *api.runInputs[1].ClientToken || *api.runInputs[0].ClientToken == *api.runInputs[2].ClientToken {
-			t.Fatal("fallback attempts reused primary ClientToken")
-		}
-		decoded, err := base64.StdEncoding.DecodeString(*api.runInputs[2].UserData)
-		if err != nil || !strings.Contains(string(decoded), "spot=false") {
-			t.Fatalf("on-demand fallback user-data = %q, %v", decoded, err)
-		}
-	})
-
-	t.Run("per-request on-demand override bypasses spot", func(t *testing.T) {
-		api := &fakeEC2{}
-		client := newClient(api, tmpl, Config{
+func TestAWSSpotCapacityErrors(t *testing.T) {
+	for _, code := range []string{"InsufficientInstanceCapacity", "SpotMaxPriceTooLow", "InstanceLimitExceeded"} {
+		api := &fakeEC2{runErrs: []error{spotCapacityError(code)}}
+		client := newClient(api, spotTestTemplate(), Config{
 			AMI: "ami-1", InstanceType: "m7i.large", SubnetID: "subnet-a",
 			SecurityGroupIDs: []string{"sg-1"}, ControllerID: "primary", Spot: true,
 		})
-		if _, err := client.CreateRunner(context.Background(), compute.RunnerParams{
-			JobKey: "org/repo:od", Spot: compute.BoolPtr(false),
-		}); err != nil {
-			t.Fatal(err)
+		_, err := client.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:cap-" + code})
+		if !compute.IsCapacityError(err) {
+			t.Fatalf("code %s error = %v, want ErrCapacityUnavailable", code, err)
 		}
-		if api.runInput.InstanceMarketOptions != nil {
-			t.Fatal("per-request Spot=false still set Spot options")
-		}
+	}
+}
+
+func TestAWSAlternateSubnetBeforeOnDemand(t *testing.T) {
+	api := &fakeEC2{
+		runErrs: []error{
+			spotCapacityError("InsufficientInstanceCapacity"),
+			spotCapacityError("SpotMaxPriceTooLow"),
+			nil,
+		},
+	}
+	client := newClient(api, spotTestTemplate(), Config{
+		AMI: "ami-1", InstanceType: "m7i.large",
+		SubnetID: "subnet-a", AlternateSubnetIDs: []string{"subnet-b"},
+		SecurityGroupIDs: []string{"sg-1"}, ControllerID: "primary",
+		Spot: true, SpotFallbackOnDemand: true,
 	})
+	inst, err := client.CreateRunner(context.Background(), compute.RunnerParams{JobKey: "org/repo:fb"})
+	if err != nil || inst.ID != "i-123" {
+		t.Fatalf("CreateRunner fallback = %#v, %v", inst, err)
+	}
+	if len(api.runInputs) != 3 {
+		t.Fatalf("RunInstances calls = %d, want 3", len(api.runInputs))
+	}
+	if *api.runInputs[0].NetworkInterfaces[0].SubnetId != "subnet-a" || api.runInputs[0].InstanceMarketOptions == nil {
+		t.Fatalf("attempt 0 unexpected: %#v", api.runInputs[0])
+	}
+	if *api.runInputs[1].NetworkInterfaces[0].SubnetId != "subnet-b" || api.runInputs[1].InstanceMarketOptions == nil {
+		t.Fatalf("attempt 1 unexpected: %#v", api.runInputs[1])
+	}
+	if api.runInputs[2].InstanceMarketOptions != nil {
+		t.Fatal("on-demand fallback still requested Spot market options")
+	}
+	if *api.runInputs[0].ClientToken == *api.runInputs[1].ClientToken || *api.runInputs[0].ClientToken == *api.runInputs[2].ClientToken {
+		t.Fatal("fallback attempts reused primary ClientToken")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(*api.runInputs[2].UserData)
+	if err != nil || !strings.Contains(string(decoded), "spot=false") {
+		t.Fatalf("on-demand fallback user-data = %q, %v", decoded, err)
+	}
+}
+
+func TestAWSRequestOverridesDefaultSpot(t *testing.T) {
+	api := &fakeEC2{}
+	client := newClient(api, spotTestTemplate(), Config{
+		AMI: "ami-1", InstanceType: "m7i.large", SubnetID: "subnet-a",
+		SecurityGroupIDs: []string{"sg-1"}, ControllerID: "primary", Spot: true,
+	})
+	if _, err := client.CreateRunner(context.Background(), compute.RunnerParams{
+		JobKey: "org/repo:od", Spot: compute.BoolPtr(false),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if api.runInput.InstanceMarketOptions != nil {
+		t.Fatal("per-request Spot=false still set Spot options")
+	}
 }
 
 func TestAWSRunnerAbsentAndFindRunnerTreatPreemptedTerminatedAsAbsent(t *testing.T) {

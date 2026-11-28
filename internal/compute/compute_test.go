@@ -24,7 +24,7 @@ func TestValidControllerID(t *testing.T) {
 	}
 }
 
-func TestResolveSpotAndPreference(t *testing.T) {
+func TestResolveSpotDefaultAndOverride(t *testing.T) {
 	if ResolveSpot(true, nil) != true || ResolveSpot(false, nil) != false {
 		t.Fatal("ResolveSpot failed to apply provider default")
 	}
@@ -32,6 +32,9 @@ func TestResolveSpotAndPreference(t *testing.T) {
 		t.Fatal("ResolveSpot failed to apply per-request override")
 	}
 
+}
+
+func TestResolveSpotLabelPreference(t *testing.T) {
 	if got := ResolveSpotPreference([]string{"self-hosted", "large"}); got != nil {
 		t.Fatalf("ResolveSpotPreference(no spot labels) = %v, want nil", *got)
 	}
@@ -49,6 +52,9 @@ func TestResolveSpotAndPreference(t *testing.T) {
 		t.Fatalf("ResolveSpotPreference(on-demand+spot) = %v, want false", got)
 	}
 
+}
+
+func TestSpotErrorClassification(t *testing.T) {
 	capErr := fmt.Errorf("%w: pool empty", ErrCapacityUnavailable)
 	if !IsCapacityError(capErr) || IsCapacityError(errors.New("other")) {
 		t.Fatal("IsCapacityError mismatch")

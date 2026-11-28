@@ -245,7 +245,7 @@ func (c *Client) buildCreateRequest(name, plan, jobKey, userData string) createI
 
 func (c *Client) handleCreateError(ctx context.Context, jobKey, desiredName string, createErr error) (*compute.RunnerInstance, error) {
 	return compute.RecoverCreateError(
-		ctx, "Vultr", desiredName, c.recoveryTimeout, c.recoveryPoll, createErr,
+		ctx, "Vultr", desiredName, compute.RecoveryTiming{Timeout: c.recoveryTimeout, Poll: c.recoveryPoll}, createErr,
 		func(pollCtx context.Context) (*vultrInstance, error) {
 			instances, err := c.listJobInstances(pollCtx, jobKey, "")
 			if err != nil {
@@ -338,7 +338,7 @@ func (c *Client) SweepOrphanedRunners(ctx context.Context, known map[string]stru
 		return 0, fmt.Errorf("list controller Vultr instances for orphan sweep: %w", err)
 	}
 	return compute.SweepOrphans(
-		ctx, "Vultr", c.controllerTag, known, cutoff, instances,
+		ctx, compute.OrphanSweep{Provider: "Vultr", ControllerTag: c.controllerTag, Known: known, Cutoff: cutoff}, instances,
 		func(v vultrInstance) string { return v.ID },
 		func(v vultrInstance) []string { return v.Tags },
 		func(v vultrInstance) (time.Time, error) { return time.Parse(time.RFC3339, v.DateCreated) },

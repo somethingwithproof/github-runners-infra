@@ -256,7 +256,7 @@ func (c *Client) buildCreateRequest(name, instanceType, jobKey, rootPass, userDa
 
 func (c *Client) handleCreateError(ctx context.Context, jobKey, desiredName string, createErr error) (*compute.RunnerInstance, error) {
 	return compute.RecoverCreateError(
-		ctx, "Linode", desiredName, c.recoveryTimeout, c.recoveryPoll, createErr,
+		ctx, "Linode", desiredName, compute.RecoveryTiming{Timeout: c.recoveryTimeout, Poll: c.recoveryPoll}, createErr,
 		func(pollCtx context.Context) (*linodeInstance, error) {
 			instances, err := c.listJobInstances(pollCtx, jobKey, "")
 			if err != nil {
@@ -351,7 +351,7 @@ func (c *Client) SweepOrphanedRunners(ctx context.Context, known map[string]stru
 		return 0, fmt.Errorf("list controller Linode instances for orphan sweep: %w", err)
 	}
 	return compute.SweepOrphans(
-		ctx, "Linode", c.controllerTag, known, cutoff, instances,
+		ctx, compute.OrphanSweep{Provider: "Linode", ControllerTag: c.controllerTag, Known: known, Cutoff: cutoff}, instances,
 		func(l linodeInstance) string { return strconv.Itoa(l.ID) },
 		func(l linodeInstance) []string { return l.Tags },
 		func(l linodeInstance) (time.Time, error) { return parseLinodeTime(l.Created) },
