@@ -211,6 +211,10 @@ func TestVultrCursorSweepAndUndatedTolerance(t *testing.T) {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		if strings.HasPrefix(r.URL.Path, instancesBasePath) {
+			_ = json.NewEncoder(w).Encode(instanceResponse{Instance: vultrInstance{Tags: []string{"runner-controller-primary"}}})
+			return
+		}
 		cursor := r.URL.Query().Get("cursor")
 		cursors = append(cursors, cursor)
 		if cursor == "" {

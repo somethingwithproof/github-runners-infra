@@ -32,6 +32,9 @@ func TestRESTHelpers(t *testing.T) {
 	if !IsAmbiguousCreateError(&APIError{Provider: "test", StatusCode: http.StatusServiceUnavailable}) {
 		t.Fatal("503 should be ambiguous")
 	}
+	if !IsAmbiguousCreateError(context.DeadlineExceeded) {
+		t.Fatal("a timed-out POST may have created the instance")
+	}
 	if IsAmbiguousCreateError(context.Canceled) {
 		t.Fatal("canceled should not be ambiguous")
 	}

@@ -97,19 +97,20 @@ type linodeInterface struct {
 }
 
 type createInstanceRequest struct {
-	Region         string            `json:"region"`
-	Type           string            `json:"type"`
-	Image          string            `json:"image"`
-	Label          string            `json:"label"`
-	RootPass       string            `json:"root_pass"`
-	AuthorizedKeys []string          `json:"authorized_keys,omitempty"`
-	Tags           []string          `json:"tags"`
-	FirewallID     int               `json:"firewall_id,omitempty"`
-	Interfaces     []linodeInterface `json:"interfaces,omitempty"`
-	Metadata       *linodeMetadata   `json:"metadata,omitempty"`
-	Booted         bool              `json:"booted"`
-	BackupsEnabled bool              `json:"backups_enabled"`
-	PrivateIP      bool              `json:"private_ip"`
+	InterfaceGeneration string            `json:"interface_generation,omitempty"`
+	Region              string            `json:"region"`
+	Type                string            `json:"type"`
+	Image               string            `json:"image"`
+	Label               string            `json:"label"`
+	RootPass            string            `json:"root_pass"`
+	AuthorizedKeys      []string          `json:"authorized_keys,omitempty"`
+	Tags                []string          `json:"tags"`
+	FirewallID          int               `json:"firewall_id,omitempty"`
+	Interfaces          []linodeInterface `json:"interfaces,omitempty"`
+	Metadata            *linodeMetadata   `json:"metadata,omitempty"`
+	Booted              bool              `json:"booted"`
+	BackupsEnabled      bool              `json:"backups_enabled"`
+	PrivateIP           bool              `json:"private_ip"`
 }
 
 func (c *Client) Provider() string { return "linode" }
@@ -235,6 +236,7 @@ func (c *Client) buildCreateRequest(name, instanceType, jobKey, rootPass, userDa
 		PrivateIP:      false,
 	}
 	if c.vpcSubnetID > 0 {
+		req.InterfaceGeneration = "legacy_config"
 		req.Interfaces = []linodeInterface{{Purpose: "vpc", SubnetID: c.vpcSubnetID, IPv4: &linodeInterfaceIPv4{NAT: "any"}}}
 	}
 	return req
@@ -275,6 +277,10 @@ func (c *Client) RunnerAbsent(ctx context.Context, id string) (bool, error) {
 
 // DeleteRunner deletes a Linode instance only after verifying controller and job ownership tags.
 func (c *Client) DeleteRunner(ctx context.Context, id, jobKey string) error {
+	return c.deleteOwned(ctx, id, compute.JobTag(jobKey))
+}
+
+func (c *Client) deleteOwned(ctx context.Context, id, expectedJobTag string) error {
 	numericID, err := parseInstanceID(id)
 	if err != nil {
 		return err
@@ -287,7 +293,7 @@ func (c *Client) DeleteRunner(ctx context.Context, id, jobKey string) error {
 		}
 		return fmt.Errorf("get Linode instance %s before delete: %w", id, err)
 	}
-	if !compute.HasTag(inst.Tags, c.controllerTag) || !compute.HasTag(inst.Tags, compute.JobTag(jobKey)) {
+	if !compute.HasTag(inst.Tags, c.controllerTag) || (expectedJobTag != "" && !compute.HasTag(inst.Tags, expectedJobTag)) {
 		var confirm linodeInstance
 		if confirmErr := c.doJSON(ctx, http.MethodGet, path, "", nil, &confirm); confirmErr != nil {
 			if compute.IsHTTPNotFound(confirmErr) {
@@ -338,7 +344,7 @@ func (c *Client) SweepOrphanedRunners(ctx context.Context, known map[string]stru
 		func(l linodeInstance) []string { return l.Tags },
 		func(l linodeInstance) (time.Time, error) { return parseLinodeTime(l.Created) },
 		func(delCtx context.Context, id string) error {
-			return c.doJSON(delCtx, http.MethodDelete, instancesBasePath+id, "", nil, nil)
+			return c.deleteOwned(delCtx, id, "")
 		},
 	)
 }

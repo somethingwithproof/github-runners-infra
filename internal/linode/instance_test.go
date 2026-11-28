@@ -224,7 +224,7 @@ func TestLinodeOwnershipDeleteAndAbsence(t *testing.T) {
 
 func assertLinodeCreatePayload(t *testing.T, req createInstanceRequest) {
 	t.Helper()
-	if req.Type != "g6-dedicated-8" || req.FirewallID != 55 || len(req.Interfaces) != 1 || req.Interfaces[0].SubnetID != 88 || req.Interfaces[0].IPv4 == nil || req.Interfaces[0].IPv4.NAT != "any" {
+	if req.Type != "g6-dedicated-8" || req.FirewallID != 55 || req.InterfaceGeneration != "legacy_config" || len(req.Interfaces) != 1 || req.Interfaces[0].SubnetID != 88 || req.Interfaces[0].IPv4 == nil || req.Interfaces[0].IPv4.NAT != "any" {
 		t.Fatalf("unexpected create payload: %#v", req)
 	}
 	if len(req.RootPass) < 20 || req.Metadata == nil {
@@ -246,6 +246,14 @@ func TestLinodePageSweepAndTimestamps(t *testing.T) {
 		if r.Method == http.MethodDelete {
 			deleted = append(deleted, strings.TrimPrefix(r.URL.Path, instancesBasePath))
 			_, _ = w.Write([]byte(`{}`))
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, instancesBasePath) {
+			var tags []string
+			if strings.HasSuffix(r.URL.Path, "/14") {
+				tags = []string{"runner-controller-primary"}
+			}
+			_ = json.NewEncoder(w).Encode(linodeInstance{Tags: tags})
 			return
 		}
 		page := r.URL.Query().Get("page")
@@ -279,7 +287,7 @@ func TestLinodePageSweepAndTimestamps(t *testing.T) {
 		t.Fatal(err)
 	}
 	count, err := client.SweepOrphanedRunners(context.Background(), map[string]struct{}{"10": {}}, time.Now().Add(-time.Hour))
-	if err == nil || count != 2 || strings.Join(deleted, ",") != "12,14" || strings.Join(pages, ",") != "1,2" {
+	if err == nil || !errors.Is(err, compute.ErrOwnershipMismatch) || count != 1 || strings.Join(deleted, ",") != "14" || strings.Join(pages, ",") != "1,2" {
 		t.Fatalf("sweep count=%d err=%v deleted=%v pages=%v", count, err, deleted, pages)
 	}
 }
