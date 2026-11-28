@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/thomasvincent/github-runners-infra/internal/budget"
@@ -98,6 +99,7 @@ type spotRateEstimator interface {
 
 // Handler authenticates webhooks and drives durable runner lifecycle workers.
 type Handler struct {
+	orphanCleanups            atomic.Uint64
 	webhookSecret             []byte
 	githubClient              GitHubClient
 	computeClient             ComputeClient
@@ -666,7 +668,7 @@ func (h *Handler) reconcileLiveness(ctx context.Context, cutoff time.Time) []err
 	knownInstances, err := h.store.KnownInstanceIDs(ctx)
 	if err != nil {
 		reconciliationErrors = append(reconciliationErrors, fmt.Errorf("list known provider instances: %w", err))
-	} else if deleted, sweepErr := h.computeClient.SweepOrphanedRunners(ctx, knownInstances, cutoff); sweepErr != nil {
+	} else if deleted, sweepErr := h.sweepOrphans(ctx, knownInstances, cutoff); sweepErr != nil {
 		reconciliationErrors = append(reconciliationErrors, fmt.Errorf("sweep orphaned provider instances: %w", sweepErr))
 	} else {
 		if deleted != 0 {
@@ -685,6 +687,17 @@ func (h *Handler) reconcileLiveness(ctx context.Context, cutoff time.Time) []err
 	}
 	reconciliationErrors = append(reconciliationErrors, h.reconcileProvisionedRunners(ctx)...)
 	return reconciliationErrors
+}
+
+// OrphanCleanups counts provider resources reclaimed by sweeps since startup.
+func (h *Handler) OrphanCleanups() uint64 { return h.orphanCleanups.Load() }
+
+func (h *Handler) sweepOrphans(ctx context.Context, known map[string]struct{}, cutoff time.Time) (int, error) {
+	deleted, err := h.computeClient.SweepOrphanedRunners(ctx, known, cutoff)
+	if deleted > 0 {
+		h.orphanCleanups.Add(uint64(deleted))
+	}
+	return deleted, err
 }
 
 func (h *Handler) snapshotSweptOrphanCandidates(ctx context.Context, cutoff time.Time) (map[string]string, error) {

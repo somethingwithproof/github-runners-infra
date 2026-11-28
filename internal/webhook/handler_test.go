@@ -1191,6 +1191,9 @@ func TestProviderSweepReclaimsOnlyOldInstancesAbsentFromState(t *testing.T) {
 	if err := handler.expireRunners(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if got := handler.OrphanCleanups(); got != 2 {
+		t.Errorf("orphan cleanups = %d, want 2", got)
+	}
 	if _, ok := computeClient.orphans["instance-orphan"]; ok {
 		t.Fatal("old orphaned provider instance was not reclaimed")
 	}

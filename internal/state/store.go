@@ -178,6 +178,7 @@ type journalEntry struct {
 // periodically compacts them into an atomically replaced snapshot. It is
 // intended for a single controller process.
 type FileStore struct {
+	metrics          map[string]ProviderCounters
 	mu               sync.Mutex
 	lockFile         *os.File
 	path             string
@@ -693,11 +694,7 @@ func (s *FileStore) ClaimNext(ctx context.Context, now time.Time, maxAttempts in
 func (s *FileStore) liveRunnerCountLocked() int {
 	count := 0
 	for _, record := range s.records {
-		if record.Status == StatusDeleted || (record.Status == StatusOrphaned && record.InstanceID == "") {
-			continue
-		}
-		if record.InstanceID != "" || (record.GitHubRunnerOwned && record.GitHubRunnerID != 0) ||
-			record.ClaimedWork == WorkProvision || record.Status == StatusProvisioning {
+		if record.countsAsLive() {
 			count++
 		}
 	}
@@ -1128,7 +1125,7 @@ func (s *FileStore) DeferOrphanCleanup(_ context.Context, key, message string, r
 }
 
 func (s *FileStore) MarkProvisionFailed(_ context.Context, key, message string, retryAt time.Time, maxAttempts int) error {
-	return s.update(key, func(record *Record) {
+	return s.updateWithFailure(key, WorkProvision, func(record *Record) {
 		if record.Status == StatusDeleted || record.Status == StatusOrphaned {
 			return
 		}
@@ -1355,7 +1352,7 @@ func (s *FileStore) BeginCleanupAttempt(_ context.Context, key string, maxAttemp
 }
 
 func (s *FileStore) MarkDeleteFailed(_ context.Context, key, message string, retryAt time.Time, maxAttempts int) error {
-	return s.update(key, func(record *Record) {
+	return s.updateWithFailure(key, WorkDelete, func(record *Record) {
 		if record.Status == StatusDeleted || record.Status == StatusOrphaned {
 			return
 		}
@@ -1651,6 +1648,10 @@ func cloneRecords(records map[string]Record) map[string]Record {
 }
 
 func (s *FileStore) update(key string, mutate func(*Record)) error {
+	return s.updateWithFailure(key, "", mutate)
+}
+
+func (s *FileStore) updateWithFailure(key string, failure WorkKind, mutate func(*Record)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	record, ok := s.records[key]
@@ -1669,6 +1670,7 @@ func (s *FileStore) update(key string, mutate func(*Record)) error {
 		s.records[key] = before
 		return err
 	}
+	s.countLifecycleEvents(before, record, failure)
 	if before.GitHubRunnerID != 0 &&
 		(record.Status == StatusDeleted || !record.GitHubRunnerOwned || record.GitHubRunnerID != before.GitHubRunnerID) {
 		s.evictRunnerKeyLocked(key, before)
