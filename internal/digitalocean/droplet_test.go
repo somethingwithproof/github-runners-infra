@@ -29,7 +29,7 @@ func TestCloudInitContainsOnlyJITBootstrapMaterial(t *testing.T) {
 				t.Fatal(err)
 			}
 			text := string(data)
-			for _, forbidden := range []string{"DOToken", "DIGITALOCEAN_TOKEN", "aws ssm", "CallbackSecret", "/callback/destroy"} {
+			for _, forbidden := range []string{"DOToken", "DIGITALOCEAN_TOKEN", "VULTR_API_KEY", "LINODE_TOKEN", "aws ssm", "CallbackSecret", "/callback/destroy"} {
 				if strings.Contains(text, forbidden) {
 					t.Fatalf("cloud-init contains forbidden control-plane material %q", forbidden)
 				}
@@ -59,6 +59,29 @@ func TestCloudInitContainsOnlyJITBootstrapMaterial(t *testing.T) {
 			}
 			if !strings.Contains(rendered.String(), "./run.sh --jitconfig") {
 				t.Fatal("rendered cloud-init does not start a JIT runner")
+			}
+			if strings.Contains(rendered.String(), "runner-deadman-shutdown") {
+				t.Fatal("rendered cloud-init included dead-man fuse when disabled")
+			}
+
+			var renderedDeadman bytes.Buffer
+			err = tmpl.Execute(&renderedDeadman, compute.RunnerParams{
+				RunnerJITConfig:        "encoded-jit-config",
+				RunnerVersion:          "2.331.0",
+				RunnerSHA256:           strings.Repeat("a", 64),
+				ChefInstallerSHA256:    strings.Repeat("b", 64),
+				DeadmanShutdownMinutes: 180,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{"date -u -d '+180 minutes'", "OnCalendar=$deadline", "Persistent=true", "ExecStart=/sbin/shutdown --poweroff now", "systemctl enable --now runner-deadman-shutdown.timer"} {
+				if !strings.Contains(renderedDeadman.String(), want) {
+					t.Errorf("missing shutdown timer directive %q", want)
+				}
+			}
+			if strings.Contains(renderedDeadman.String(), "set -eu#") || strings.Contains(renderedDeadman.String(), "set -eusystemctl") {
+				t.Fatalf("dead-man template tags collapsed adjacent shell lines:\n%s", renderedDeadman.String())
 			}
 		})
 	}
@@ -441,5 +464,47 @@ func TestCreateRunnerLogsRejectedProjectAssignment(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "do:droplet:91 status service_down") {
 		t.Fatalf("log = %q, want the rejected resource status", logs.String())
+	}
+}
+
+func TestCreateRunnerAppliesSizeOverrideAndRejectsInvalidSize(t *testing.T) {
+	var requestedSize string
+	httpClient := &http.Client{Transport: doRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/v2/droplets":
+			return jsonResponse(http.StatusOK, `{"droplets":[]}`), nil
+		case request.Method == http.MethodGet && request.URL.Path == "/v2/firewalls":
+			return jsonResponse(http.StatusOK, `{"firewalls":[{"id":"firewall-id","tags":["runner-controller-test"],"inbound_rules":[]}]}`), nil
+		case request.Method == http.MethodPost && request.URL.Path == "/v2/droplets":
+			var body struct {
+				Size string `json:"size"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			requestedSize = body.Size
+			return jsonResponse(http.StatusAccepted, `{"droplet":{"id":92,"name":"runner"}}`), nil
+		default:
+			t.Fatalf("unexpected request %s %s", request.Method, request.URL.Path)
+			return nil, nil
+		}
+	})}
+	client := &Client{
+		client: godo.NewClient(httpClient), cloudInitTmpl: template.Must(template.New("cloud-init").Parse("bootstrap")),
+		region: "nyc3", size: "c-4", image: "ubuntu", controllerTag: "runner-controller-test",
+		vpcUUID: "vpc-id", firewallID: "firewall-id",
+	}
+	if _, err := client.CreateRunner(context.Background(), compute.RunnerParams{
+		JobKey: "org/repo:10", ProvisionEpoch: 1, InstanceSize: "c-16",
+	}); err != nil {
+		t.Fatalf("CreateRunner override error = %v", err)
+	}
+	if requestedSize != "c-16" {
+		t.Fatalf("requested size = %q, want c-16", requestedSize)
+	}
+	if _, err := client.CreateRunner(context.Background(), compute.RunnerParams{
+		JobKey: "org/repo:11", ProvisionEpoch: 1, InstanceSize: "bad/size",
+	}); err == nil {
+		t.Fatal("CreateRunner accepted invalid droplet size override")
 	}
 }

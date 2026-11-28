@@ -20,6 +20,7 @@ import (
 type fakeInstances struct {
 	instance     *computepb.Instance
 	getErr       error
+	insertReq    *computepb.InsertInstanceRequest
 	insertOp     operation
 	insertErr    error
 	deleteOp     operation
@@ -37,7 +38,8 @@ func (f *fakeInstances) Get(context.Context, *computepb.GetInstanceRequest) (*co
 	return f.instance, f.getErr
 }
 
-func (f *fakeInstances) Insert(context.Context, *computepb.InsertInstanceRequest) (operation, error) {
+func (f *fakeInstances) Insert(_ context.Context, req *computepb.InsertInstanceRequest) (operation, error) {
+	f.insertReq = req
 	return f.insertOp, f.insertErr
 }
 
@@ -59,7 +61,7 @@ func TestSpotInstanceSpecIsDeleteOnPreemptionAndPrivateByDefault(t *testing.T) {
 		subnetwork: "projects/p/regions/us-central1/subnetworks/runners", controllerHash: shortHash("primary"), spot: true,
 		serviceAccountEmail: "runner@project.iam.gserviceaccount.com",
 	}
-	instance := client.instanceSpec("org/repo:42", "#cloud-config")
+	instance := client.instanceSpec("org/repo:42", "n2-standard-4", "#cloud-config")
 	if instance.Scheduling == nil || instance.Scheduling.GetProvisioningModel() != "SPOT" ||
 		instance.Scheduling.GetInstanceTerminationAction() != "DELETE" || instance.Scheduling.GetAutomaticRestart() ||
 		instance.Scheduling.GetOnHostMaintenance() != "TERMINATE" {
@@ -252,5 +254,24 @@ func testClient(instances instancesAPI) *Client {
 		instances: instances, tmpl: template.Must(template.New("runner").Parse("{{.RunnerJITConfig}}")),
 		projectID: "project", zone: "zone", machineType: "n2-standard-4", sourceImage: "image",
 		subnetwork: "subnetwork", controllerHash: shortHash("primary"), serviceAccountEmail: "runner@project.iam.gserviceaccount.com",
+	}
+}
+
+func TestCreateRunnerAppliesMachineTypeOverride(t *testing.T) {
+	instances := &fakeInstances{getErr: &googleapi.Error{Code: 404}, insertOp: fakeOperation{}}
+	client := testClient(instances)
+	if _, err := client.CreateRunner(context.Background(), compute.RunnerParams{
+		JobKey: "org/repo:55", RunnerJITConfig: "jit", InstanceSize: "c3-standard-8",
+	}); err != nil {
+		t.Fatalf("CreateRunner override error = %v", err)
+	}
+	want := "zones/zone/machineTypes/c3-standard-8"
+	if instances.insertReq == nil || instances.insertReq.GetInstanceResource().GetMachineType() != want {
+		t.Fatalf("machine type = %q, want %q", instances.insertReq.GetInstanceResource().GetMachineType(), want)
+	}
+	if _, err := client.CreateRunner(context.Background(), compute.RunnerParams{
+		JobKey: "org/repo:56", RunnerJITConfig: "jit", InstanceSize: "../bad",
+	}); err == nil {
+		t.Fatal("CreateRunner accepted invalid GCP machine type override")
 	}
 }

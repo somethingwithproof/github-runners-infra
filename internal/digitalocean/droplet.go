@@ -55,6 +55,8 @@ type Config struct {
 	ProjectID string
 }
 
+var _ compute.Provider = (*Client)(nil)
+
 func (c *Client) Provider() string { return "digitalocean" }
 
 // NewClient creates a new DigitalOcean API client.
@@ -86,6 +88,9 @@ func NewClient(cfg Config) (*Client, error) {
 	size := cfg.Size
 	if size == "" {
 		size = "s-4vcpu-8gb-amd"
+	}
+	if !compute.ValidInstanceSize(size) {
+		return nil, fmt.Errorf("invalid DigitalOcean droplet size %q", size)
 	}
 	image := cfg.Image
 	if image == "" {
@@ -130,6 +135,14 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 		return nil, err
 	}
 
+	size := c.size
+	if params.InstanceSize != "" {
+		if !compute.ValidInstanceSize(params.InstanceSize) {
+			return nil, fmt.Errorf("invalid DigitalOcean droplet size %q", params.InstanceSize)
+		}
+		size = params.InstanceSize
+	}
+
 	userData, err := compute.RenderCloudInit(c.cloudInitTmpl, params)
 	if err != nil {
 		return nil, err
@@ -143,7 +156,7 @@ func (c *Client) CreateRunner(ctx context.Context, params compute.RunnerParams) 
 	createReq := &godo.DropletCreateRequest{
 		Name:   desiredName,
 		Region: c.region,
-		Size:   c.size,
+		Size:   size,
 		Image: godo.DropletCreateImage{
 			Slug: c.image,
 		},

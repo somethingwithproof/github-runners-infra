@@ -216,6 +216,25 @@ func TestSplitCSV(t *testing.T) {
 	}
 }
 
+func TestSingleProviderRejectsSpot(t *testing.T) {
+	for _, provider := range []string{"digitalocean", "vultr", "linode"} {
+		t.Run(provider+" spot", func(t *testing.T) {
+			t.Setenv("CONTROLLER_ID", "controller-1")
+			t.Setenv("COMPUTE_PROVIDER", provider)
+			t.Setenv("CLOUD_INIT_PATH", writeRunnerTemplate(t))
+			t.Setenv("VULTR_API_KEY", "test-token")
+			t.Setenv("LINODE_TOKEN", "test-token")
+			t.Setenv("DIGITALOCEAN_TOKEN", "test-token")
+			t.Setenv("DO_VPC_UUID", "vpc-id")
+			t.Setenv("DO_FIREWALL_ID", "firewall-id")
+			t.Setenv("RUNNER_SPOT", "true")
+			if _, _, err := newComputeClient(context.Background(), context.Background()); err == nil || !strings.Contains(err.Error(), "RUNNER_SPOT") || !strings.Contains(strings.ToLower(err.Error()), provider) {
+				t.Fatalf("newComputeClient(%s, spot) = %v", provider, err)
+			}
+		})
+	}
+}
+
 func TestNewComputeClientRejectsInvalidProviderConfiguration(t *testing.T) {
 	t.Run("invalid spot boolean", func(t *testing.T) {
 		t.Setenv("CONTROLLER_ID", "controller-1")
@@ -258,14 +277,6 @@ func TestNewComputeClientRejectsInvalidProviderConfiguration(t *testing.T) {
 			t.Fatalf("invalid GCP_EXTERNAL_IP error = %v", err)
 		}
 	})
-	t.Run("DigitalOcean spot", func(t *testing.T) {
-		t.Setenv("CONTROLLER_ID", "controller-1")
-		t.Setenv("COMPUTE_PROVIDER", "digitalocean")
-		t.Setenv("RUNNER_SPOT", "true")
-		if _, _, err := newComputeClient(context.Background(), context.Background()); err == nil {
-			t.Fatal("newComputeClient accepted DigitalOcean spot")
-		}
-	})
 	t.Run("Azure unreadable SSH key", func(t *testing.T) {
 		t.Setenv("CONTROLLER_ID", "controller-1")
 		t.Setenv("COMPUTE_PROVIDER", "azure")
@@ -305,6 +316,12 @@ func TestNewComputeClientRequiresProviderInputs(t *testing.T) {
 			"AZURE_RESOURCE_GROUP": "resource-group", "AZURE_LOCATION": "westus",
 			"AZURE_VM_SIZE": "Standard_D2s_v5", "AZURE_IMAGE": "Canonical:ubuntu-24_04-lts:server:latest",
 			"AZURE_SUBNET_ID": "/subscriptions/subnet",
+		}},
+		{provider: "vultr", missing: "VULTR_API_KEY", required: map[string]string{
+			"VULTR_API_KEY": "vultr-secret",
+		}},
+		{provider: "linode", missing: "LINODE_TOKEN", required: map[string]string{
+			"LINODE_TOKEN": "linode-secret",
 		}},
 	} {
 		t.Run(test.provider, func(t *testing.T) {
@@ -394,6 +411,24 @@ func TestNewComputeClientCloudProviderHappyPaths(t *testing.T) {
 		t.Setenv("AZURE_IMAGE", "Canonical:ubuntu-24_04-lts:server:24.04.202601010")
 		t.Setenv("AZURE_SUBNET_ID", "/subscriptions/test/subnets/runners")
 		assertComputeProvider(t, "azure")
+	})
+	t.Run("vultr", func(t *testing.T) {
+		t.Setenv("COMPUTE_PROVIDER", "vultr")
+		t.Setenv("CONTROLLER_ID", "controller-1")
+		t.Setenv("CLOUD_INIT_PATH", writeRunnerTemplate(t))
+		t.Setenv("VULTR_API_KEY", "test-vultr-key")
+		t.Setenv("VULTR_REGION", "ewr")
+		t.Setenv("VULTR_PLAN", "vc2-4c-8gb")
+		assertComputeProvider(t, "vultr")
+	})
+	t.Run("linode", func(t *testing.T) {
+		t.Setenv("COMPUTE_PROVIDER", "linode")
+		t.Setenv("CONTROLLER_ID", "controller-1")
+		t.Setenv("CLOUD_INIT_PATH", writeRunnerTemplate(t))
+		t.Setenv("LINODE_TOKEN", "test-linode-token")
+		t.Setenv("LINODE_REGION", "us-east")
+		t.Setenv("LINODE_INSTANCE_TYPE", "g6-standard-4")
+		assertComputeProvider(t, "linode")
 	})
 }
 
@@ -518,14 +553,72 @@ func setValidRuntimeEnvironment(t *testing.T) {
 	// observe. Clear them so every test starts from the documented defaults.
 	for _, key := range []string{
 		"AZURE_ADMIN_USERNAME", "CANCELLED_RUNNER_TTL", "CLOUD_INIT_PATH", "COMPUTE_PROVIDER",
-		"DELETED_RECORD_RETENTION", "DO_IMAGE", "DO_REGION", "DO_SIZE", "LISTEN_ADDR",
-		"LIVENESS_CONFIRMATIONS", "LIVENESS_SETTLE_WINDOW", "MAX_ATTEMPTS", "MAX_LIVE_RUNNERS",
-		"MAX_RUNNER_AGE", "REQUIRED_LABEL", "RUNNER_REGISTRATION_TIMEOUT", "STATE_FILE",
-		"WORKER_COUNT",
+		"DELETED_RECORD_RETENTION", "DO_IMAGE", "DO_LABEL_SIZE_MAP", "DO_REGION", "DO_SIZE",
+		"LABEL_SIZE_MAP", "LINODE_API_URL", "LINODE_FIREWALL_ID", "LINODE_IMAGE",
+		"LINODE_INSTANCE_TYPE", "LINODE_REGION", "LINODE_SSH_PUBLIC_KEY_FILE", "LINODE_VPC_SUBNET_ID",
+		"LISTEN_ADDR", "LIVENESS_CONFIRMATIONS", "LIVENESS_SETTLE_WINDOW", "MAX_ATTEMPTS",
+		"MAX_LIVE_RUNNERS", "MAX_RUNNER_AGE", "REQUIRED_LABEL", "RUNNER_DEADMAN_MINUTES",
+		"RUNNER_REGISTRATION_TIMEOUT", "STATE_FILE", "VULTR_API_URL", "VULTR_FIREWALL_GROUP_ID",
+		"VULTR_OS_ID", "VULTR_PLAN", "VULTR_REGION", "VULTR_SNAPSHOT_ID", "VULTR_SSH_KEY_IDS",
+		"VULTR_VPC_ID", "WORKER_COUNT",
 	} {
 		t.Setenv(key, "")
 		if err := os.Unsetenv(key); err != nil {
 			t.Fatal(err)
 		}
 	}
+}
+
+func TestLoadRuntimeConfigLabelSizeMapAndDeadman(t *testing.T) {
+	t.Run("generic LABEL_SIZE_MAP", func(t *testing.T) {
+		setValidRuntimeEnvironment(t)
+		t.Setenv("LABEL_SIZE_MAP", "chef=c-8")
+		t.Setenv("RUNNER_DEADMAN_MINUTES", "90")
+		cfg, err := loadRuntimeConfig()
+		if err != nil {
+			t.Fatalf("loadRuntimeConfig error = %v", err)
+		}
+		if cfg.labelSizeMap["chef"] != "c-8" || cfg.deadmanShutdownMinutes != 90 || cfg.disableDeadmanShutdown {
+			t.Fatalf("cfg = %#v", cfg)
+		}
+	})
+	t.Run("backward-compatible DO_LABEL_SIZE_MAP", func(t *testing.T) {
+		setValidRuntimeEnvironment(t)
+		t.Setenv("DO_LABEL_SIZE_MAP", "chef=s-8vcpu-16gb-amd")
+		cfg, err := loadRuntimeConfig()
+		if err != nil {
+			t.Fatalf("loadRuntimeConfig error = %v", err)
+		}
+		if cfg.labelSizeMap["chef"] != "s-8vcpu-16gb-amd" {
+			t.Fatalf("labelSizeMap = %#v", cfg.labelSizeMap)
+		}
+	})
+	t.Run("rejects both LABEL_SIZE_MAP and DO_LABEL_SIZE_MAP", func(t *testing.T) {
+		setValidRuntimeEnvironment(t)
+		t.Setenv("LABEL_SIZE_MAP", "chef=c-8")
+		t.Setenv("DO_LABEL_SIZE_MAP", "chef=c-16")
+		if _, err := loadRuntimeConfig(); err == nil {
+			t.Fatal("accepted both LABEL_SIZE_MAP and DO_LABEL_SIZE_MAP")
+		}
+	})
+	t.Run("deadman disabled with zero", func(t *testing.T) {
+		setValidRuntimeEnvironment(t)
+		t.Setenv("RUNNER_DEADMAN_MINUTES", "0")
+		cfg, err := loadRuntimeConfig()
+		if err != nil {
+			t.Fatalf("loadRuntimeConfig error = %v", err)
+		}
+		if !cfg.disableDeadmanShutdown || cfg.deadmanShutdownMinutes != 0 {
+			t.Fatalf("deadman disable = %v, %d", cfg.disableDeadmanShutdown, cfg.deadmanShutdownMinutes)
+		}
+	})
+	t.Run("rejects invalid deadman", func(t *testing.T) {
+		for _, bad := range []string{"-1", "abc", "999999"} {
+			setValidRuntimeEnvironment(t)
+			t.Setenv("RUNNER_DEADMAN_MINUTES", bad)
+			if _, err := loadRuntimeConfig(); err == nil {
+				t.Fatalf("accepted RUNNER_DEADMAN_MINUTES=%q", bad)
+			}
+		}
+	})
 }

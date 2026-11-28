@@ -72,14 +72,7 @@ type GitHubClient interface {
 
 // ComputeClient owns cloud resources. Provider credentials stay behind this
 // interface and are never rendered into runner user data.
-type ComputeClient interface {
-	Provider() string
-	FindRunner(context.Context, string) (*compute.RunnerInstance, bool, error)
-	CreateRunner(context.Context, compute.RunnerParams) (*compute.RunnerInstance, error)
-	DeleteRunner(context.Context, string, string) error
-	CleanupRunner(context.Context, string) error
-	SweepOrphanedRunners(context.Context, map[string]struct{}, time.Time) (int, error)
-}
+type ComputeClient = compute.Provider
 
 // instanceAbsenceChecker checks exact IDs independently of mutable tags.
 type instanceAbsenceChecker interface {
@@ -94,6 +87,7 @@ type Handler struct {
 	store                     state.Store
 	requiredLabel             string
 	allowedLabels             map[string]string
+	labelSizeMap              map[string]string
 	allowedRepositories       map[string]struct{}
 	allowedPublicRepositories map[string]struct{}
 	runnerVersion             string
@@ -108,6 +102,7 @@ type Handler struct {
 	registrationTimeout       time.Duration
 	livenessSettleWindow      time.Duration
 	livenessConfirmations     int
+	deadmanShutdownMinutes    int
 	reaperTimeout             time.Duration
 	livenessCheckInterval     time.Duration
 	installationID            int64
@@ -127,6 +122,7 @@ type Config struct {
 	Store                     state.Store
 	RequiredLabel             string
 	AllowedLabels             []string
+	LabelSizeMap              map[string]string
 	AllowedRepositories       []string
 	AllowedPublicRepositories []string
 	RunnerVersion             string
@@ -142,6 +138,8 @@ type Config struct {
 	RegistrationTimeout       time.Duration
 	LivenessSettleWindow      time.Duration
 	LivenessConfirmations     int
+	DeadmanShutdownMinutes    int
+	DisableDeadmanShutdown    bool
 	InstallationID            int64
 }
 
@@ -150,6 +148,10 @@ func NewHandler(cfg Config) (*Handler, error) {
 		return nil, err
 	}
 	requiredLabel, allowedLabels, err := normalizeAllowedLabels(cfg.RequiredLabel, cfg.AllowedLabels)
+	if err != nil {
+		return nil, err
+	}
+	labelSizeMap, err := normalizeLabelSizeMap(cfg.LabelSizeMap, allowedLabels)
 	if err != nil {
 		return nil, err
 	}
@@ -180,6 +182,7 @@ func NewHandler(cfg Config) (*Handler, error) {
 		store:                     cfg.Store,
 		requiredLabel:             requiredLabel,
 		allowedLabels:             allowedLabels,
+		labelSizeMap:              labelSizeMap,
 		allowedRepositories:       allowedRepositories,
 		allowedPublicRepositories: allowedPublicRepositories,
 		runnerVersion:             cfg.RunnerVersion,
@@ -194,6 +197,7 @@ func NewHandler(cfg Config) (*Handler, error) {
 		registrationTimeout:       limits.registrationTimeout,
 		livenessSettleWindow:      limits.livenessSettleWindow,
 		livenessConfirmations:     limits.livenessConfirmations,
+		deadmanShutdownMinutes:    limits.deadmanShutdownMinutes,
 		reaperTimeout:             max(5*time.Minute, time.Duration(limits.maxLiveRunners+10)*30*time.Second),
 		livenessCheckInterval:     5 * time.Minute,
 		installationID:            cfg.InstallationID,
@@ -245,6 +249,32 @@ func normalizeAllowedLabels(required string, rawLabels []string) (string, map[st
 	return requiredLabel, allowedLabels, nil
 }
 
+func normalizeLabelSizeMap(raw, allowedLabels map[string]string) (map[string]string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	normalized := make(map[string]string, len(raw))
+	for rawLabel, rawSize := range raw {
+		label := strings.TrimSpace(rawLabel)
+		size := strings.TrimSpace(rawSize)
+		if !compute.ValidLabel(label) {
+			return nil, fmt.Errorf("invalid label %q in label size map", rawLabel)
+		}
+		if !compute.ValidInstanceSize(size) {
+			return nil, fmt.Errorf("invalid instance size %q for label %q", rawSize, label)
+		}
+		key := strings.ToLower(label)
+		if _, allowed := allowedLabels[key]; !allowed {
+			return nil, fmt.Errorf("label size map key %q is outside ALLOWED_LABELS", rawLabel)
+		}
+		if _, dup := normalized[key]; dup {
+			return nil, fmt.Errorf("duplicate label %q in label size map", rawLabel)
+		}
+		normalized[key] = size
+	}
+	return normalized, nil
+}
+
 func normalizeAllowedRepositories(rawRepositories []string) (map[string]struct{}, error) {
 	allowedRepositories := make(map[string]struct{}, len(rawRepositories))
 	for _, raw := range rawRepositories {
@@ -267,6 +297,7 @@ type handlerLimits struct {
 	registrationTimeout                      time.Duration
 	livenessSettleWindow                     time.Duration
 	livenessConfirmations                    int
+	deadmanShutdownMinutes                   int
 	runnerGroupID                            int64
 }
 
@@ -274,10 +305,11 @@ func resolveHandlerLimits(cfg Config) (handlerLimits, error) {
 	limits := handlerLimits{
 		workerCount: cfg.WorkerCount, maxLiveRunners: cfg.MaxLiveRunners, maxAttempts: cfg.MaxAttempts,
 		pollInterval: cfg.PollInterval, maxRunnerAge: cfg.MaxRunnerAge, cancelledRunnerTTL: cfg.CancelledRunnerTTL,
-		registrationTimeout:   cfg.RegistrationTimeout,
-		livenessSettleWindow:  cfg.LivenessSettleWindow,
-		livenessConfirmations: cfg.LivenessConfirmations,
-		runnerGroupID:         cfg.RunnerGroupID,
+		registrationTimeout:    cfg.RegistrationTimeout,
+		livenessSettleWindow:   cfg.LivenessSettleWindow,
+		livenessConfirmations:  cfg.LivenessConfirmations,
+		deadmanShutdownMinutes: cfg.DeadmanShutdownMinutes,
+		runnerGroupID:          cfg.RunnerGroupID,
 	}
 	if limits.workerCount <= 0 {
 		limits.workerCount = 4
@@ -315,10 +347,29 @@ func resolveHandlerLimits(cfg Config) (handlerLimits, error) {
 	if limits.livenessConfirmations <= 0 {
 		limits.livenessConfirmations = 3
 	}
+	deadmanMinutes, err := resolveDeadmanMinutes(cfg)
+	if err != nil {
+		return limits, err
+	}
+	limits.deadmanShutdownMinutes = deadmanMinutes
 	if limits.runnerGroupID <= 0 {
 		limits.runnerGroupID = 1
 	}
 	return limits, nil
+}
+
+func resolveDeadmanMinutes(cfg Config) (int, error) {
+	if cfg.DisableDeadmanShutdown {
+		return 0, nil
+	}
+	minutes := cfg.DeadmanShutdownMinutes
+	if minutes == 0 {
+		return compute.DefaultDeadmanShutdownMinutes, nil
+	}
+	if minutes < 0 || minutes > compute.MaxDeadmanShutdownMinutes {
+		return 0, fmt.Errorf("dead-man shutdown minutes must be between 0 and %d", compute.MaxDeadmanShutdownMinutes)
+	}
+	return minutes, nil
 }
 
 // Start launches durable workers. Pending work is loaded from the store, so a
@@ -1026,13 +1077,15 @@ func (h *Handler) provision(ctx context.Context, record state.Record) {
 	}
 
 	instance, err := h.computeClient.CreateRunner(ctx, compute.RunnerParams{
-		JobKey:              record.Key,
-		ProvisionEpoch:      record.ProvisionEpoch,
-		RunnerName:          runnerName,
-		RunnerJITConfig:     jit.EncodedConfig,
-		RunnerVersion:       h.runnerVersion,
-		RunnerSHA256:        h.runnerSHA256,
-		ChefInstallerSHA256: h.chefInstallerSHA256,
+		JobKey:                 record.Key,
+		ProvisionEpoch:         record.ProvisionEpoch,
+		RunnerName:             runnerName,
+		RunnerJITConfig:        jit.EncodedConfig,
+		RunnerVersion:          h.runnerVersion,
+		RunnerSHA256:           h.runnerSHA256,
+		ChefInstallerSHA256:    h.chefInstallerSHA256,
+		InstanceSize:           compute.ResolveInstanceSize(record.Labels, h.requiredLabel, h.labelSizeMap),
+		DeadmanShutdownMinutes: h.deadmanShutdownMinutes,
 	})
 	if err != nil {
 		h.provisionFailed(ctx, record, fmt.Errorf("create runner instance: %w", err))

@@ -22,10 +22,10 @@
 </details>
 
 A Go controller that creates one-job, repository-scoped GitHub Actions runners
-on DigitalOcean, AWS EC2, Google Compute Engine, or Azure VMs. GitHub webhook
-deliveries are persisted before acknowledgement, provisioning is retried after
-transient failures or controller restarts, and only controller-owned resources
-can be deleted.
+on DigitalOcean, AWS EC2, Google Compute Engine, Azure VMs, Vultr Cloud Compute,
+or Akamai Cloud (Linode). GitHub webhook deliveries are persisted before
+acknowledgement, provisioning is retried after transient failures or controller
+restarts, and only controller-owned resources can be deleted.
 
 A JIT registration is scoped to a repository, not bound to its triggering job.
 Before registering a runner and again before allocating a VM, the controller
@@ -81,23 +81,25 @@ egress through NAT and security groups or firewall rules with no inbound access.
 
 ## Supported providers
 
-| `COMPUTE_PROVIDER` | Standard capacity | Interruptible capacity |
-| --- | --- | --- |
-| `digitalocean` | Droplet | Not available; `RUNNER_SPOT=true` fails closed |
-| `aws` | EC2 On-Demand | EC2 one-time Spot, terminate on interruption |
-| `gcp` | Standard VM | Spot VM, delete on preemption |
-| `azure` | Standard VM | Spot VM, delete eviction policy |
+| `COMPUTE_PROVIDER` | Standard capacity | Interruptible capacity | Per-label size override (`LABEL_SIZE_MAP`) | Terraform module |
+| --- | --- | --- | --- | --- |
+| `digitalocean` | Droplet | Not available; `RUNNER_SPOT=true` fails closed | Supported (also accepts `DO_LABEL_SIZE_MAP`) | [`terraform/digitalocean`](terraform/digitalocean) |
+| `aws` | EC2 On-Demand | EC2 one-time Spot, terminate on interruption | Supported (`AWS_INSTANCE_TYPE` override) | [`terraform/aws`](terraform/aws) |
+| `gcp` | Standard VM | Spot VM, delete on preemption | Supported (`GCP_MACHINE_TYPE` override) | [`terraform/gcp`](terraform/gcp) |
+| `azure` | Standard VM | Spot VM, delete eviction policy | Supported (`AZURE_VM_SIZE` override) | [`terraform/azure`](terraform/azure) |
+| `vultr` | Cloud Compute | Not available; `RUNNER_SPOT=true` fails closed | Supported (`VULTR_PLAN` override) | [`terraform/vultr`](terraform/vultr) |
+| `linode` | Akamai Cloud / Linode | Not available; `RUNNER_SPOT=true` fails closed | Supported (`LINODE_INSTANCE_TYPE` override) | [`terraform/linode`](terraform/linode) |
 
 `RUNNER_SPOT` defaults to `false`. Spot instances can disappear at any time and
 have no availability guarantee. A preempted GitHub job may need to be retried by
 workflow policy; the lifecycle TTL remains the cleanup backstop.
 
 DigitalOcean firewall posture is validated through its API before provisioning.
-AWS security-group, GCP VPC-firewall, and Azure subnet/NSG ingress policy is
-explicitly delegated to operator-managed IaC because the intended policy cannot
-be inferred from a subnet identifier. Keep those runners private and deny all
-unsolicited inbound traffic; enabling an external IP requires a separate policy
-review.
+AWS security-group, GCP VPC-firewall, Azure subnet/NSG, Vultr firewall group,
+and Linode Cloud Firewall ingress policies are managed through IaC (reference
+modules live under [`terraform/`](terraform/README.md)). Keep runners private
+and deny all unsolicited inbound traffic; enabling an external IP requires a
+separate policy review.
 
 ## Prerequisites
 
@@ -157,8 +159,11 @@ CONTROLLER_ID=primary
 RUNNER_SPOT=false
 
 ALLOWED_REPOSITORIES=example-org/private-repo,example-org/other-private-repo
-ALLOWED_LABELS=self-hosted,chef
+ALLOWED_LABELS=self-hosted,chef,large
 REQUIRED_LABEL=self-hosted
+# Optional: comma-separated label=size overrides applied across all 6 providers.
+# DigitalOcean also accepts the backward-compatible alias DO_LABEL_SIZE_MAP.
+LABEL_SIZE_MAP=large=m7i.2xlarge
 
 RUNNER_VERSION=2.336.0
 RUNNER_SHA256=04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8d68535aa9505d5d
@@ -169,6 +174,8 @@ WORKER_COUNT=4
 MAX_LIVE_RUNNERS=20
 MAX_ATTEMPTS=5
 MAX_RUNNER_AGE=6h
+# Optional: secret-free in-VM dead-man poweroff fuse in minutes (default 180; 0 disables).
+RUNNER_DEADMAN_MINUTES=180
 RUNNER_REGISTRATION_TIMEOUT=10m
 LIVENESS_SETTLE_WINDOW=2m
 LIVENESS_CONFIRMATIONS=3
@@ -182,6 +189,22 @@ LISTEN_ADDR=:8080
 `STATE_FILE` must live on durable storage. The controller also performs a
 fail-safe provider sweep: controller-owned resources absent from that state are
 reclaimed only after `MAX_RUNNER_AGE`.
+
+`LABEL_SIZE_MAP` maps allowlisted workflow labels to provider-specific instance
+sizes (for example `large=c-8,xlarge=c-16` on DigitalOcean, `large=m7i.2xlarge`
+on AWS, `large=n2-standard-8` on GCP, `large=Standard_D8s_v5` on Azure,
+`large=vhf-8c-16gb` on Vultr, or `large=g6-dedicated-8` on Linode). Every label
+key must also appear in `ALLOWED_LABELS`, and size values are validated against
+a strict character allowlist. Set either `LABEL_SIZE_MAP` or the DigitalOcean
+alias `DO_LABEL_SIZE_MAP`, not both.
+
+`RUNNER_DEADMAN_MINUTES` arms a secret-free persistent systemd poweroff
+timer inside each runner VM (default `180` minutes, `0` disables). The original deadline survives a reboot. No cloud API
+credentials enter cloud-init user data. Because providers such as DigitalOcean,
+Vultr, and Linode continue billing powered-off VMs until the instance is
+destroyed, the dead-man fuse halts runaway execution while the controller's
+completion handler and age-gated `MAX_RUNNER_AGE` sweep remain responsible for
+destroying the instance and ending billing.
 
 All allowlisted repositories must belong to the same GitHub App installation
 owner. Installation tokens are restricted to exactly those repository names and
@@ -344,6 +367,50 @@ The disk and NIC entries are needed even though the controller never calls those
 APIs directly: the OS disk and NIC are created with `DeleteOption: Delete`, so
 Azure creates and removes them on the controller's behalf as part of the VM
 lifecycle.
+
+### Vultr Cloud Compute
+
+```dotenv
+COMPUTE_PROVIDER=vultr
+VULTR_API_KEY=read-from-your-secret-manager-at-deploy-time
+VULTR_REGION=ewr
+VULTR_PLAN=vc2-4c-8gb
+# Ubuntu 24.04 LTS x64 OS ID (default 2284); omit when using VULTR_SNAPSHOT_ID.
+VULTR_OS_ID=2284
+VULTR_SNAPSHOT_ID=
+VULTR_VPC_ID=private-vpc-id
+VULTR_FIREWALL_GROUP_ID=deny-all-inbound-firewall-group-id
+VULTR_SSH_KEY_IDS=
+```
+
+The Vultr adapter uses the Vultr API v2 directly over `net/http` with bounded
+timeouts and response reads, base64-encoded cloud-init user data, controller and
+job ownership tags, ambiguous-create recovery polling, authoritative 404
+absence checks, and cursor-paginated orphan sweeps. Provision the private VPC
+and deny-inbound firewall group with [`terraform/vultr`](terraform/vultr).
+Powered-off Vultr instances continue billing until destroyed by the controller.
+
+### Akamai Cloud / Linode
+
+```dotenv
+COMPUTE_PROVIDER=linode
+LINODE_TOKEN=read-from-your-secret-manager-at-deploy-time
+LINODE_REGION=us-ord
+LINODE_INSTANCE_TYPE=g6-standard-4
+LINODE_IMAGE=linode/ubuntu24.04
+LINODE_FIREWALL_ID=12345
+LINODE_VPC_SUBNET_ID=
+LINODE_SSH_PUBLIC_KEY_FILE=
+```
+
+The Linode adapter uses the Linode API v4 directly over `net/http` with bounded
+timeouts and response reads, base64 cloud-init metadata (`metadata.user_data`),
+cryptographically random throwaway root passwords (with root and password SSH
+disabled by cloud-init), controller and job ownership tags, `X-Filter` tag
+queries, ambiguous-create recovery polling, authoritative 404 absence checks,
+and paginated orphan sweeps. Provision the VPC, subnet, and default-DROP Cloud
+Firewall with [`terraform/linode`](terraform/linode). Set `LINODE_REGION` to the module’s `region` output. The firewall and VPC subnet options require an account that permits legacy configuration interfaces. With a VPC subnet configured, the runner uses 1:1 IPv4 NAT to reach GitHub through the cloud firewall. Powered-off Linode
+instances continue billing until destroyed by the controller.
 
 Drain all active records before changing `COMPUTE_PROVIDER`. State is bound to
 the provider that created each runner, and the controller fails closed instead

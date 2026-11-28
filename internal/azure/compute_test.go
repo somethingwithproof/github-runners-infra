@@ -32,6 +32,7 @@ func (f fakeNICCreateOperation) Wait(context.Context) (armnetwork.Interface, err
 
 type fakeVMs struct {
 	vm        armcompute.VirtualMachine
+	createdVM armcompute.VirtualMachine
 	getErr    error
 	createErr error
 	createOp  operation
@@ -49,7 +50,8 @@ func (f *fakeVMs) List(context.Context, string) ([]*armcompute.VirtualMachine, e
 	return f.vms, nil
 }
 
-func (f *fakeVMs) CreateOrUpdate(context.Context, string, string, armcompute.VirtualMachine) (operation, error) {
+func (f *fakeVMs) CreateOrUpdate(_ context.Context, _, _ string, vm armcompute.VirtualMachine) (operation, error) {
+	f.createdVM = vm
 	return f.createOp, f.createErr
 }
 
@@ -94,7 +96,7 @@ func TestSpotVMSpecDeletesEvictedResourcesAndDisablesPasswords(t *testing.T) {
 		image:         [4]string{"Canonical", "ubuntu-24_04-lts", "server", "24.04.202601010"},
 		adminUsername: "runneradmin", sshPublicKey: "ssh-ed25519 test", controllerID: "primary", spot: true,
 	}
-	vm := client.vmSpec("org/repo:42", "ghr-test", "/subscriptions/test/nic", "#cloud-config")
+	vm := client.vmSpec("org/repo:42", "ghr-test", "/subscriptions/test/nic", armcompute.VirtualMachineSizeTypes("Standard_D4s_v5"), "#cloud-config")
 	if vm.Properties.Priority == nil || *vm.Properties.Priority != armcompute.VirtualMachinePriorityTypesSpot ||
 		vm.Properties.EvictionPolicy == nil || *vm.Properties.EvictionPolicy != armcompute.VirtualMachineEvictionPolicyTypesDelete {
 		t.Fatalf("unexpected spot settings: %#v", vm.Properties)
@@ -271,3 +273,28 @@ func testAzureClient(vms virtualMachinesAPI, nics networkInterfacesAPI) *Client 
 }
 
 func notFoundError() error { return &azcore.ResponseError{StatusCode: 404} }
+
+func TestCreateRunnerAppliesVMSizeOverride(t *testing.T) {
+	nicID := "/subscriptions/test/nics/runner"
+	nics := &fakeNICs{
+		getErr: notFoundError(), createOp: fakeNICCreateOperation{nic: armnetwork.Interface{ID: &nicID}},
+		deleteOp: fakeOperation{},
+	}
+	vms := &fakeVMs{getErr: notFoundError(), createOp: fakeOperation{}}
+	client := testAzureClient(vms, nics)
+	if _, err := client.CreateRunner(context.Background(), compute.RunnerParams{
+		JobKey: "org/repo:88", RunnerJITConfig: "jit", InstanceSize: "Standard_D8s_v5",
+	}); err != nil {
+		t.Fatalf("CreateRunner override error = %v", err)
+	}
+	if vms.createdVM.Properties == nil || vms.createdVM.Properties.HardwareProfile == nil ||
+		vms.createdVM.Properties.HardwareProfile.VMSize == nil ||
+		*vms.createdVM.Properties.HardwareProfile.VMSize != armcompute.VirtualMachineSizeTypes("Standard_D8s_v5") {
+		t.Fatalf("VM size = %#v, want Standard_D8s_v5", vms.createdVM.Properties)
+	}
+	if _, err := client.CreateRunner(context.Background(), compute.RunnerParams{
+		JobKey: "org/repo:89", RunnerJITConfig: "jit", InstanceSize: "bad size",
+	}); err == nil {
+		t.Fatal("CreateRunner accepted invalid Azure VM size override")
+	}
+}
